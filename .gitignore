@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Node / 前端
+node_modules/
+dist/
+.vite/
+
+# 模型与大文件(不入库)
+models/
+*.bin
+*.wav
+*.mp3
+*.m4a
+data/audio/
+
+# 实验临时
+experiments/*/output/
+*.log
+
+# IDE
+.idea/
+.vscode/
