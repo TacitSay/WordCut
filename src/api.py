@@ -253,7 +253,20 @@ class HealthResponse(BaseModel):
 # ----------------------------------------------------------------------
 # 应用对象
 # ----------------------------------------------------------------------
-app = FastAPI(title="WordCut", version="0.1.0")
+def _read_version() -> str:
+    """从项目根目录的 VERSION 文件读取版本号（单一版本源）。
+
+    文件缺失或内容非法时回退到 0.0.0，不阻断服务启动。
+    """
+    version_file = BASE_DIR / "VERSION"
+    try:
+        text = version_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "0.0.0"
+    return text or "0.0.0"
+
+
+app = FastAPI(title="WordCut", version=_read_version())
 
 
 # ----------------------------------------------------------------------
