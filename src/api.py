@@ -561,7 +561,36 @@ def _resample(
     return np.clip(resampled, -1.0, 1.0).astype(np.float32)
 
 
-def _ingest_media(raw: bytes, suffix: str, destination: Path) -> float:
+def _keep_source_media(
+    raw: bytes, suffix: str, project_id: str, media_info: Dict[str, Any]
+) -> Optional[Path]:
+    """保留原始上传文件（仅视频），供导出时剪视频使用。
+
+    音频文件不需要保留原始副本——统一转码后的 WAV 已包含全部信息。
+    视频必须保留原文件：按 EDL 剪视频需要原始码流（重编码会损失画质与速度）。
+
+    参数:
+        raw: 上传文件的原始字节。
+        suffix: 原扩展名（含点）。
+        project_id: 项目 id，用于命名。
+        media_info: :func:`_detect_media_kind` 的结果。
+
+    返回:
+        保留的源文件路径；非视频或保存失败时返回 None（不影响上传成功）。
+    """
+    if media_info.get("kind") != "video":
+        return None
+
+    target = UPLOAD_DIR / f"{project_id}.source{suffix}"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+        return target
+    except OSError:
+        return None
+
+
+def _ingest_media(raw: bytes, suffix: str, destination: Path) -> Dict[str, Any]:
     """把上传的原始字节落成 16kHz 单声道 WAV，返回时长（秒）。
 
     走 ffprobe 探测 + ffmpeg 转码，支持任意音视频容器（视频自动丢弃画面）。
@@ -617,11 +646,18 @@ def _ingest_media(raw: bytes, suffix: str, destination: Path) -> float:
         # 3. 以输出文件为准取时长（转码后可能因重采样有毫秒级差异）
         try:
             out_info = media.probe(destination)
-            return float(out_info.duration)
         except media.MediaToolError as exc:
             raise HTTPException(
                 status_code=500, detail=f"转码后探测输出失败：{exc}"
             ) from exc
+
+        has_video = any(stream.type == "video" for stream in info.streams)
+        return {
+            "duration": float(out_info.duration),
+            "kind": "video" if has_video else "audio",
+            "has_audio": True,
+            "format_name": info.format_name,
+        }
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
@@ -751,11 +787,18 @@ async def create_project(
     suffix = Path(file.filename or "").suffix.lower() or ".bin"
     project_id = uuid.uuid4().hex[:12]
     audio_path = UPLOAD_DIR / f"{project_id}.wav"
-    duration = _ingest_media(raw, suffix, audio_path)
+    media_info = _ingest_media(raw, suffix, audio_path)
+    duration = float(media_info["duration"])
+
+    # 若上传的是视频，额外保留一份原始文件，供导出时剪视频使用（只读，不变量 1）
+    source_path = _keep_source_media(raw, suffix, project_id, media_info)
+
     project: Dict[str, Any] = {
         "id": project_id,
         "name": project_name,
         "audio_path": str(audio_path.resolve()),
+        "source_path": str(source_path.resolve()) if source_path else None,
+        "source_kind": media_info.get("kind", "audio"),
         "sample_rate": SAMPLE_RATE,
         "words": [],
         "deleted_ids": set(),

@@ -69,10 +69,10 @@ def export_audio(
 
     * ``.wav``：直接用 :func:`soundfile.write` 写出；浮点样本写成 32-bit
       float WAV（无损、不过载），整型样本按原位宽写成对应 PCM。
-    * ``.mp3``：先在输出目录写一个临时 float WAV，再用
-      ``ffmpeg -y -i 临时.wav <MP3_BITRATE_ARGS> 输出.mp3`` 转码，
-      无论成功与否都会删除临时文件。
-    * 其他后缀：交给 soundfile 按扩展名推断容器与编码（如 flac / ogg）。
+    * ``.wav``：直接用 :func:`soundfile.write` 写出（无损）。
+    * ``.flac``：经 ffmpeg 转码为无损 FLAC（压缩率约 50%，音质无损失）。
+    * ``.mp3`` / ``.m4a``：经 ffmpeg 转码为有损格式（MP3 VBR q2 / AAC 192k）。
+    * 转码类格式统一先写临时 float WAV 再调用 ffmpeg，无论成功与否都会删除临时文件。
 
     **不变量 1**：传入的 ``samples`` 只读。函数内不做任何就地运算，整型样本
     转浮点、非连续数组转连续数组都产生新数组。
@@ -98,15 +98,23 @@ def export_audio(
     rate = _validate_sample_rate(sample_rate)
     path = _prepare_output_path(output_path)
 
-    if path.suffix == ".mp3":
-        _export_mp3(data, rate, path)
+    if path.suffix in _FFMPEG_AUDIO_SUFFIXES:
+        _export_via_ffmpeg(data, rate, path)
         return
 
     _write_soundfile(data, rate, path, subtype=_subtype_for(data, path))
 
 
-def _export_mp3(data: np.ndarray, sample_rate: int, path: Path) -> None:
-    """经临时 WAV 中转，把样本转码为 mp3。"""
+#: 需要经 ffmpeg 转码的后缀 -> 转码参数。
+_FFMPEG_AUDIO_SUFFIXES = {
+    ".mp3": ("-codec:a", "libmp3lame", "-q:a", "2"),
+    ".m4a": ("-codec:a", "aac", "-b:a", "192k"),
+    ".flac": ("-codec:a", "flac", "-compression_level", "5"),
+}
+
+
+def _export_via_ffmpeg(data: np.ndarray, sample_rate: int, path: Path) -> None:
+    """经临时 WAV 中转，把样本转码为目标格式（mp3 / m4a / flac）。"""
     ffmpeg = _resolve_ffmpeg()
 
     # 临时文件放在输出目录，避免跨盘拷贝；dir 参数保证同一文件系统内 rename。
@@ -129,7 +137,7 @@ def _export_mp3(data: np.ndarray, sample_rate: int, path: Path) -> None:
             "error",
             "-i",
             str(temp_path),
-            *MP3_BITRATE_ARGS,
+            *_FFMPEG_AUDIO_SUFFIXES[path.suffix],
             str(path),
         ]
         result = subprocess.run(
@@ -142,8 +150,9 @@ def _export_mp3(data: np.ndarray, sample_rate: int, path: Path) -> None:
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()
             raise RuntimeError(
-                "ffmpeg 转码 mp3 失败（exit code {code}）：{detail}；"
+                "ffmpeg 转码 {suffix} 失败（exit code {code}）：{detail}；"
                 "命令：{command}".format(
+                    suffix=path.suffix,
                     code=result.returncode,
                     detail=detail[-800:] or "<无输出>",
                     command=" ".join(command),
@@ -160,7 +169,7 @@ def _export_mp3(data: np.ndarray, sample_rate: int, path: Path) -> None:
             pass
         except OSError as exc:  # 清理失败不影响主流程，但不能静默
             raise RuntimeError(
-                f"mp3 转码后删除临时文件失败：{temp_path}（{exc}）"
+                f"{path.suffix} 转码后删除临时文件失败：{temp_path}（{exc}）"
             ) from exc
 
 
