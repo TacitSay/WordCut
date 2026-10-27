@@ -1,0 +1,241 @@
+/* ----------------------------------------------------------------------
+   WordCut 全局样式：深色主题（参考 VS Code）
+   背景 #1e1e1e · 文字 #d4d4d4 · 强调色 #3b82f6
+   ---------------------------------------------------------------------- */
+
+:root {
+  /* 背景层次 */
+  --bg: #1e1e1e;
+  --bg-panel: #1b1b1c;
+  --bg-elevated: #252526;
+  --bg-toolbar: #2d2d30;
+
+  /* 边框 */
+  --border: #333338;
+  --border-strong: #3c3c3c;
+
+  /* 文字 */
+  --text: #d4d4d4;
+  --text-strong: #f3f4f6;
+  --text-dim: #9aa0a6;
+  --text-faint: #6b7076;
+
+  /* 强调与语义色 */
+  --accent: #3b82f6;
+  --accent-hover: #2f74e0;
+  --accent-dim: rgba(59, 130, 246, 0.18);
+  --danger: #f87171;
+  --danger-dim: rgba(239, 68, 68, 0.22);
+  --warn: #f59e0b;
+  --success: #4ade80;
+
+  /* 字体 */
+  --sans:
+    'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', system-ui, -apple-system,
+    'Helvetica Neue', Arial, sans-serif;
+  --mono: ui-monospace, 'Cascadia Mono', Consolas, 'Courier New', monospace;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+/* 滚动条（深色细条） */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #4a4a4f transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #4a4a4f;
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #5f5f66;
+  background-clip: content-box;
+}
+
+/* ----------------------------------------------------------------------
+   通用控件：按钮 / 输入框
+   ---------------------------------------------------------------------- */
+
+.btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 5px 12px;
+  min-height: 26px;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text);
+  background: #37373d;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background-color 0.12s ease,
+    border-color 0.12s ease,
+    color 0.12s ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: #45454c;
+  border-color: var(--accent);
+  color: var(--text-strong);
+}
+
+.btn:active:not(:disabled) {
+  background: #2b2b30;
+}
+
+.btn:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: #ffffff;
+}
+
+.btn-small {
+  padding: 2px 9px;
+  min-height: 22px;
+  font-size: 12px;
+}
+
+.input {
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 4px 9px;
+  min-height: 26px;
+  outline: none;
+  transition: border-color 0.12s ease;
+}
+
+.input::placeholder {
+  color: var(--text-faint);
+}
+
+.input:focus {
+  border-color: var(--accent);
+}
+
+/* ----------------------------------------------------------------------
+   面板通用结构：标题栏 / 空态
+   ---------------------------------------------------------------------- */
+
+.pane-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 0 0 auto;
+  padding: 7px 14px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  min-height: 34px;
+}
+
+.pane-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+  letter-spacing: 0.2px;
+}
+
+.pane-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pane-count {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.pane-empty {
+  margin: 0;
+  padding: 18px 4px;
+  font-size: 13px;
+  color: var(--text-faint);
+}
+
+.pane-error {
+  color: var(--danger);
+}
+
+/* 窄屏下把左右两栏改成上下排列 */
+@media (max-width: 900px) {
+  .workspace {
+    flex-direction: column;
+  }
+
+  .pane-text,
+  .pane-wave {
+    flex: 1 1 50%;
+    border-right: none;
+  }
+
+  .pane-text {
+    border-bottom: 1px solid var(--border);
+  }
+}
