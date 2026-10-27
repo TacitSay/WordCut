@@ -43,7 +43,8 @@ _SRC_DIR: Path = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-import pipeline  # noqa: E402  （必须在 sys.path 调整之后导入）
+import media  # noqa: E402  （必须在 sys.path 调整之后导入）
+import pipeline  # noqa: E402
 import subtitle  # noqa: E402
 from model import DeleteSpan, TimeMap, Token  # noqa: E402
 
@@ -532,6 +533,72 @@ def _resample(
     return np.clip(resampled, -1.0, 1.0).astype(np.float32)
 
 
+def _ingest_media(raw: bytes, suffix: str, destination: Path) -> float:
+    """把上传的原始字节落成 16kHz 单声道 WAV，返回时长（秒）。
+
+    走 ffprobe 探测 + ffmpeg 转码，支持任意音视频容器（视频自动丢弃画面）。
+    先写临时文件（保留原扩展名，便于 ffmpeg 识别容器），转换成功后删除。
+
+    参数:
+        raw: 上传文件的原始字节。
+        suffix: 原文件扩展名（含点，如 .mp4）；未知时用 .bin。
+        destination: 目标 WAV 路径（父目录自动创建）。
+
+    返回:
+        目标音频时长（秒），由 ffprobe 对输出文件探测得出。
+
+    异常:
+        400: 文件不是有效媒体，或不含音频流。
+        500: ffmpeg/ffprobe 不可用或转码失败。
+    """
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=suffix, delete=False, dir=str(UPLOAD_DIR)
+        ) as handle:
+            handle.write(raw)
+            temp_path = Path(handle.name)
+
+        # 1. 探测：确认是有效媒体且含音频流
+        try:
+            info = media.probe(temp_path)
+        except media.MediaToolError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"无法识别的媒体文件（需要 ffmpeg 可解码的音频或视频）：{exc}",
+            ) from exc
+
+        if not any(stream.type == "audio" for stream in info.streams):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "上传的文件中没有音频流"
+                    f"（探测到：{[s.type for s in info.streams] or '无任何流'}）"
+                ),
+            )
+
+        # 2. 转码：任意音视频 -> 16kHz 单声道 PCM16 WAV
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            media.convert_to_wav16k(temp_path, destination, SAMPLE_RATE)
+        except media.MediaToolError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"音频转码失败：{exc}"
+            ) from exc
+
+        # 3. 以输出文件为准取时长（转码后可能因重采样有毫秒级差异）
+        try:
+            out_info = media.probe(destination)
+            return float(out_info.duration)
+        except media.MediaToolError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"转码后探测输出失败：{exc}"
+            ) from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
 def _write_wav(destination: Path, samples: np.ndarray) -> None:
     """把样本写成 16kHz 单声道 PCM_16 WAV（目标格式统一）。"""
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -628,13 +695,17 @@ async def create_project(
     file: UploadFile = File(..., description="音频文件（wav/flac/ogg 等）"),
     name: str = Form(..., description="项目名"),
 ) -> ProjectCreated:
-    """上传音频文件并创建项目。
+    """上传音视频文件并创建项目。
 
-    流程：读入字节 → soundfile 解码校验 → 混缩为单声道 → 重采样到 16kHz →
-    落盘 ``uploads/{project_id}.wav``（不变量 1：此文件之后只读）。
+    流程：字节落临时文件 → ffprobe 探测（校验是有效媒体）→ ffmpeg 统一转码为
+    16kHz 单声道 PCM16 WAV → 落盘 ``uploads/{project_id}.wav``
+    （不变量 1：此文件之后只读）。
+
+    支持任意 ffmpeg 可解码的音频/视频容器（mp4/mov/mkv/mp3/flac/ogg/m4a…）；
+    视频文件自动丢弃画面只取音轨。
 
     参数:
-        file: 上传的音频文件。
+        file: 上传的音视频文件。
         name: 项目名，非空。
 
     返回:
@@ -649,14 +720,10 @@ async def create_project(
     if not raw:
         raise HTTPException(status_code=400, detail="上传的文件为空")
 
-    suffix = Path(file.filename or "").suffix.lower()
-    samples = _normalize_audio(raw, suffix)
-
+    suffix = Path(file.filename or "").suffix.lower() or ".bin"
     project_id = uuid.uuid4().hex[:12]
     audio_path = UPLOAD_DIR / f"{project_id}.wav"
-    _write_wav(audio_path, samples)
-
-    duration = float(samples.size) / float(SAMPLE_RATE)
+    duration = _ingest_media(raw, suffix, audio_path)
     project: Dict[str, Any] = {
         "id": project_id,
         "name": project_name,
