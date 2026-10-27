@@ -782,6 +782,49 @@ watch(
   },
 )
 
+// ----------------------------------------------------------------------
+// 拖拽上传
+// ----------------------------------------------------------------------
+const dragging = ref(false)
+let dragDepth = 0
+
+function hasFiles(event) {
+  const types = event.dataTransfer?.types
+  return Boolean(types && Array.from(types).includes('Files'))
+}
+
+function onDragEnter(event) {
+  if (!hasFiles(event)) return
+  event.preventDefault()
+  dragDepth += 1
+  dragging.value = true
+}
+
+function onDragOver(event) {
+  if (!hasFiles(event)) return
+  event.preventDefault()
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+}
+
+function onDragLeave(event) {
+  if (!hasFiles(event)) return
+  dragDepth = Math.max(0, dragDepth - 1)
+  if (dragDepth === 0) dragging.value = false
+}
+
+async function onDrop(event) {
+  event.preventDefault()
+  dragDepth = 0
+  dragging.value = false
+  const file = event.dataTransfer?.files?.[0]
+  if (!file) return
+  if (busy.value) {
+    setStatus('当前有任务在进行，请等待完成后再导入新文件', 'error')
+    return
+  }
+  await handleSelectFile(file)
+}
+
 onMounted(async () => {
   window.addEventListener('keydown', onKeydown)
   try {
@@ -803,7 +846,22 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="app-shell">
+  <div
+    class="app-shell"
+    @dragenter="onDragEnter"
+    @dragover="onDragOver"
+    @dragleave="onDragLeave"
+    @drop="onDrop"
+  >
+    <!-- 拖拽提示遮罩 -->
+    <div v-if="dragging" class="drop-overlay">
+      <div class="drop-hint">
+        <span class="drop-icon">⬇</span>
+        <strong>松手导入</strong>
+        <span class="drop-sub">支持音频 / 视频（mp4、mov、mkv、mp3、wav、flac、m4a…）</span>
+      </div>
+    </div>
+
     <!-- L1：菜单栏从命令注册表渲染 -->
     <MenuBar :ctx="commandCtx" @run="handleMenuRun" />
 
@@ -953,6 +1011,42 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(30, 30, 30, 0.86);
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+}
+
+.drop-hint {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 42px 64px;
+  border: 2px dashed var(--accent);
+  border-radius: 12px;
+  background: rgba(59, 130, 246, 0.08);
+  color: var(--text-strong);
+  font-size: 16px;
+}
+
+.drop-icon {
+  font-size: 34px;
+  line-height: 1;
+  color: var(--accent);
+}
+
+.drop-sub {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
 .app-shell {
   display: flex;
   flex-direction: column;
