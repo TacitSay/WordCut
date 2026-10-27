@@ -27,6 +27,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import MenuBar from './components/MenuBar.vue'
 import Toolbar from './components/Toolbar.vue'
 import ExportDialog from './components/ExportDialog.vue'
+
 import TextEditor from './components/TextEditor.vue'
 import WaveformView from './components/WaveformView.vue'
 import { registerCommands, runCommand, shortcutFromEvent, shortcutMap } from './core/commands.js'
@@ -37,7 +38,9 @@ import {
   exportProject,
   fetchTokens,
   health,
+  loadProject,
   restoreTokens,
+  saveProject,
   transcribeProject,
 } from './api/client.js'
 
@@ -68,6 +71,10 @@ const totalDeleted = ref(0)
 const exportInfo = ref(null)
 /** 导出对话框是否打开 */
 const exportDialogOpen = ref(false)
+/** 工程文件保存中 */
+const saving = ref(false)
+/** 工程文件加载中 */
+const loadingProject = ref(false)
 /** 后端 API 版本号（状态栏展示） */
 const apiVersion = ref('')
 
@@ -497,6 +504,151 @@ async function handleTranscribe() {
   }
 }
 
+/** Ctrl+S：保存工程文件（.wcproj）。 */
+async function handleSaveProject() {
+  if (!project.value || !hasTokens.value) {
+    setStatus('请先转写，再保存工程', 'error')
+    return
+  }
+
+  const suggested = `${project.value.name || 'untitled'}.wcproj`
+  let target = ''
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: suggested,
+        types: [
+          {
+            description: 'WordCut 工程文件',
+            accept: { 'application/json': ['.wcproj'] },
+          },
+        ],
+      })
+      target = handle.name
+      // 浏览器沙箱拿不到绝对路径，需要用户输入保存目录
+      const directory = window.prompt(
+        '已选择文件名，请填写保存目录的绝对路径（例如 D:\\工程）：',
+        '',
+      )
+      if (!directory) {
+        setStatus('已取消保存', 'info')
+        return
+      }
+      target = `${directory.replace(/[\\/]+$/, '')}\\${handle.name}`
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        setStatus('已取消保存', 'info')
+        return
+      }
+      target = ''
+    }
+  }
+
+  if (!target) {
+    target = window.prompt('工程文件保存路径（含 .wcproj）：', suggested) || ''
+  }
+  if (!target.trim()) {
+    setStatus('已取消保存', 'info')
+    return
+  }
+
+  saving.value = true
+  setStatus('正在保存工程…', 'busy')
+  try {
+    const result = await saveProject(project.value.id, target.trim())
+    setStatus(
+      `工程已保存：${result.path}（${(result.size_bytes / 1024).toFixed(1)} KB）`,
+      'success',
+    )
+  } catch (error) {
+    setStatus(`保存工程失败：${error.message}`, 'error')
+  } finally {
+    saving.value = false
+  }
+}
+
+/** Ctrl+Shift+O：打开工程文件（.wcproj）。 */
+async function handleOpenProject() {
+  if (busy.value) {
+    setStatus('当前有任务在进行，请稍后再打开工程', 'error')
+    return
+  }
+
+  let target = ''
+  if (window.showOpenFilePicker) {
+    try {
+      const [handle] = await window.showOpenFilePicker({
+        types: [
+          {
+            description: 'WordCut 工程文件',
+            accept: { 'application/json': ['.wcproj'] },
+          },
+        ],
+        multiple: false,
+      })
+      const directory = window.prompt(
+        '请填写该工程文件所在目录的绝对路径（例如 D:\\工程）：',
+        '',
+      )
+      if (!directory) {
+        setStatus('已取消打开', 'info')
+        return
+      }
+      target = `${directory.replace(/[\\/]+$/, '')}\\${handle.name}`
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        setStatus('已取消打开', 'info')
+        return
+      }
+      target = ''
+    }
+  }
+
+  if (!target) {
+    target = window.prompt('工程文件路径（含 .wcproj）：', '') || ''
+  }
+  if (!target.trim()) {
+    setStatus('已取消打开', 'info')
+    return
+  }
+
+  loadingProject.value = true
+  setStatus('正在打开工程…', 'busy')
+  try {
+    const loaded = await loadProject(target.trim())
+    resetProjectState()
+
+    project.value = {
+      id: loaded.project_id,
+      name: loaded.name,
+      sample_rate: loaded.sample_rate,
+      duration: 0,
+      source_kind: loaded.source_kind,
+    }
+    projectName.value = loaded.name
+    tokens.value = Array.isArray(loaded.tokens) ? [...loaded.tokens] : []
+    segments.value = Array.isArray(loaded.segments) ? [...loaded.segments] : []
+    deletedIds.value = Array.isArray(loaded.deleted_ids) ? [...loaded.deleted_ids] : []
+    deletes.value = buildDeletesFromTokens(tokens.value, deletedIds.value)
+    totalDeleted.value = totalOf(deletes.value)
+    playback.setDeletes(deletes.value)
+    exportInfo.value = null
+
+    const integrity = loaded.integrity || {}
+    const message = integrity.message || ''
+    setStatus(
+      integrity.audio_ok
+        ? `已打开「${loaded.name}」：${tokens.value.length} 个 Token，删除 ${deletedIds.value.length} 个`
+        : `已打开「${loaded.name}」但源文件有变动：${message}`,
+      integrity.audio_ok ? 'success' : 'error',
+    )
+  } catch (error) {
+    setStatus(`打开工程失败：${error.message}`, 'error')
+  } finally {
+    loadingProject.value = false
+  }
+}
+
 /** 打开导出对话框（Ctrl+E / 菜单 文件 → 导出）。 */
 function handleExport() {
   if (!project.value) {
@@ -653,10 +805,26 @@ registerCommands([
   },
   {
     id: 'file.export',
-    title: '导出音频 / 字幕 / EDL…',
+    title: '导出…',
     menu: 'file',
     shortcut: 'Ctrl+E',
     handler: () => handleExport(),
+  },
+  {
+    id: 'file.saveProject',
+    title: '保存工程…',
+    menu: 'file',
+    shortcut: 'Ctrl+S',
+    handler: () => handleSaveProject(),
+    enabled: () => Boolean(project.value) && hasTokens.value && !busy.value,
+  },
+  {
+    id: 'file.openProject',
+    title: '打开工程…',
+    menu: 'file',
+    shortcut: 'Ctrl+Shift+O',
+    handler: () => handleOpenProject(),
+    enabled: () => !busy.value,
   },
   {
     id: 'edit.delete',

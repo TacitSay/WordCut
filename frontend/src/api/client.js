@@ -201,6 +201,31 @@ export function restoreTokens(projectId, tokenIds) {
  * @param {{ audio_format?: string, export_video?: boolean, video_mode?: string }} [options]
  *   与后端 ExportRequest 完全对齐；不传时后端使用默认值（wav / 不导出视频）。
  */
+/**
+ * POST /api/projects/{pid}/save -> SaveProjectResponse
+ *
+ * @param {string} projectId
+ * @param {string} path 工程文件保存路径（.wcproj）
+ */
+export function saveProject(projectId, path) {
+  return request(projectPath(projectId, '/save'), {
+    method: 'POST',
+    body: { path },
+  })
+}
+
+/**
+ * POST /api/projects/load -> LoadProjectResponse
+ *
+ * @param {string} path 工程文件路径（.wcproj）
+ */
+export function loadProject(path) {
+  return request('/api/projects/load', {
+    method: 'POST',
+    body: { path },
+  })
+}
+
 export function exportProject(projectId, options = {}) {
   const body = {
     audio_format: options.audio_format ?? 'wav',
