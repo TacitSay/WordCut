@@ -374,19 +374,42 @@ async function handleUndo() {
 // ----------------------------------------------------------------------
 // 文件 / 上传 / 转写 / 导出
 // ----------------------------------------------------------------------
-/** 选择本地文件：立刻生成 blob URL 供波形使用（上传后仍是同一个文件）。 */
-function handleSelectFile(file) {
-  if (!file) return
+/** 清空所有项目级状态（新建/切换项目、上传失败时统一走这里，防止残留）。 */
+function resetProjectState() {
   if (audioUrl.value) URL.revokeObjectURL(audioUrl.value)
+  project.value = null
+  audioFile.value = null
+  audioUrl.value = ''
+  projectName.value = ''
+  tokens.value = []
+  segments.value = []
+  deletedIds.value = []
+  deletes.value = []
+  totalDeleted.value = 0
+  exportInfo.value = null
+  undoStack.value = []
+  cursorIndex.value = 0
+  selectionAnchor.value = null
+  playback.setDeletes([])
+}
+
+/** 选择本地文件：清空旧项目状态 → 生成 blob URL → 自动上传。 */
+async function handleSelectFile(file) {
+  if (!file) return
+
+  // 1. 先彻底清空上一个项目的状态（修复换项目后文本/删除点残留）
+  resetProjectState()
+
+  // 2. 建立新文件上下文
   audioFile.value = file
   audioUrl.value = URL.createObjectURL(file)
-  if (!projectName.value.trim()) {
-    projectName.value = file.name.replace(/\.[^.\\/]+$/, '')
-  }
-  setStatus(
-    `已选择：${file.name}（${(file.size / 1024 / 1024).toFixed(2)} MB），下一步点击「上传」`,
-    'info',
-  )
+  projectName.value = file.name.replace(/\.[^.\\/]+$/, '')
+
+  const sizeMb = (file.size / 1024 / 1024).toFixed(2)
+  setStatus(`已选择：${file.name}（${sizeMb} MB），正在自动上传…`, 'busy')
+
+  // 3. 选完即上传，不再需要单独点「上传」
+  await handleUpload()
 }
 
 /** file.import：打开系统文件选择器。 */
