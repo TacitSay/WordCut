@@ -207,13 +207,33 @@ class EditStateResponse(BaseModel):
     total_deleted: float = Field(..., description="删除总时长（秒，已合并重叠）")
 
 
+class ExportRequest(BaseModel):
+    """``POST /api/projects/{pid}/export`` 的请求体。"""
+
+    audio_format: str = Field(
+        "wav", description="音频格式：wav / mp3 / flac / m4a"
+    )
+    export_video: bool = Field(
+        False, description="是否同时导出成品视频（需项目来自视频上传）"
+    )
+    video_mode: str = Field(
+        "precise", description="视频剪辑模式：precise（fast 已禁用，自动回退）"
+    )
+
+
 class ExportResponse(BaseModel):
     """``POST /api/projects/{pid}/export`` 的响应。"""
 
     project_id: str = Field(..., description="项目 id")
     output_duration: float = Field(..., description="目标音频时长（秒）")
     paths: Dict[str, str] = Field(
-        ..., description="导出文件绝对路径：audio_path / srt_path / edl_path"
+        ...,
+        description="导出文件绝对路径：audio_path / srt_path / edl_path / video_path(可选)",
+    )
+    audio_format: str = Field("wav", description="实际导出的音频格式")
+    video_exported: bool = Field(False, description="是否导出了视频")
+    video_info: Optional[Dict[str, Any]] = Field(
+        None, description="视频导出的性能数据（mode/segments/elapsed_ms 等）"
     )
     token_count: int = Field(..., description="Token 总数")
     deleted_count: int = Field(..., description="实际被删除的 Token 数")
@@ -680,6 +700,71 @@ def _write_wav(destination: Path, samples: np.ndarray) -> None:
         ) from exc
 
 
+
+
+#: 导出支持的音频格式。
+_EXPORT_AUDIO_FORMATS = ("wav", "mp3", "flac", "m4a")
+
+
+def _export_video(
+    source_path: Path,
+    target_audio: Path,
+    deletes: Sequence[DeleteSpan],
+    mode: str,
+    output_dir: Path,
+    basename: str,
+) -> Dict[str, Any]:
+    """按 EDL 剪视频并与剪辑后音频合流，返回性能数据与输出路径。
+
+    两步：① cut_video 按删除区间切视频；② concat_av 用目标音频替换音轨。
+    中间产物写到临时目录，合流成功后清理。
+
+    参数:
+        source_path: 原始视频路径（只读，不变量 1）。
+        target_audio: 剪辑后的目标音频（供合流使用）。
+        deletes: 删除区间（DeleteSpan，秒）。
+        mode: 视频剪辑模式（fast 会被内部回退到 precise）。
+        output_dir: 输出目录。
+        basename: 文件名主名。
+
+    返回:
+        ``{"path": str, "mode": str, "segments": int, "elapsed_ms": float,
+        "reencoded_fraction": float, "total_elapsed_ms": float}``。
+
+    异常:
+        HTTPException: 切视频或合流失败时返回 500。
+    """
+    import tempfile
+    import shutil
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    workdir = Path(tempfile.mkdtemp(prefix="wordcut_av_"))
+    try:
+        cut_path = workdir / "cut.mp4"
+        final_path = output_dir / f"{basename}.mp4"
+
+        try:
+            cut_info = media.cut_video(source_path, list(deletes), cut_path, mode=mode)
+            media.concat_av(cut_path, target_audio, final_path)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"视频导出失败：{exc}"
+            ) from exc
+        except media.MediaToolError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"视频导出失败：{exc}"
+            ) from exc
+
+        info: Dict[str, Any] = dict(cut_info)
+        info["path"] = str(final_path.resolve())
+        info["total_elapsed_ms"] = round(
+            float(cut_info.get("elapsed_ms", 0.0)) * 1.0, 1
+        )
+        return info
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def _srt_to_plain(srt_text: str) -> str:
     """把 SRT 文本转成纯文本预览（去掉序号行与时间码行）。"""
     lines: List[str] = []
@@ -1032,7 +1117,7 @@ def restore_tokens(pid: str, payload: TokenIdsRequest) -> EditStateResponse:
     response_model=ExportResponse,
     summary="导出剪辑结果",
 )
-def export_project(pid: str) -> ExportResponse:
+def export_project(pid: str, payload: Optional[ExportRequest] = None) -> ExportResponse:
     """调用 :func:`pipeline.run_pipeline` 导出音频 / 字幕 / EDL 三件套。
 
     输出写入 ``outputs/{project_id}/``（不变量 1：源音频只读，剪辑结果是新副本）。
@@ -1048,6 +1133,17 @@ def export_project(pid: str) -> ExportResponse:
         400：尚未转写，或删除后没有任何保留区间；
         404：项目不存在；500：读写 / 渲染失败。
     """
+    options = payload or ExportRequest()
+    audio_format = (options.audio_format or "wav").lower().lstrip(".")
+    if audio_format not in _EXPORT_AUDIO_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"不支持的音频格式 {audio_format!r}，可选："
+                f"{'/'.join(_EXPORT_AUDIO_FORMATS)}"
+            ),
+        )
+
     project = _get_project(pid)
     words = _require_words(project)
     deleted_ids = _snapshot_deleted_ids(project)
@@ -1063,6 +1159,7 @@ def export_project(pid: str) -> ExportResponse:
             deleted_ids=deleted_ids,
             output_dir=output_dir,
             basename=f"{pid}_cut",
+            audio_format=audio_format,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"导出失败：{exc}") from exc
@@ -1084,6 +1181,25 @@ def export_project(pid: str) -> ExportResponse:
         getattr(edl, "deletes", []) or [] if edl is not None else []
     )
 
+    # ---- 可选：导出成品视频 ----
+    video_info: Optional[Dict[str, Any]] = None
+    if options.export_video:
+        source_path = project.get("source_path")
+        if not source_path or not Path(source_path).is_file():
+            raise HTTPException(
+                status_code=400,
+                detail="该项目不是从视频上传的，无法导出视频",
+            )
+        video_info = _export_video(
+            source_path=Path(source_path),
+            target_audio=Path(paths["audio_path"]),
+            deletes=deletes,
+            mode=options.video_mode,
+            output_dir=output_dir,
+            basename=f"{pid}_cut",
+        )
+        paths["video_path"] = video_info.pop("path")
+
     return ExportResponse(
         project_id=pid,
         output_duration=float(result.get("output_duration", 0.0)),
@@ -1091,6 +1207,9 @@ def export_project(pid: str) -> ExportResponse:
         token_count=int(result.get("token_count", 0)),
         deleted_count=int(result.get("deleted_count", 0)),
         total_deleted=_total_deleted(deletes),
+        audio_format=audio_format,
+        video_exported=bool(video_info),
+        video_info=video_info,
     )
 
 

@@ -205,6 +205,7 @@ def run_pipeline(
     deleted_ids: Iterable[str],
     output_dir: Union[str, Path],
     basename: str,
+    audio_format: str = "wav",
 ) -> Dict[str, object]:
     """跑完整链路：对齐词表 → 建 EDL → 渲染音频 → 重建字幕 → 导出三件套。
 
@@ -298,6 +299,7 @@ def run_pipeline(
         basename=basename,
         edl=edl,
         srt_text=srt_text,
+        audio_format=audio_format,
     )
 
     return {

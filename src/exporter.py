@@ -326,6 +326,7 @@ def export_all(
     basename: str,
     edl: EDL,
     srt_text: str,
+    audio_format: str = "wav",
 ) -> Dict[str, Path]:
     """一次性导出 ``{basename}.wav``、``{basename}.srt``、``{basename}.edl.json``。
 
@@ -366,8 +367,15 @@ def export_all(
 
     directory = _ensure_directory(Path(output_dir))
 
+    suffix = "." + audio_format.lower().lstrip(".")
+    if suffix not in _FFMPEG_AUDIO_SUFFIXES and suffix != ".wav":
+        raise ValueError(
+            f"不支持的音频格式 {audio_format!r}，可选：wav / "
+            + " / ".join(item.lstrip(".") for item in _FFMPEG_AUDIO_SUFFIXES)
+        )
+
     paths: Dict[str, Path] = {
-        "audio_path": directory / f"{stem}.wav",
+        "audio_path": directory / f"{stem}{suffix}",
         "srt_path": directory / f"{stem}.srt",
         "edl_path": directory / f"{stem}.edl.json",
     }
