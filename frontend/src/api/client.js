@@ -194,8 +194,20 @@ export function restoreTokens(projectId, tokenIds) {
  * POST /api/projects/{pid}/export -> ExportResponse
  * @param {string} projectId
  */
-export function exportProject(projectId) {
-  return request(projectPath(projectId, '/export'), { method: 'POST' })
+/**
+ * POST /api/projects/{pid}/export -> ExportResponse
+ *
+ * @param {string} projectId
+ * @param {{ audio_format?: string, export_video?: boolean, video_mode?: string }} [options]
+ *   与后端 ExportRequest 完全对齐；不传时后端使用默认值（wav / 不导出视频）。
+ */
+export function exportProject(projectId, options = {}) {
+  const body = {
+    audio_format: options.audio_format ?? 'wav',
+    export_video: Boolean(options.export_video),
+    video_mode: options.video_mode ?? 'precise',
+  }
+  return request(projectPath(projectId, '/export'), { method: 'POST', body })
 }
 
 /**

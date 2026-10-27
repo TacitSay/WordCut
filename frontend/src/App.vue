@@ -26,6 +26,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import MenuBar from './components/MenuBar.vue'
 import Toolbar from './components/Toolbar.vue'
+import ExportDialog from './components/ExportDialog.vue'
 import TextEditor from './components/TextEditor.vue'
 import WaveformView from './components/WaveformView.vue'
 import { registerCommands, runCommand, shortcutFromEvent, shortcutMap } from './core/commands.js'
@@ -65,6 +66,8 @@ const deletes = ref([])
 const totalDeleted = ref(0)
 /** 导出结果（ExportResponse） */
 const exportInfo = ref(null)
+/** 导出对话框是否打开 */
+const exportDialogOpen = ref(false)
 /** 后端 API 版本号（状态栏展示） */
 const apiVersion = ref('')
 
@@ -494,7 +497,8 @@ async function handleTranscribe() {
   }
 }
 
-async function handleExport() {
+/** 打开导出对话框（Ctrl+E / 菜单 文件 → 导出）。 */
+function handleExport() {
   if (!project.value) {
     setStatus('请先上传并转写', 'error')
     return
@@ -504,18 +508,34 @@ async function handleExport() {
     return
   }
   if (exporting.value) return
+  exportInfo.value = null
+  exportDialogOpen.value = true
+}
+
+/** 导出对话框确认：按用户选择的格式与视频选项导出。 */
+async function handleExportConfirm(options) {
+  if (!project.value || exporting.value) return
 
   exporting.value = true
-  setStatus('正在导出目标音频 / 字幕 / EDL…', 'busy')
+  const wantsVideo = Boolean(options?.export_video)
+  setStatus(
+    wantsVideo
+      ? '正在导出音频 / 字幕 / EDL / 视频（视频剪辑可能需要几十秒）…'
+      : '正在导出音频 / 字幕 / EDL…',
+    'busy',
+  )
   try {
-    const result = await exportProject(project.value.id)
+    const result = await exportProject(project.value.id, options)
     exportInfo.value = result
     const total = Number(result?.total_deleted)
     if (Number.isFinite(total)) totalDeleted.value = total
-    const audioPath = result?.paths?.audio_path ?? ''
+
+    const files = ['audio_path', 'srt_path', 'edl_path']
+    if (result?.paths?.video_path) files.push('video_path')
     setStatus(
-      `导出完成：目标音频 ${formatSeconds(result?.output_duration)}，删除 ${result?.deleted_count} 个 Token（${formatSeconds(result?.total_deleted)}）` +
-        (audioPath ? ` → ${audioPath}` : ''),
+      `导出完成：${result?.audio_format?.toUpperCase() || 'WAV'} ${formatSeconds(result?.output_duration)}` +
+        (result?.paths?.video_path ? ' + 成品视频' : '') +
+        `（${files.length} 个文件）`,
       'success',
     )
   } catch (error) {
@@ -1007,6 +1027,16 @@ onBeforeUnmount(() => {
         WordCut v{{ apiVersion || '0.1.0' }}
       </span>
     </footer>
+
+    <!-- 导出对话框 -->
+    <ExportDialog
+      :open="exportDialogOpen"
+      :has-source-video="Boolean(project?.source_kind === 'video')"
+      :busy="exporting"
+      :result="exportInfo"
+      @close="exportDialogOpen = false"
+      @confirm="handleExportConfirm"
+    />
   </div>
 </template>
 
