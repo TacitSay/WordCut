@@ -45,6 +45,7 @@ if str(_SRC_DIR) not in sys.path:
 
 import media  # noqa: E402  （必须在 sys.path 调整之后导入）
 import pipeline  # noqa: E402
+import project_file  # noqa: E402
 import segmenter  # noqa: E402
 import subtitle  # noqa: E402
 from model import DeleteSpan, TimeMap, Token  # noqa: E402
@@ -205,6 +206,41 @@ class EditStateResponse(BaseModel):
     deleted_ids: List[str] = Field(..., description="最新的被删 Token id，升序")
     deletes: List[DeleteSpanOut] = Field(..., description="build_deletes 的结果")
     total_deleted: float = Field(..., description="删除总时长（秒，已合并重叠）")
+
+
+class SaveProjectRequest(BaseModel):
+    """POST /api/projects/{pid}/save 的请求体。"""
+
+    path: str = Field(..., description="工程文件保存路径（.wcproj）")
+
+
+class LoadProjectRequest(BaseModel):
+    """POST /api/projects/load 的请求体。"""
+
+    path: str = Field(..., description="工程文件路径（.wcproj）")
+
+
+class LoadProjectResponse(BaseModel):
+    """POST /api/projects/load 的响应：恢复的上下文与完整性校验。"""
+
+    project_id: str = Field(..., description="原项目 id")
+    name: str = Field(..., description="项目名")
+    audio_path: str = Field(..., description="源音频路径")
+    sample_rate: int = Field(..., description="采样率")
+    words: List[WordOut] = Field(..., description="词级对齐结果")
+    deleted_ids: List[str] = Field(..., description="被删 Token id")
+    tokens: List[TokenOut] = Field(..., description="重建的 Token 列表")
+    segments: List[SegmentOut] = Field(default_factory=list, description="重新分段结果")
+    source_kind: str = Field("audio", description="源类型：audio / video")
+    integrity: Dict[str, Any] = Field(..., description="源文件校验结果")
+
+
+class SaveProjectResponse(BaseModel):
+    """POST /api/projects/{pid}/save 的响应。"""
+
+    path: str = Field(..., description="实际写入的工程文件路径")
+    size_bytes: int = Field(..., description="文件大小（字节）")
+    modified_at: str = Field(..., description="保存时间（ISO-8601）")
 
 
 class ExportRequest(BaseModel):
@@ -1210,6 +1246,125 @@ def export_project(pid: str, payload: Optional[ExportRequest] = None) -> ExportR
         audio_format=audio_format,
         video_exported=bool(video_info),
         video_info=video_info,
+    )
+
+
+# ----------------------------------------------------------------------
+# 接口：工程文件保存 / 加载
+# ----------------------------------------------------------------------
+@app.post(
+    "/api/projects/{pid}/save",
+    response_model=SaveProjectResponse,
+    summary="保存工程文件（.wcproj）",
+)
+def save_project_file(pid: str, payload: SaveProjectRequest) -> SaveProjectResponse:
+    """把当前项目的编辑状态写成 .wcproj 工程文件。
+
+    方案 A：工程文件只记录源文件路径与编辑状态，不复制音频/视频。
+    保存时计算源音频的 SHA-256，重新打开时据此校验源文件是否被替换。
+
+    参数:
+        pid: 项目 id。
+        payload: ``{"path": "D:/xxx/我的工程.wcproj"}``。
+
+    返回:
+        ``{path, size_bytes, modified_at}``。
+
+    异常:
+        400: 路径为空或源音频缺失；404: 项目不存在；500: 写入失败。
+    """
+    target = (payload.path or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="保存路径不能为空")
+
+    project = _get_project(pid)
+    path = Path(target)
+
+    try:
+        doc = project_file.save_project(project, path)
+        written = path if path.suffix.lower() == project_file.PROJECT_SUFFIX else path.with_suffix(project_file.PROJECT_SUFFIX)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"写入工程文件失败：{path}（{exc}）"
+        ) from exc
+
+    return SaveProjectResponse(
+        path=str(written.resolve()),
+        size_bytes=int(written.stat().st_size),
+        modified_at=str(doc.get("modified_at", "")),
+    )
+
+
+@app.post(
+    "/api/projects/load",
+    response_model=LoadProjectResponse,
+    summary="加载工程文件（.wcproj）",
+)
+def load_project_file(payload: LoadProjectRequest) -> LoadProjectResponse:
+    """从 .wcproj 恢复一个项目（注册到内存项目表）。
+
+    源音频存在且 hash 匹配时正常恢复；不存在或已变更时仍在响应的
+    ``integrity`` 中返回原因，由前端提示用户。
+
+    参数:
+        payload: ``{"path": "D:/xxx/我的工程.wcproj"}``。
+
+    返回:
+        ``{project_id, name, audio_path, sample_rate, words, deleted_ids,
+        tokens, segments, source_kind, integrity}``。
+
+    异常:
+        400: 不是合法工程文件或版本不支持；404: 文件不存在。
+    """
+    target = (payload.path or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="工程文件路径不能为空")
+
+    path = Path(target)
+    try:
+        loaded = project_file.load_project(path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"工程文件不是合法 JSON：{exc}") from exc
+
+    integrity = loaded["integrity"]
+    if not integrity.get("audio_exists"):
+        raise HTTPException(status_code=400, detail=str(integrity.get("message")))
+
+    # 恢复为一个内存项目（沿用工程里的 id；若已存在则覆盖）
+    project: Dict[str, Any] = {
+        "id": loaded["id"],
+        "name": loaded["name"],
+        "audio_path": loaded["audio_path"],
+        "source_path": loaded.get("source_path"),
+        "source_kind": loaded.get("source_kind", "audio"),
+        "sample_rate": loaded["sample_rate"] or SAMPLE_RATE,
+        "words": loaded["words"],
+        "deleted_ids": set(loaded["deleted_ids"]),
+        "created_at": loaded["created_at"] or _now_iso(),
+    }
+    with _PROJECTS_LOCK:
+        _projects[project["id"]] = project
+
+    tokens = loaded["tokens"]
+    segments = segmenter.segment_tokens(tokens)
+
+    return LoadProjectResponse(
+        project_id=project["id"],
+        name=project["name"],
+        audio_path=project["audio_path"],
+        sample_rate=int(project["sample_rate"]),
+        words=[WordOut(**item) for item in project["words"]],
+        deleted_ids=sorted(project["deleted_ids"]),
+        tokens=[TokenOut(**token.to_dict()) for token in tokens],
+        segments=[SegmentOut(**seg.to_dict()) for seg in segments],
+        source_kind=str(project["source_kind"]),
+        integrity=integrity,
     )
 
 
