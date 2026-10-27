@@ -5,8 +5,10 @@
  *  - 所有字段名严格对齐 src/api.py 里的 Pydantic 响应模型：
  *      ProjectCreated   -> { id, name, sample_rate, duration }
  *      TranscribeResponse -> { project_id, words[], duration, elapsed_seconds, model }
- *      TokenListResponse  -> { project_id, sample_rate, duration, tokens[], deleted_ids[] }
+ *      TokenListResponse  -> { project_id, sample_rate, duration, tokens[],
+ *                              deleted_ids[], segments[] }
  *      TokenOut           -> { id, text, start, end, is_deleted, confidence }
+ *      SegmentOut         -> { index, start, end, duration, text, token_ids[] }
  *      EditStateResponse  -> { project_id, deleted_ids[], deletes[], total_deleted }
  *      DeleteSpanOut      -> { start, end, token_id, cause }
  *      ExportResponse     -> { project_id, output_duration, paths, token_count,

@@ -1,21 +1,22 @@
 <script setup>
 /**
- * 波形视图：用 WaveSurfer 显示源音频波形。
+ * 波形视图（L2：吸顶，固定 180px 高）。
  *
- * 约定（见 docs/术语表.md）：
+ * 约定（见 docs/术语表.md / docs/界面问题清单.md L2）：
  *  - 波形展示的是 source_audio（源音频，只读）；
  *  - DeleteSpan 用红色半透明区域标注，不可拖动 / 不可缩放；
- *  - 点击波形只移动播放头（playhead），不改变任何删除状态。
+ *  - 点击波形只移动播放头（playhead），不改变任何删除状态；
+ *  - 播放控制统一走 composables/usePlayback.js 的共享实例，
+ *    因此 App.vue 的「空格 / 菜单命令」与这里的按钮操作的是同一个播放器。
  *
  * 音频来源：后端未暴露源音频下载接口，因此直接使用用户选择的本地文件
- * （URL.createObjectURL 生成的 blob URL），与上传的是同一个文件。
+ * （URL.createObjectURL 生成的 blob URL），与上传给后端的是同一个文件。
  */
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
-import WaveSurfer from 'wavesurfer.js'
-import RegionsPlugin from 'wavesurfer.js/plugins/regions'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { formatClock, usePlayback } from '../composables/usePlayback.js'
 
 const props = defineProps({
-  /** 源音频的 blob URL（由 App.vue 通过本地 File 生成） */
+  /** 源音频的 blob URL（由 App.vue 用本地 File 生成） */
   audioUrl: { type: String, default: '' },
   /** DeleteSpanOut[]：{ start, end, token_id, cause } */
   deletes: { type: Array, default: () => [] },
@@ -24,276 +25,186 @@ const props = defineProps({
 const emit = defineEmits(['ready'])
 
 const container = ref(null)
-const wave = shallowRef(null)
-const regions = shallowRef(null)
-const ready = ref(false)
-const errorText = ref('')
-const playing = ref(false)
-const currentTime = ref(0)
-const duration = ref(0)
+const { state, attach, detach, setDeletes, toggle, play, pause, seekTo, seekBy } = usePlayback()
 
-/** 当前播放进度百分比（0–100）。 */
-const progress = computed(() => {
-  if (!duration.value) return 0
-  return Math.min(100, Math.max(0, (currentTime.value / duration.value) * 100))
-})
-
-function formatClock(seconds) {
-  const value = Number(seconds)
-  if (!Number.isFinite(value) || value <= 0) return '0:00.0'
-  const minutes = Math.floor(value / 60)
-  const rest = value - minutes * 60
-  return `${minutes}:${rest.toFixed(1).padStart(4, '0')}`
-}
-
-/** 销毁旧实例，避免重复挂载导致多个 canvas 堆叠。 */
-function destroyWave() {
-  if (wave.value) {
-    try {
-      wave.value.destroy()
-    } catch {
-      /* 忽略卸载异常 */
-    }
-  }
-  wave.value = null
-  regions.value = null
-  ready.value = false
-  playing.value = false
-  currentTime.value = 0
-  duration.value = 0
-}
-
-/** 按当前 DeleteSpan 列表重绘红色区间。 */
-function renderRegions() {
-  const plugin = regions.value
-  if (!plugin || !ready.value) return
-  plugin.clearRegions()
-  for (const span of props.deletes) {
-    const start = Number(span?.start)
-    const end = Number(span?.end)
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue
-    plugin.addRegion({
-      start,
-      end,
-      color: 'rgba(239, 68, 68, 0.28)',
-      drag: false,
-      resize: false,
-    })
-  }
-}
-
-/** 创建 WaveSurfer 实例（音频地址变化时重建）。 */
-function createWave(url) {
-  destroyWave()
-  errorText.value = ''
-  if (!url || !container.value) return
-
-  const instance = WaveSurfer.create({
-    container: container.value,
-    url,
-    height: 180,
-    waveColor: '#4b5563',
-    progressColor: '#3b82f6',
-    cursorColor: '#f59e0b',
-    cursorWidth: 2,
-    barWidth: 2,
-    barGap: 1,
-    barRadius: 1,
-    normalize: true,
-    autoScroll: true,
-    autoCenter: false,
-    hideScrollbar: true,
-  })
-
-  const plugin = instance.registerPlugin(RegionsPlugin.create())
-
-  wave.value = instance
-  regions.value = plugin
-
-  instance.on('ready', () => {
-    ready.value = true
-    duration.value = instance.getDuration()
-    renderRegions()
-    emit('ready', duration.value)
-  })
-  instance.on('timeupdate', (time) => {
-    currentTime.value = time
-  })
-  instance.on('seeking', (time) => {
-    currentTime.value = time
-  })
-  instance.on('play', () => {
-    playing.value = true
-  })
-  instance.on('pause', () => {
-    playing.value = false
-  })
-  instance.on('finish', () => {
-    playing.value = false
-  })
-  instance.on('error', (error) => {
-    errorText.value = String(error?.message ?? error ?? '未知错误')
-    ready.value = false
-  })
-
-  // 点击删除区间也只在区间起点移动播放头，不改变删除状态。
-  plugin.on('region-clicked', (region, event) => {
-    event?.stopPropagation?.()
-    if (region && Number.isFinite(Number(region.start))) {
-      instance.setTime(Number(region.start))
-    }
-  })
-}
-
+/** 播放/暂停按钮（也可由父组件通过 ref 调用 expose 出来的方法）。 */
 function togglePlay() {
-  if (!wave.value || !ready.value) return
-  wave.value.playPause()
+  if (!state.ready) return
+  toggle()
+}
+
+/** 挂载/切换音频时重建实例。 */
+function mount(url) {
+  const instance = attach(container.value, url)
+  if (instance) {
+    instance.on('ready', () => emit('ready', state.duration))
+  }
 }
 
 watch(
+  // flush: 'post' —— 等 v-show 生效、容器有真实高度后再挂载波形
   () => props.audioUrl,
-  (url) => {
-    createWave(url)
-  },
+  (url) => mount(url),
+  { flush: 'post' },
 )
 
 watch(
   () => props.deletes,
-  () => {
-    renderRegions()
-  },
+  (spans) => setDeletes(spans),
   { deep: true },
 )
 
 onMounted(() => {
-  createWave(props.audioUrl)
+  setDeletes(props.deletes)
+  mount(props.audioUrl)
 })
 
 onBeforeUnmount(() => {
-  destroyWave()
+  detach()
+})
+
+// 供父组件调用（App.vue 的命令也可以直接走 usePlayback，二选一均可）。
+defineExpose({
+  play,
+  pause,
+  toggle,
+  isPlaying: () => state.playing,
+  getCurrentTime: () => state.currentTime,
+  getDuration: () => state.duration,
+  seekTo,
+  seekBy,
 })
 </script>
 
 <template>
   <section class="waveform-view">
-    <header class="pane-header">
-      <h2 class="pane-title">波形视图</h2>
-      <span class="pane-hint">红色半透明区域 = 删除区间 · 点击波形仅移动播放头</span>
-      <div class="wave-controls">
-        <button
-          class="btn btn-small"
-          type="button"
-          :disabled="!ready"
-          :title="playing ? '暂停' : '播放'"
-          @click="togglePlay"
-        >
-          {{ playing ? '暂停' : '播放' }}
-        </button>
-        <span class="wave-time">{{ formatClock(currentTime) }} / {{ formatClock(duration) }}</span>
-      </div>
-    </header>
+    <header class="wave-header">
+      <button
+        class="wave-play"
+        type="button"
+        :disabled="!state.ready"
+        :title="state.playing ? '暂停（空格）' : '播放（空格）'"
+        @click="togglePlay"
+      >
+        <svg v-if="!state.playing" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+          <path d="M4 2.5v11l9-5.5z" fill="currentColor" />
+        </svg>
+        <svg v-else viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+          <path d="M4 2.5h3.2v11H4zM8.8 2.5H12v11H8.8z" fill="currentColor" />
+        </svg>
+      </button>
 
-    <div class="wave-body">
-      <div v-show="audioUrl" ref="container" class="wave-container" />
-
-      <p v-if="!audioUrl" class="pane-empty">
-        尚未载入音频。在工具栏点击「选择音频」后，这里会直接显示本地音频的源波形。
-      </p>
-      <p v-else-if="errorText" class="pane-empty pane-error">
-        音频加载失败：{{ errorText }}
-      </p>
-
-      <div class="wave-progress" :aria-hidden="true">
-        <div class="wave-progress-bar" :style="{ width: `${progress}%` }" />
-      </div>
+      <span class="wave-title">源波形</span>
+      <span class="wave-time">
+        {{ formatClock(state.currentTime) }} / {{ formatClock(state.duration) }}
+      </span>
+      <span class="wave-hint">红色 = 删除区间 · 点击波形只移动播放头</span>
 
       <ul class="wave-legend">
         <li><span class="legend-swatch legend-deleted" />删除区间</li>
         <li><span class="legend-swatch legend-played" />已播放</li>
         <li><span class="legend-swatch legend-cursor" />播放头</li>
       </ul>
+    </header>
 
-      <p class="wave-note">波形读取的是你选择的本地源音频（与上传给后端的是同一个文件）。</p>
+    <div class="wave-body">
+      <div v-show="audioUrl" ref="container" class="wave-container" />
+      <p v-if="!audioUrl" class="wave-empty">尚未载入音频：点击「选择文件」后这里显示源波形。</p>
+      <p v-else-if="state.errorText" class="wave-empty wave-error">
+        音频加载失败：{{ state.errorText }}
+      </p>
+      <p v-else-if="!state.ready" class="wave-empty">正在解码音频…</p>
     </div>
   </section>
 </template>
 
 <style scoped>
+/* 固定 180px：垂直布局里吸顶不滚动（L2）。 */
 .waveform-view {
   display: flex;
   flex-direction: column;
-  min-height: 0;
-  height: 100%;
-}
-
-.wave-body {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 14px 16px 24px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.wave-container {
-  width: 100%;
+  height: 180px;
   min-height: 180px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 8px 0;
-  box-sizing: border-box;
+  background: var(--bg-panel);
 }
 
-.wave-controls {
+.wave-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-left: auto;
+  gap: 10px;
+  flex: 0 0 auto;
+  height: 28px;
+  padding: 0 12px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.wave-play {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  color: var(--text);
+  background: #37373d;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.wave-play:hover:not(:disabled) {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.wave-play:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.wave-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-strong);
 }
 
 .wave-time {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-dim);
   white-space: nowrap;
 }
 
-.wave-progress {
-  height: 3px;
-  width: 100%;
-  background: var(--border);
-  border-radius: 2px;
+.wave-hint {
+  font-size: 11px;
+  color: var(--text-faint);
   overflow: hidden;
-}
-
-.wave-progress-bar {
-  height: 100%;
-  background: var(--accent);
-  transition: width 0.08s linear;
+  text-overflow: ellipsis;
 }
 
 .wave-legend {
   display: flex;
-  flex-wrap: wrap;
-  gap: 14px;
-  margin: 0;
+  gap: 10px;
+  margin: 0 0 0 auto;
   padding: 0;
   list-style: none;
-  font-size: 12px;
-  color: var(--text-dim);
+  font-size: 11px;
+  color: var(--text-faint);
 }
 
 .wave-legend li {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
 }
 
 .legend-swatch {
-  width: 12px;
-  height: 10px;
+  width: 10px;
+  height: 9px;
   border-radius: 2px;
 }
 
@@ -310,9 +221,38 @@ onBeforeUnmount(() => {
   background: var(--warn);
 }
 
-.wave-note {
+.wave-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 6px 12px 8px;
+}
+
+.wave-container {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.wave-empty {
+  position: absolute;
+  inset: 6px 12px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   margin: 0;
   font-size: 12px;
   color: var(--text-faint);
+  border: 1px dashed var(--border-strong);
+  border-radius: 4px;
+}
+
+.wave-error {
+  color: var(--danger);
 }
 </style>
