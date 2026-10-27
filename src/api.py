@@ -45,6 +45,7 @@ if str(_SRC_DIR) not in sys.path:
 
 import media  # noqa: E402  （必须在 sys.path 调整之后导入）
 import pipeline  # noqa: E402
+import segmenter  # noqa: E402
 import subtitle  # noqa: E402
 from model import DeleteSpan, TimeMap, Token  # noqa: E402
 
@@ -156,6 +157,17 @@ class TokenOut(BaseModel):
     confidence: float = Field(..., description="置信度，范围 [0, 1]")
 
 
+class SegmentOut(BaseModel):
+    """段落的 HTTP 形态（由 segmenter.segment_tokens 生成）。"""
+
+    index: int = Field(..., description="段落序号（0 起）")
+    start: float = Field(..., description="段落起始时间（秒，源时间轴）")
+    end: float = Field(..., description="段落结束时间（秒，源时间轴）")
+    duration: float = Field(..., description="段落时长（秒）")
+    text: str = Field(..., description="段落拼接文本")
+    token_ids: List[str] = Field(..., description="段落包含的 Token id（有序）")
+
+
 class TokenListResponse(BaseModel):
     """``GET /api/projects/{pid}/tokens`` 的响应。"""
 
@@ -164,6 +176,9 @@ class TokenListResponse(BaseModel):
     duration: float = Field(..., description="源音频时长（秒）")
     tokens: List[TokenOut] = Field(..., description="Token 列表（时间序）")
     deleted_ids: List[str] = Field(..., description="被删除的 Token id，升序")
+    segments: List[SegmentOut] = Field(
+        default_factory=list, description="按分段策略切出的段落（仅影响显示）"
+    )
 
 
 class DeleteSpanOut(BaseModel):
@@ -869,12 +884,14 @@ def get_tokens(pid: str) -> TokenListResponse:
     _require_words(project)
     deleted_ids = _snapshot_deleted_ids(project)
     tokens = _tokens_of(project, deleted_ids)
+    segments = segmenter.segment_tokens(tokens)
     return TokenListResponse(
         project_id=pid,
         sample_rate=int(project["sample_rate"]),
         duration=_duration_of(project),
         tokens=[TokenOut(**token.to_dict()) for token in tokens],
         deleted_ids=sorted(deleted_ids),
+        segments=[SegmentOut(**seg.to_dict()) for seg in segments],
     )
 
 
