@@ -81,6 +81,8 @@ const exportDialogOpen = ref(false)
 const saving = ref(false)
 /** 正在检测静音 */
 const detecting = ref(false)
+/** 自上次保存工程后是否有编辑（用于提示用户显式保存） */
+const dirtySinceSave = ref(false)
 /** 工程文件加载中 */
 const loadingProject = ref(false)
 /** 后端 API 版本号（状态栏展示） */
@@ -199,6 +201,8 @@ function applyEditState(state) {
   deletes.value = Array.isArray(state?.deletes) ? [...state.deletes] : []
   const total = Number(state?.total_deleted)
   totalDeleted.value = Number.isFinite(total) ? total : totalOf(deletes.value)
+  // 编辑后工程与磁盘不一致：标记为脏，由用户显式 Ctrl+S 保存
+  if (project.value) dirtySinceSave.value = true
 }
 
 // ----------------------------------------------------------------------
@@ -645,6 +649,7 @@ async function handleSaveProject() {
         await writable.write(payload)
         await writable.close()
         const size = payload.length
+        dirtySinceSave.value = false
         setStatus(
           `工程已保存：${handle.name}（约 ${(size / 1024).toFixed(1)} KB）`,
           'success',
@@ -669,6 +674,7 @@ async function handleSaveProject() {
   setStatus('正在保存工程…', 'busy')
   try {
     const result = await saveProject(project.value.id, target.trim())
+    dirtySinceSave.value = false
     setStatus(
       `工程已保存：${result.path}（${(result.size_bytes / 1024).toFixed(1)} KB）`,
       'success',
@@ -871,7 +877,8 @@ async function handleExportConfirm(options) {
           ? `，已保存到 ${saved.selectionDir}`
           : saved.pickerUsed
             ? '，已保存到你选择的位置'
-            : `（${files.length} 个文件，服务器路径见导出结果）`),
+            : `（${files.length} 个文件，服务器路径见导出结果）`) +
+        (dirtySinceSave.value ? ' · 工程未保存（Ctrl+S 固化本次编辑）' : ''),
       'success',
     )
   } catch (error) {
