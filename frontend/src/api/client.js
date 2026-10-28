@@ -217,13 +217,27 @@ export function saveProject(projectId, path) {
 /**
  * POST /api/projects/load -> LoadProjectResponse
  *
- * @param {string} path 工程文件路径（.wcproj）
+ * @param {string} path 工程文件路径（.wcproj，仅当后端与浏览器同机同路径时可用）
  */
 export function loadProject(path) {
   return request('/api/projects/load', {
     method: 'POST',
     body: { path },
   })
+}
+
+/**
+ * POST /api/projects/load-file -> LoadProjectUploadResponse
+ *
+ * 直接上传工程文件内容，无需知道绝对路径（浏览器环境下的正路）。
+ *
+ * @param {File} file .wcproj 文件
+ */
+export function loadProjectFile(file) {
+  if (!file) throw new ApiError('未选择工程文件', 0, null)
+  const form = new FormData()
+  form.append('file', file, file.name || 'project.wcproj')
+  return request('/api/projects/load-file', { method: 'POST', body: form })
 }
 
 export function exportProject(projectId, options = {}) {

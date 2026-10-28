@@ -139,9 +139,24 @@ def load_project(path: Path) -> Dict[str, Any]:
         raise FileNotFoundError(f"工程文件不存在：{path}")
 
     doc = json.loads(path.read_text(encoding="utf-8"))
+    return parse_project_doc(doc)
+
+
+def parse_project_doc(doc: Any) -> Dict[str, Any]:
+    """解析已经反序列化的工程文档（供文件路径与上传内容两条入口共用）。
+
+    参数:
+        doc: json.loads 之后的字典。
+
+    返回:
+        与 :func:`load_project` 相同的项目字典。
+
+    异常:
+        ValueError: 不是合法工程文件，或版本不支持。
+    """
     if not isinstance(doc, dict) or doc.get("format") != PROJECT_FORMAT:
         raise ValueError(
-            f"不是 WordCut 工程文件（缺少 format={PROJECT_FORMAT!r}）：{path}"
+            f"不是 WordCut 工程文件（缺少 format={PROJECT_FORMAT!r}）：{doc!r:.200}"
         )
     if str(doc.get("version")) != PROJECT_VERSION:
         raise ValueError(

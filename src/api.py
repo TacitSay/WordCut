@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import threading
@@ -124,6 +125,9 @@ class ProjectCreated(BaseModel):
     name: str = Field(..., description="项目名")
     sample_rate: int = Field(..., description="采样率（Hz），统一为 16000")
     duration: float = Field(..., description="源音频时长（秒）")
+    source_kind: str = Field(
+        "audio", description="源类型：audio（纯音频）/ video（含视频轨，可导出成品视频）"
+    )
 
 
 class WordOut(BaseModel):
@@ -933,6 +937,7 @@ async def create_project(
         name=project_name,
         sample_rate=SAMPLE_RATE,
         duration=duration,
+        source_kind=str(project["source_kind"]),
     )
 
 
@@ -1366,6 +1371,102 @@ def load_project_file(payload: LoadProjectRequest) -> LoadProjectResponse:
         source_kind=str(project["source_kind"]),
         integrity=integrity,
     )
+
+
+class LoadProjectUploadResponse(BaseModel):
+    """POST /api/projects/load-file 的响应（与 load 相同，额外回显文件名）。"""
+
+    file_name: str = Field("", description="上传的工程文件名")
+    project_id: str = Field(..., description="原项目 id")
+    name: str = Field(..., description="项目名")
+    audio_path: str = Field(..., description="源音频路径")
+    sample_rate: int = Field(..., description="采样率")
+    words: List[WordOut] = Field(..., description="词级对齐结果")
+    deleted_ids: List[str] = Field(..., description="被删 Token id")
+    tokens: List[TokenOut] = Field(..., description="重建的 Token 列表")
+    segments: List[SegmentOut] = Field(default_factory=list, description="重新分段结果")
+    source_kind: str = Field("audio", description="源类型：audio / video")
+    integrity: Dict[str, Any] = Field(..., description="源文件校验结果")
+
+
+def _restore_project_from_doc(loaded: Dict[str, Any]) -> Dict[str, Any]:
+    """把 load_project 的解析结果恢复成内存项目并重新分段。"""
+    integrity = loaded["integrity"]
+    if not integrity.get("audio_exists"):
+        raise HTTPException(status_code=400, detail=str(integrity.get("message")))
+
+    project: Dict[str, Any] = {
+        "id": loaded["id"],
+        "name": loaded["name"],
+        "audio_path": loaded["audio_path"],
+        "source_path": loaded.get("source_path"),
+        "source_kind": loaded.get("source_kind", "audio"),
+        "sample_rate": loaded["sample_rate"] or SAMPLE_RATE,
+        "words": loaded["words"],
+        "deleted_ids": set(loaded["deleted_ids"]),
+        "created_at": loaded["created_at"] or _now_iso(),
+    }
+    with _PROJECTS_LOCK:
+        _projects[project["id"]] = project
+
+    tokens = loaded["tokens"]
+    segments = segmenter.segment_tokens(tokens)
+    return {
+        "project_id": project["id"],
+        "name": project["name"],
+        "audio_path": project["audio_path"],
+        "sample_rate": int(project["sample_rate"]),
+        "words": [WordOut(**item) for item in project["words"]],
+        "deleted_ids": sorted(project["deleted_ids"]),
+        "tokens": [TokenOut(**token.to_dict()) for token in tokens],
+        "segments": [SegmentOut(**seg.to_dict()) for seg in segments],
+        "source_kind": str(project["source_kind"]),
+        "integrity": integrity,
+    }
+
+
+@app.post(
+    "/api/projects/load-file",
+    response_model=LoadProjectUploadResponse,
+    summary="上传 .wcproj 文件内容并加载工程",
+)
+async def load_project_from_upload(
+    file: UploadFile = File(..., description=".wcproj 工程文件"),
+) -> LoadProjectUploadResponse:
+    """直接接收工程文件内容并加载（浏览器沙箱拿不到绝对路径时的正路）。
+
+    与 /api/projects/load 的区别：本接口不需要服务器可访问的路径，
+    前端读文件字节直接上传即可，适用于浏览器环境与远程后端。
+
+    参数:
+        file: .wcproj 文件内容。
+
+    返回:
+        与 load 相同的恢复结果，外加 file_name。
+
+    异常:
+        400: 内容不是合法工程文件或版本不支持；
+        404: 工程记录的源音频在服务器上不存在。
+    """
+    raw = await file.read()
+    await file.close()
+    if not raw:
+        raise HTTPException(status_code=400, detail="上传的工程文件为空")
+
+    try:
+        doc = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"工程文件不是合法 JSON：{exc}"
+        ) from exc
+
+    try:
+        loaded = project_file.parse_project_doc(doc)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    restored = _restore_project_from_doc(loaded)
+    return LoadProjectUploadResponse(file_name=file.filename or "", **restored)
 
 
 # ----------------------------------------------------------------------

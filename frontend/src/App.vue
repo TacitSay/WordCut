@@ -39,6 +39,7 @@ import {
   fetchTokens,
   health,
   loadProject,
+  loadProjectFile,
   restoreTokens,
   saveProject,
   transcribeProject,
@@ -567,6 +568,55 @@ async function handleSaveProject() {
   }
 }
 
+/** 把加载结果应用为当前项目（成功路径，供路径加载与文件上传共用）。 */
+function applyLoadedProject(loaded) {
+  resetProjectState()
+
+  project.value = {
+    id: loaded.project_id,
+    name: loaded.name,
+    sample_rate: loaded.sample_rate,
+    duration: 0,
+    source_kind: loaded.source_kind,
+  }
+  projectName.value = loaded.name
+  tokens.value = Array.isArray(loaded.tokens) ? [...loaded.tokens] : []
+  segments.value = Array.isArray(loaded.segments) ? [...loaded.segments] : []
+  deletedIds.value = Array.isArray(loaded.deleted_ids) ? [...loaded.deleted_ids] : []
+  deletes.value = buildDeletesFromTokens(tokens.value, deletedIds.value)
+  totalDeleted.value = totalOf(deletes.value)
+  playback.setDeletes(deletes.value)
+  exportInfo.value = null
+
+  const integrity = loaded.integrity || {}
+  setStatus(
+    integrity.audio_ok
+      ? `已打开「${loaded.name}」：${tokens.value.length} 个 Token，删除 ${deletedIds.value.length} 个`
+      : `已打开「${loaded.name}」但源文件有变动：${integrity.message || ''}`,
+    integrity.audio_ok ? 'success' : 'error',
+  )
+}
+
+/** 直接读取工程文件内容并加载（无需绝对路径）。 */
+async function openProjectFromFile(file) {
+  if (!file) return
+  if (busy.value) {
+    setStatus('当前有任务在进行，请稍后再打开工程', 'error')
+    return
+  }
+
+  loadingProject.value = true
+  setStatus(`正在读取工程文件「${file.name}」…`, 'busy')
+  try {
+    const loaded = await loadProjectFile(file)
+    applyLoadedProject(loaded)
+  } catch (error) {
+    setStatus(`打开工程失败：${error.message}`, 'error')
+  } finally {
+    loadingProject.value = false
+  }
+}
+
 /** Ctrl+Shift+O：打开工程文件（.wcproj）。 */
 async function handleOpenProject() {
   if (busy.value) {
@@ -574,7 +624,7 @@ async function handleOpenProject() {
     return
   }
 
-  let target = ''
+  // 首选：原生文件选择器，直接读文件内容上传（不需要绝对路径）
   if (window.showOpenFilePicker) {
     try {
       const [handle] = await window.showOpenFilePicker({
@@ -586,27 +636,41 @@ async function handleOpenProject() {
         ],
         multiple: false,
       })
-      const directory = window.prompt(
-        '请填写该工程文件所在目录的绝对路径（例如 D:\\工程）：',
-        '',
-      )
-      if (!directory) {
-        setStatus('已取消打开', 'info')
-        return
-      }
-      target = `${directory.replace(/[\\/]+$/, '')}\\${handle.name}`
+      const file = await handle.getFile()
+      await openProjectFromFile(file)
+      return
     } catch (error) {
       if (error?.name === 'AbortError') {
         setStatus('已取消打开', 'info')
         return
       }
-      target = ''
     }
   }
 
-  if (!target) {
-    target = window.prompt('工程文件路径（含 .wcproj）：', '') || ''
+  // 兜底：隐藏的 <input type=file> 选择器
+  openProjectInput()
+}
+
+/** 兜底方案：触发隐藏 input 选择 .wcproj。 */
+function openProjectInput() {
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = '.wcproj,application/json'
+  input.onchange = () => {
+    const file = input.files && input.files[0]
+    if (file) openProjectFromFile(file)
   }
+  input.click()
+}
+
+/** 旧路径加载入口（保留：后端与浏览器同机时可用绝对路径）。 */
+async function handleOpenProjectByPath() {
+  if (busy.value) {
+    setStatus('当前有任务在进行，请稍后再打开工程', 'error')
+    return
+  }
+
+  const target = window.prompt('工程文件路径（含 .wcproj）：', '') || ''
   if (!target.trim()) {
     setStatus('已取消打开', 'info')
     return
@@ -616,32 +680,7 @@ async function handleOpenProject() {
   setStatus('正在打开工程…', 'busy')
   try {
     const loaded = await loadProject(target.trim())
-    resetProjectState()
-
-    project.value = {
-      id: loaded.project_id,
-      name: loaded.name,
-      sample_rate: loaded.sample_rate,
-      duration: 0,
-      source_kind: loaded.source_kind,
-    }
-    projectName.value = loaded.name
-    tokens.value = Array.isArray(loaded.tokens) ? [...loaded.tokens] : []
-    segments.value = Array.isArray(loaded.segments) ? [...loaded.segments] : []
-    deletedIds.value = Array.isArray(loaded.deleted_ids) ? [...loaded.deleted_ids] : []
-    deletes.value = buildDeletesFromTokens(tokens.value, deletedIds.value)
-    totalDeleted.value = totalOf(deletes.value)
-    playback.setDeletes(deletes.value)
-    exportInfo.value = null
-
-    const integrity = loaded.integrity || {}
-    const message = integrity.message || ''
-    setStatus(
-      integrity.audio_ok
-        ? `已打开「${loaded.name}」：${tokens.value.length} 个 Token，删除 ${deletedIds.value.length} 个`
-        : `已打开「${loaded.name}」但源文件有变动：${message}`,
-      integrity.audio_ok ? 'success' : 'error',
-    )
+    applyLoadedProject(loaded)
   } catch (error) {
     setStatus(`打开工程失败：${error.message}`, 'error')
   } finally {
@@ -1006,6 +1045,13 @@ async function onDrop(event) {
   dragging.value = false
   const file = event.dataTransfer?.files?.[0]
   if (!file) return
+
+  // 拖入 .wcproj 工程文件：直接读取内容加载工程
+  if (file.name.toLowerCase().endsWith('.wcproj')) {
+    await openProjectFromFile(file)
+    return
+  }
+
   if (busy.value) {
     setStatus('当前有任务在进行，请等待完成后再导入新文件', 'error')
     return
@@ -1047,6 +1093,7 @@ onBeforeUnmount(() => {
         <span class="drop-icon">⬇</span>
         <strong>松手导入</strong>
         <span class="drop-sub">支持音频 / 视频（mp4、mov、mkv、mp3、wav、flac、m4a…）</span>
+        <span class="drop-sub">也可拖入 .wcproj 工程文件直接打开</span>
       </div>
     </div>
 
