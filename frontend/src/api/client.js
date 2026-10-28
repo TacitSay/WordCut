@@ -185,6 +185,23 @@ export function deleteTokens(projectId, tokenIds) {
 }
 
 /**
+ * POST /api/projects/{pid}/silences -> SilenceSuggestResponse
+ *
+ * 检测静音段并返回建议删除区间（DTO 与后端 SilenceSuggestRequest 对齐）。
+ *
+ * @param {string} projectId
+ * @param {{ min_silence?: number, threshold_db?: number, padding?: number }} [options]
+ */
+export function detectSilences(projectId, options = {}) {
+  const body = {
+    min_silence: options.min_silence ?? 0.8,
+    threshold_db: options.threshold_db ?? -38.0,
+    padding: options.padding ?? 0.08,
+  }
+  return request(projectPath(projectId, '/silences'), { method: 'POST', body })
+}
+
+/**
  * POST /api/projects/{pid}/restore -> EditStateResponse
  * @param {string} projectId
  * @param {string[]} tokenIds

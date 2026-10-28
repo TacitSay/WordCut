@@ -36,6 +36,7 @@ import { formatClock, usePlayback } from './composables/usePlayback.js'
 import {
   createProject,
   deleteTokens,
+  detectSilences,
   exportFileUrl,
   exportProject,
   fetchTokens,
@@ -78,6 +79,8 @@ const exportInfo = ref(null)
 const exportDialogOpen = ref(false)
 /** 工程文件保存中 */
 const saving = ref(false)
+/** 正在检测静音 */
+const detecting = ref(false)
 /** 工程文件加载中 */
 const loadingProject = ref(false)
 /** 后端 API 版本号（状态栏展示） */
@@ -374,6 +377,60 @@ async function handleRestoreSelection() {
     return
   }
   await performEdit(targets, 'restore', { nextCursor: selectionRange.value.start })
+}
+
+/** 静音检测：调用后端分析并批量删除无发音的长停顿。 */
+async function handleRemoveSilences() {
+  if (!project.value || !hasTokens.value) {
+    setStatus('请先转写，再检测静音', 'info')
+    return
+  }
+  if (busy.value) return
+
+  detecting.value = true
+  setStatus('正在分析音频中的静音段…', 'busy')
+  try {
+    const result = await detectSilences(project.value.id, { min_silence: 0.8 })
+    const deletes = Array.isArray(result?.deletes) ? result.deletes : []
+    if (!deletes.length) {
+      setStatus(
+        `未发现可删除的静音段（检出 ${result?.silences?.length ?? 0} 段，均与发音重叠）`,
+        'info',
+      )
+      return
+    }
+
+    // 静音区间落在两个 token 之间，按时间相邻关系映射回 token：
+    // 把"完全落在静音区间内"的 token 视为要删除的对象。
+    const ids = tokens.value
+      .filter((token) =>
+        deletes.some(
+          (span) =>
+            Number(token.start) >= Number(span.start) - 0.02 &&
+            Number(token.end) <= Number(span.end) + 0.02,
+        ),
+      )
+      .map((token) => token.id)
+      .filter((id) => !deletedSet.value.has(id))
+
+    if (!ids.length) {
+      setStatus(
+        `检出 ${deletes.length} 段静音（共 ${Number(result.total_deleted).toFixed(1)}s），但没有整词落在其中，已跳过`,
+        'info',
+      )
+      return
+    }
+
+    await performEdit(ids, 'delete', { nextCursor: cursorIndex.value })
+    setStatus(
+      `静音处理完成：删除 ${ids.length} 个 Token（${deletes.length} 段静音，共 ${Number(result.total_deleted).toFixed(1)}s）`,
+      'success',
+    )
+  } catch (error) {
+    setStatus(`静音检测失败：${error.message}`, 'error')
+  } finally {
+    detecting.value = false
+  }
 }
 
 /** 点击已删除 Token：立即恢复它。 */
@@ -1016,6 +1073,13 @@ registerCommands([
     menu: 'edit',
     shortcut: 'Ctrl+Shift+Z',
     handler: () => handleRestoreSelection(),
+  },
+  {
+    id: 'edit.removeSilences',
+    title: '检测静音并批量删除…',
+    menu: 'edit',
+    handler: () => handleRemoveSilences(),
+    enabled: () => Boolean(project.value) && hasTokens.value && !busy.value,
   },
   {
     id: 'edit.selectAll',
