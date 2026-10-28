@@ -42,6 +42,7 @@ import {
   loadProject,
   loadProjectFile,
   restoreTokens,
+  sourceAudioUrl,
   saveProject,
   transcribeProject,
 } from './api/client.js'
@@ -582,7 +583,7 @@ async function handleSaveProject() {
 }
 
 /** 把加载结果应用为当前项目（成功路径，供路径加载与文件上传共用）。 */
-function applyLoadedProject(loaded) {
+async function applyLoadedProject(loaded) {
   resetProjectState()
 
   project.value = {
@@ -602,11 +603,36 @@ function applyLoadedProject(loaded) {
   exportInfo.value = null
 
   const integrity = loaded.integrity || {}
+
+  // 按工程记录的路径让后端重新提供源音频，恢复波形与播放
+  let audioRestored = false
+  try {
+    const response = await fetch(
+      `${sourceAudioUrl(loaded.project_id)}?t=${Date.now()}`,
+    )
+    if (response.ok) {
+      const blob = await response.blob()
+      if (audioUrl.value) URL.revokeObjectURL(audioUrl.value)
+      audioUrl.value = URL.createObjectURL(blob)
+      audioRestored = true
+    }
+  } catch {
+    audioRestored = false
+  }
+
+  if (!integrity.audio_ok) {
+    setStatus(
+      `已打开「${loaded.name}」但源文件有变动：${integrity.message || ''}`,
+      'error',
+    )
+    return
+  }
+
   setStatus(
-    integrity.audio_ok
-      ? `已打开「${loaded.name}」：${tokens.value.length} 个 Token，删除 ${deletedIds.value.length} 个`
-      : `已打开「${loaded.name}」但源文件有变动：${integrity.message || ''}`,
-    integrity.audio_ok ? 'success' : 'error',
+    audioRestored
+      ? `已打开「${loaded.name}」：${tokens.value.length} 个 Token，删除 ${deletedIds.value.length} 个，音频已恢复`
+      : `已打开「${loaded.name}」：${tokens.value.length} 个 Token（音频未恢复，请重新导入源文件）`,
+    audioRestored ? 'success' : 'error',
   )
 }
 
@@ -622,7 +648,7 @@ async function openProjectFromFile(file) {
   setStatus(`正在读取工程文件「${file.name}」…`, 'busy')
   try {
     const loaded = await loadProjectFile(file)
-    applyLoadedProject(loaded)
+    await applyLoadedProject(loaded)
   } catch (error) {
     setStatus(`打开工程失败：${error.message}`, 'error')
   } finally {
@@ -693,7 +719,7 @@ async function handleOpenProjectByPath() {
   setStatus('正在打开工程…', 'busy')
   try {
     const loaded = await loadProject(target.trim())
-    applyLoadedProject(loaded)
+    await applyLoadedProject(loaded)
   } catch (error) {
     setStatus(`打开工程失败：${error.message}`, 'error')
   } finally {

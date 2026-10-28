@@ -214,6 +214,11 @@ export function restoreTokens(projectId, tokenIds) {
  *
  * @param {string} projectId
  */
+/** GET /api/projects/{pid}/source-audio -> WAV blob URL（按工程记录的路径恢复波形） */
+export function sourceAudioUrl(projectId) {
+  return `${API_BASE}/api/projects/${encodeURIComponent(String(projectId))}/source-audio`
+}
+
 export function buildProjectFile(projectId) {
   return request(projectPath(projectId, '/project-file'))
 }

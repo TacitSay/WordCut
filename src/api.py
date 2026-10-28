@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 # ----------------------------------------------------------------------
@@ -1512,6 +1513,71 @@ async def load_project_from_upload(
 
     restored = _restore_project_from_doc(loaded)
     return LoadProjectUploadResponse(file_name=file.filename or "", **restored)
+
+
+@app.get(
+    "/api/projects/{pid}/source-audio",
+    summary="按工程记录的路径重新读取源音频（加载工程后恢复波形）",
+)
+def get_source_audio(pid: str) -> FileResponse:
+    """按项目记录的 source 路径重新转码源音频，返回 16kHz 单声道 WAV 供波形使用。
+
+    加载 .wcproj 后，浏览器无法直接读取源文件的本地路径，因此由后端
+    重新从原路径转码一份 WAV 返回。若原路径不可用（文件被移动/删除），
+    返回 404，前端提示用户手动重新导入。
+
+    参数:
+        pid: 项目 id。
+
+    返回:
+        WAV 文件流（audio/wav）。
+
+    异常:
+        404: 项目不存在，或源文件路径已失效；500: 转码失败。
+    """
+    project = _get_project(pid)
+
+    # 优先用工程里记录的原始文件（视频会丢弃画面只取音轨）
+    candidates = [
+        project.get("original_media_path"),
+        project.get("source_path"),
+        project.get("audio_path"),
+    ]
+    source: Optional[Path] = None
+    for item in candidates:
+        if not item:
+            continue
+        candidate = Path(str(item))
+        if candidate.is_file():
+            source = candidate
+            break
+
+    if source is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "源文件路径已失效（可能被移动或删除）："
+                f"{project.get('original_media_path') or project.get('source_path') or project.get('audio_path')}"
+                "；请重新导入源文件"
+            ),
+        )
+
+    cache_dir = OUTPUT_DIR / pid
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = cache_dir / "source_preview.wav"
+
+    try:
+        # 已经是目标格式的 WAV 直接复用，避免重复转码
+        if source.suffix.lower() == ".wav" and source.name.endswith(".wav"):
+            if source.stat().st_size > 44:
+                return FileResponse(str(source), media_type="audio/wav", filename="source.wav")
+        media.convert_to_wav16k(source, cache, SAMPLE_RATE)
+    except media.MediaToolError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"读取源音频失败：{exc}"
+        ) from exc
+
+    return FileResponse(str(cache), media_type="audio/wav", filename="source.wav")
 
 
 # ----------------------------------------------------------------------
