@@ -50,6 +50,7 @@ import media  # noqa: E402  （必须在 sys.path 调整之后导入）
 import pipeline  # noqa: E402
 import project_file  # noqa: E402
 import segmenter  # noqa: E402
+import silence  # noqa: E402
 import subtitle  # noqa: E402
 from model import DeleteSpan, TimeMap, Token  # noqa: E402
 
@@ -247,6 +248,24 @@ class SaveProjectResponse(BaseModel):
     path: str = Field(..., description="实际写入的工程文件路径")
     size_bytes: int = Field(..., description="文件大小（字节）")
     modified_at: str = Field(..., description="保存时间（ISO-8601）")
+
+
+class SilenceSuggestRequest(BaseModel):
+    """POST /api/projects/{pid}/silences 的请求体。"""
+
+    min_silence: float = Field(0.8, description="最短静音时长（秒）")
+    threshold_db: float = Field(-38.0, description="静音判定阈值（dBFS）")
+    padding: float = Field(0.08, description="静音段两端各收缩（秒）")
+
+
+class SilenceSuggestResponse(BaseModel):
+    """POST /api/projects/{pid}/silences 的响应。"""
+
+    project_id: str = Field(..., description="项目 id")
+    silences: List[Dict[str, Any]] = Field(..., description="检测到的静音段（秒）")
+    deletes: List[DeleteSpanOut] = Field(..., description="建议删除区间")
+    total_silence: float = Field(..., description="静音总时长（秒）")
+    total_deleted: float = Field(..., description="建议删除总时长（秒）")
 
 
 class ExportRequest(BaseModel):
@@ -1625,6 +1644,61 @@ def get_export_file(pid: str, filename: str) -> FileResponse:
         raise HTTPException(status_code=404, detail=f"导出文件不存在：{filename}")
 
     return FileResponse(str(target), filename=filename)
+
+
+@app.post(
+    "/api/projects/{pid}/silences",
+    response_model=SilenceSuggestResponse,
+    summary="检测静音段并给出建议删除区间",
+)
+def detect_project_silences(
+    pid: str, payload: Optional[SilenceSuggestRequest] = None
+) -> SilenceSuggestResponse:
+    """用短时能量检测音频中的静音段，转成建议删除的 DeleteSpan。
+
+    已经与 token 发音区间做过重叠保护：完全落在某个词内部的静音不会被建议删除。
+
+    参数:
+        pid: 项目 id。
+        payload: ``{min_silence, threshold_db, padding}``；省略时用默认值。
+
+    返回:
+        ``{silences, deletes, total_silence, total_deleted}``，时间单位秒。
+
+    异常:
+        400: 参数非法；404: 项目不存在。
+    """
+    options = payload or SilenceSuggestRequest()
+    project = _get_project(pid)
+    words = _require_words(project)
+    samples = _load_samples(project)
+    rate = int(project["sample_rate"])
+
+    try:
+        tokens = pipeline.load_tokens(words, set())
+        silences = silence.detect_silences(
+            samples,
+            rate,
+            min_silence=float(options.min_silence),
+            threshold_db=float(options.threshold_db),
+            padding=float(options.padding),
+        )
+        deletes = silence.suggest_pause_deletes(
+            samples,
+            rate,
+            tokens,
+            min_silence=float(options.min_silence),
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"静音检测参数非法：{exc}") from exc
+
+    return SilenceSuggestResponse(
+        project_id=pid,
+        silences=silences,
+        deletes=[DeleteSpanOut(**span.to_dict()) for span in deletes],
+        total_silence=round(sum(item["duration"] for item in silences), 3),
+        total_deleted=round(_total_deleted(deletes), 3),
+    )
 
 
 # ----------------------------------------------------------------------
