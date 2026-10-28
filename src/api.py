@@ -50,6 +50,7 @@ import media  # noqa: E402  （必须在 sys.path 调整之后导入）
 import pipeline  # noqa: E402
 import project_file  # noqa: E402
 import segmenter  # noqa: E402
+import store as store_mod  # noqa: E402
 import silence  # noqa: E402
 import subtitle  # noqa: E402
 from model import DeleteSpan, TimeMap, Token  # noqa: E402
@@ -108,6 +109,13 @@ _MAX_LISTED_IDS: int = 20
 #: * ``words`` (List[dict])：faster-whisper word dict 列表（未转写时为空）；
 #: * ``deleted_ids`` (Set[str])：被删除的 Token id 集合；
 #: * ``created_at`` (str)：创建时间（ISO-8601，UTC）。
+#: 项目持久化仓库（SQLite）。后端重启后项目不再丢失。
+DB_PATH: Path = BASE_DIR / "data" / "wordcut.db"
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+_store: store_mod.Repository = store_mod.Repository(DB_PATH)
+
+#: 兼容旧代码的轻量视图：多数接口改为经 _store 读写，
+#: 保留 _projects 仅用于兼容外部测试脚本直接清空内存表。
 _projects: Dict[str, Dict[str, Any]] = {}
 
 #: 保护 :data:`_projects` 的锁（读写都加锁，临界区内只做纯内存操作）。
@@ -375,8 +383,7 @@ def _get_project(project_id: str) -> Dict[str, Any]:
     返回的是项目字典引用本身；调用方若要修改 ``deleted_ids`` 等可变字段，
     必须自行持有 :data:`_PROJECTS_LOCK`。
     """
-    with _PROJECTS_LOCK:
-        project = _projects.get(project_id)
+    project = _store.get(project_id)
     if project is None:
         raise HTTPException(
             status_code=404,
@@ -858,8 +865,7 @@ def _srt_to_plain(srt_text: str) -> str:
 @app.get("/api/health", response_model=HealthResponse, summary="健康检查")
 def health() -> HealthResponse:
     """返回服务存活状态与内存中的项目数量。"""
-    with _PROJECTS_LOCK:
-        count = len(_projects)
+    count = len(_store.list_all())
     return HealthResponse(
         status="ok",
         version=app.version,
@@ -875,8 +881,7 @@ def health() -> HealthResponse:
 )
 def list_projects() -> List[ProjectSummary]:
     """列出内存中所有项目的摘要（按创建时间倒序，最新在前）。"""
-    with _PROJECTS_LOCK:
-        items = list(_projects.values())
+    items = _store.list_all()
 
     summaries: List[ProjectSummary] = []
     for project in items:
@@ -961,8 +966,7 @@ async def create_project(
         "deleted_ids": set(),
         "created_at": _now_iso(),
     }
-    with _PROJECTS_LOCK:
-        _projects[project_id] = project
+    _store.put(project)
 
     return ProjectCreated(
         id=project_id,
@@ -1061,9 +1065,10 @@ def transcribe_project(pid: str) -> TranscribeResponse:
 
     # 不变量 4：id 由词序决定，不重排；旧删除引用只保留仍存在的 id。
     known_ids = {f"{pipeline.TOKEN_ID_PREFIX}{index:05d}" for index in range(len(words))}
-    with _PROJECTS_LOCK:
-        project["words"] = words
-        project["deleted_ids"] &= known_ids
+    project["words"] = words
+    project["deleted_ids"] &= known_ids
+    _store.update_words(pid, words)
+    _store.update_deleted_ids(pid, project["deleted_ids"])
 
     return TranscribeResponse(
         project_id=pid,
@@ -1134,9 +1139,9 @@ def delete_tokens(pid: str, payload: TokenIdsRequest) -> EditStateResponse:
     known_ids = {token.id for token in tokens}
     ids = _validate_token_ids(payload.token_ids, known_ids)
 
-    with _PROJECTS_LOCK:
-        project["deleted_ids"].update(ids)
-        current = set(project["deleted_ids"])
+    project["deleted_ids"].update(ids)
+    current = set(project["deleted_ids"])
+    _store.update_deleted_ids(pid, current)
 
     deletes = _deletes_of(tokens, current)
     return EditStateResponse(
@@ -1169,9 +1174,9 @@ def restore_tokens(pid: str, payload: TokenIdsRequest) -> EditStateResponse:
     known_ids = {token.id for token in tokens}
     ids = _validate_token_ids(payload.token_ids, known_ids)
 
-    with _PROJECTS_LOCK:
-        project["deleted_ids"].difference_update(ids)
-        current = set(project["deleted_ids"])
+    project["deleted_ids"].difference_update(ids)
+    current = set(project["deleted_ids"])
+    _store.update_deleted_ids(pid, current)
 
     deletes = _deletes_of(tokens, current)
     return EditStateResponse(
@@ -1430,8 +1435,7 @@ def load_project_file(payload: LoadProjectRequest) -> LoadProjectResponse:
         "deleted_ids": set(loaded["deleted_ids"]),
         "created_at": loaded["created_at"] or _now_iso(),
     }
-    with _PROJECTS_LOCK:
-        _projects[project["id"]] = project
+    _store.put(project)
 
     tokens = loaded["tokens"]
     segments = segmenter.segment_tokens(tokens)
@@ -1483,8 +1487,7 @@ def _restore_project_from_doc(loaded: Dict[str, Any]) -> Dict[str, Any]:
         "deleted_ids": set(loaded["deleted_ids"]),
         "created_at": loaded["created_at"] or _now_iso(),
     }
-    with _PROJECTS_LOCK:
-        _projects[project["id"]] = project
+    _store.put(project)
 
     tokens = loaded["tokens"]
     segments = segmenter.segment_tokens(tokens)
