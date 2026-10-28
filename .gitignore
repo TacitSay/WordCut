@@ -30,3 +30,7 @@ experiments/*/output/
 # 运行时产物
 uploads/
 outputs/
+
+# 误存的工程文件
+*.wcproj
+src/00*
