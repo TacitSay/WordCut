@@ -1254,9 +1254,54 @@ def export_project(pid: str, payload: Optional[ExportRequest] = None) -> ExportR
     )
 
 
+class ProjectFileResponse(BaseModel):
+    """POST /api/projects/{pid}/project-file 的响应：可直接写盘的工程文档。"""
+
+    document: Dict[str, Any] = Field(
+        ..., description="完整工程文档（与 .wcproj 内容一致）"
+    )
+    suggested_name: str = Field(..., description="建议的文件名（含 .wcproj）")
+
+
 # ----------------------------------------------------------------------
 # 接口：工程文件保存 / 加载
 # ----------------------------------------------------------------------
+@app.get(
+    "/api/projects/{pid}/project-file",
+    response_model=ProjectFileResponse,
+    summary="生成工程文档（由浏览器写入本地文件）",
+)
+def get_project_file(pid: str) -> ProjectFileResponse:
+    """返回完整工程文档，供前端用 File System Access API 直接写盘。
+
+    与 /save 的区别：本接口不写服务器磁盘，只返回内容。
+    浏览器（Chrome/Edge）可据此弹出原生保存对话框，用户选择位置后直接写入，
+    无需知道绝对路径。
+
+    参数:
+        pid: 项目 id。
+
+    返回:
+        ``{document, suggested_name}``。
+
+    异常:
+        400: 源音频缺失等前置条件不满足；404: 项目不存在。
+    """
+    project = _get_project(pid)
+    try:
+        doc = project_file.build_project_doc(project)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    safe_name = "".join(
+        ch for ch in str(project.get("name") or "untitled") if ch not in '\\/:*?"<>|'
+    ).strip() or "untitled"
+    return ProjectFileResponse(
+        document=doc,
+        suggested_name=f"{safe_name}{project_file.PROJECT_SUFFIX}",
+    )
+
+
 @app.post(
     "/api/projects/{pid}/save",
     response_model=SaveProjectResponse,

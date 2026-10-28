@@ -207,6 +207,17 @@ export function restoreTokens(projectId, tokenIds) {
  * @param {string} projectId
  * @param {string} path 工程文件保存路径（.wcproj）
  */
+/**
+ * GET /api/projects/{pid}/project-file -> { document, suggested_name }
+ *
+ * 只生成工程文档内容，不写服务器磁盘；浏览器可据此直接写本地文件。
+ *
+ * @param {string} projectId
+ */
+export function buildProjectFile(projectId) {
+  return request(projectPath(projectId, '/project-file'))
+}
+
 export function saveProject(projectId, path) {
   return request(projectPath(projectId, '/save'), {
     method: 'POST',

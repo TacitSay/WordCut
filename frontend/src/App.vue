@@ -37,6 +37,7 @@ import {
   deleteTokens,
   exportProject,
   fetchTokens,
+  buildProjectFile,
   health,
   loadProject,
   loadProjectFile,
@@ -513,10 +514,13 @@ async function handleSaveProject() {
   }
 
   const suggested = `${project.value.name || 'untitled'}.wcproj`
-  let target = ''
-  if (window.showSaveFilePicker) {
+  const supportsNativePicker = Boolean(window.showSaveFilePicker)
+
+  // 原生保存器可用：让后端生成内容，前端写进用户选的路径（无需绝对路径）
+  if (supportsNativePicker) {
+    let handle = null
     try {
-      const handle = await window.showSaveFilePicker({
+      handle = await window.showSaveFilePicker({
         suggestedName: suggested,
         types: [
           {
@@ -525,29 +529,38 @@ async function handleSaveProject() {
           },
         ],
       })
-      target = handle.name
-      // 浏览器沙箱拿不到绝对路径，需要用户输入保存目录
-      const directory = window.prompt(
-        '已选择文件名，请填写保存目录的绝对路径（例如 D:\\工程）：',
-        '',
-      )
-      if (!directory) {
-        setStatus('已取消保存', 'info')
-        return
-      }
-      target = `${directory.replace(/[\\/]+$/, '')}\\${handle.name}`
     } catch (error) {
       if (error?.name === 'AbortError') {
         setStatus('已取消保存', 'info')
         return
       }
-      target = ''
+      handle = null
+    }
+
+    if (handle) {
+      saving.value = true
+      setStatus('正在保存工程…', 'busy')
+      try {
+        const doc = await buildProjectFile(project.value.id)
+        const writable = await handle.createWritable()
+        await writable.write(JSON.stringify(doc, null, 2) + '\n')
+        await writable.close()
+        const size = JSON.stringify(doc, null, 2).length
+        setStatus(
+          `工程已保存：${handle.name}（约 ${(size / 1024).toFixed(1)} KB）`,
+          'success',
+        )
+      } catch (error) {
+        setStatus(`保存工程失败：${error.message}`, 'error')
+      } finally {
+        saving.value = false
+      }
+      return
     }
   }
 
-  if (!target) {
-    target = window.prompt('工程文件保存路径（含 .wcproj）：', suggested) || ''
-  }
+  // 兜底（不支持原生保存器的浏览器）：由后端写文件，需要用户给路径
+  const target = window.prompt(`当前浏览器不支持选择保存位置，请输入服务器上的保存路径：`, suggested) || ''
   if (!target.trim()) {
     setStatus('已取消保存', 'info')
     return
