@@ -24,6 +24,7 @@
  * 全部 handler 都是真实实现，不存在「只注册不干活」的命令。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { createHistory, createTokenEditEntry } from './core/history.js'
 import MenuBar from './components/MenuBar.vue'
 import Toolbar from './components/Toolbar.vue'
 import ExportDialog from './components/ExportDialog.vue'
@@ -95,7 +96,8 @@ const cursorIndex = ref(0)
 /** 选区锚点；null 表示没有选区 */
 const selectionAnchor = ref(null)
 /** 撤销栈：[{ kind: 'delete' | 'restore', ids: string[] }] */
-const undoStack = ref([])
+/** 统一的编辑历史（撤销/重做命令栈） */
+const history = createHistory()
 
 /** 波形是否显示（视图菜单） */
 const waveformVisible = ref(true)
@@ -109,6 +111,13 @@ const playback = usePlayback()
 // 派生值
 // ----------------------------------------------------------------------
 const deletedSet = computed(() => new Set(deletedIds.value))
+
+/** tokenApi：供历史记录回放时调用的后端接口集合（projectId 用函数延迟取值）。 */
+const tokenApi = {
+  deleteTokens,
+  restoreTokens,
+  projectId: () => project.value?.id ?? '',
+}
 const sourceDuration = computed(() => Number(project.value?.duration ?? 0))
 const outputDuration = computed(() =>
   Math.max(0, sourceDuration.value - Number(totalDeleted.value || 0)),
@@ -265,7 +274,11 @@ async function performEdit(ids, action, { record = true, nextCursor = null } = {
       ? await deleteTokens(project.value.id, targets)
       : await restoreTokens(project.value.id, targets)
     applyEditState(state)
-    if (record) undoStack.value = [...undoStack.value, { kind: action, ids: targets }]
+    if (record) {
+    history.push(
+      createTokenEditEntry(targets, isDelete ? 'delete' : 'restore', tokenApi),
+    )
+  }
 
     const hasTarget =
       nextCursor !== null && nextCursor !== undefined && Number.isFinite(Number(nextCursor))
@@ -376,13 +389,37 @@ async function handleUndo() {
     setStatus('正在处理中，请稍候', 'busy')
     return
   }
-  const entry = undoStack.value[undoStack.value.length - 1]
-  if (!entry) {
+  if (!history.canUndo) {
     setStatus('没有可撤销的操作', 'info')
     return
   }
-  undoStack.value = undoStack.value.slice(0, -1)
-  await performEdit(entry.ids, entry.kind === 'delete' ? 'restore' : 'delete', { record: false })
+  const label = history.undoLabel
+  try {
+    const state = await history.undo()
+    applyEditState(state)
+    setStatus(`已撤销：${label}`, 'success')
+  } catch (error) {
+    setStatus(`撤销失败：${error.message}`, 'error')
+  }
+}
+
+async function handleRedo() {
+  if (busy.value) {
+    setStatus('正在处理中，请稍候', 'busy')
+    return
+  }
+  if (!history.canRedo) {
+    setStatus('没有可重做的操作', 'info')
+    return
+  }
+  const label = history.redoLabel
+  try {
+    const state = await history.redo()
+    applyEditState(state)
+    setStatus(`已重做：${label}`, 'success')
+  } catch (error) {
+    setStatus(`重做失败：${error.message}`, 'error')
+  }
 }
 
 // ----------------------------------------------------------------------
@@ -401,7 +438,7 @@ function resetProjectState() {
   deletes.value = []
   totalDeleted.value = 0
   exportInfo.value = null
-  undoStack.value = []
+  history.clear()
   cursorIndex.value = 0
   selectionAnchor.value = null
   playback.setDeletes([])
@@ -459,7 +496,7 @@ async function handleUpload() {
     deletes.value = []
     totalDeleted.value = 0
     exportInfo.value = null
-    undoStack.value = []
+    history.clear()
     cursorIndex.value = 0
     selectionAnchor.value = null
     playback.setDeletes([])
@@ -492,7 +529,7 @@ async function handleTranscribe() {
     deletes.value = buildDeletesFromTokens(tokens.value, deletedIds.value)
     totalDeleted.value = totalOf(deletes.value)
     exportInfo.value = null
-    undoStack.value = []
+    history.clear()
     cursorIndex.value = 0
     selectionAnchor.value = null
     setStatus(
@@ -909,7 +946,7 @@ const commandCtx = {
     return !selectionRange.value.empty
   },
   get canUndo() {
-    return undoStack.value.length > 0
+    return history.canUndo
   },
   get playing() {
     return playback.state.playing
