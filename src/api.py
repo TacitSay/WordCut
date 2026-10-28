@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -328,6 +329,17 @@ def _read_version() -> str:
 
 
 app = FastAPI(title="WordCut", version=_read_version())
+
+# 允许本地前端开发服务器跨域访问（浏览器把 localhost 与 127.0.0.1 视为不同源）。
+# 这是本地单机工具，放开本地源不构成安全风险；生产部署时按需收紧。
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+)
 
 
 # ----------------------------------------------------------------------

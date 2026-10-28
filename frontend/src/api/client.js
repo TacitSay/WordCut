@@ -26,7 +26,10 @@
  */
 
 /** 后端默认地址（与 src/api.py 的本地调试入口一致）。 */
-const DEFAULT_API_BASE = 'http://127.0.0.1:8000'
+// 默认走同源相对路径（/api/...），由 vite proxy 转发到后端。
+// 这样开发期完全避开 CORS：页面在 localhost:5173，请求也发往 localhost:5173。
+// 需要直连其他后端时，用 .env.local 里的 VITE_API_BASE 覆盖。
+const DEFAULT_API_BASE = ''
 
 /** 实际使用的后端地址；环境变量优先，末尾斜杠会被去掉。 */
 export const API_BASE = (
@@ -91,8 +94,11 @@ async function request(path, options = {}) {
   const fetchOptions = buildOptions(options)
   let response = null
 
+  // API_BASE 为空时直接走同源相对路径（vite proxy 转发），无需回落逻辑
+  const url = API_BASE ? `${API_BASE}${path}` : path
+
   try {
-    response = await fetch(`${API_BASE}${path}`, fetchOptions)
+    response = await fetch(url, fetchOptions)
   } catch (directError) {
     // 直连失败（后端未起 / 跨域被拦）：回落到同源相对路径走 vite 代理。
     if (!API_BASE) {
