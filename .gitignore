@@ -34,3 +34,8 @@ outputs/
 # 误存的工程文件
 *.wcproj
 src/00*
+
+# SQLite 数据库
+data/*.db
+data/*.db-wal
+data/*.db-shm
