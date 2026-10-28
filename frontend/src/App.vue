@@ -35,6 +35,7 @@ import { formatClock, usePlayback } from './composables/usePlayback.js'
 import {
   createProject,
   deleteTokens,
+  exportFileUrl,
   exportProject,
   fetchTokens,
   buildProjectFile,
@@ -542,11 +543,14 @@ async function handleSaveProject() {
       saving.value = true
       setStatus('正在保存工程…', 'busy')
       try {
-        const doc = await buildProjectFile(project.value.id)
+        const response = await buildProjectFile(project.value.id)
+        // 后端返回 { document, suggested_name }，写盘只写 document 本体
+        const document = response?.document ?? response
+        const payload = JSON.stringify(document, null, 2) + '\n'
         const writable = await handle.createWritable()
-        await writable.write(JSON.stringify(doc, null, 2) + '\n')
+        await writable.write(payload)
         await writable.close()
-        const size = JSON.stringify(doc, null, 2).length
+        const size = payload.length
         setStatus(
           `工程已保存：${handle.name}（约 ${(size / 1024).toFixed(1)} KB）`,
           'success',
@@ -762,10 +766,18 @@ async function handleExportConfirm(options) {
 
     const files = ['audio_path', 'srt_path', 'edl_path']
     if (result?.paths?.video_path) files.push('video_path')
+
+    // 让用户选择保存位置并把产物写到自己机器上（无需绝对路径）
+    const saved = await saveExportFilesToUser(result)
+
     setStatus(
       `导出完成：${result?.audio_format?.toUpperCase() || 'WAV'} ${formatSeconds(result?.output_duration)}` +
         (result?.paths?.video_path ? ' + 成品视频' : '') +
-        `（${files.length} 个文件）`,
+        (saved.selectionDir
+          ? `，已保存到 ${saved.selectionDir}`
+          : saved.pickerUsed
+            ? '，已保存到你选择的位置'
+            : `（${files.length} 个文件，服务器路径见导出结果）`),
       'success',
     )
   } catch (error) {
@@ -773,6 +785,56 @@ async function handleExportConfirm(options) {
   } finally {
     exporting.value = false
   }
+}
+
+/** 把服务端产出的文件取回浏览器，让用户选择保存目录后写入本地。 */
+async function saveExportFilesToUser(result) {
+  const paths = result?.paths || {}
+  const order = ['audio_path', 'srt_path', 'edl_path', 'video_path']
+
+  // 支持选择目录的浏览器（Chrome / Edge）：一次选目录，全部写入
+  if (window.showDirectoryPicker) {
+    let dirHandle = null
+    try {
+      dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' })
+    } catch (error) {
+      if (error?.name === 'AbortError') return { pickerUsed: false, selectionDir: '' }
+      dirHandle = null
+    }
+
+    if (dirHandle) {
+      for (const key of order) {
+        const serverPath = paths[key]
+        if (!serverPath) continue
+        try {
+          const response = await fetch(exportFileUrl(project.value.id, serverPath))
+          if (!response.ok) continue
+          const blob = await response.blob()
+          const name = String(serverPath).split(/[\\/]/).pop()
+          const fileHandle = await dirHandle.getFileHandle(name, { create: true })
+          const writable = await fileHandle.createWritable()
+          await writable.write(blob)
+          await writable.close()
+        } catch {
+          // 单个文件失败不影响其他文件
+        }
+      }
+      return { pickerUsed: true, selectionDir: dirHandle.name || '' }
+    }
+  }
+
+  // 兜底：逐个触发下载
+  for (const key of order) {
+    const serverPath = paths[key]
+    if (!serverPath) continue
+    const link = document.createElement('a')
+    link.href = exportFileUrl(project.value.id, serverPath)
+    link.download = String(serverPath).split(/[\\/]/).pop()
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+  }
+  return { pickerUsed: false, selectionDir: '' }
 }
 
 // ----------------------------------------------------------------------

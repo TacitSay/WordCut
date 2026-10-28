@@ -1580,6 +1580,41 @@ def get_source_audio(pid: str) -> FileResponse:
     return FileResponse(str(cache), media_type="audio/wav", filename="source.wav")
 
 
+@app.get(
+    "/api/projects/{pid}/export-file/{filename}",
+    summary="取回导出产物（供浏览器保存到本地）",
+)
+def get_export_file(pid: str, filename: str) -> FileResponse:
+    """按文件名返回 outputs/{pid}/ 下的导出产物。
+
+    仅允许该目录内的文件（拒绝路径穿越），文件名由前端从导出结果的绝对路径取末段。
+
+    参数:
+        pid: 项目 id。
+        filename: 文件名（如 xxx_cut.mp4）。
+
+    返回:
+        文件流；MIME 按扩展名推断。
+
+    异常:
+        400: 文件名非法；404: 文件不存在。
+    """
+    if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail=f"非法文件名：{filename}")
+
+    target = (OUTPUT_DIR / pid / filename).resolve()
+    base = (OUTPUT_DIR / pid).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"非法路径：{filename}") from exc
+
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"导出文件不存在：{filename}")
+
+    return FileResponse(str(target), filename=filename)
+
+
 # ----------------------------------------------------------------------
 # 接口：字幕预览
 # ----------------------------------------------------------------------
