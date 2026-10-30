@@ -40,6 +40,8 @@ const props = defineProps({
   selectionAnchor: { type: Number, default: null },
   /** 是否处于忙碌状态（转写 / 导出时只读） */
   disabled: { type: Boolean, default: false },
+  /** 正在播放的 Token 下标（-1 表示没有）；用于播放头跟随高亮 */
+  activeIndex: { type: Number, default: -1 },
 })
 
 const emit = defineEmits(['cursor-change', 'restore', 'seek'])
@@ -139,6 +141,7 @@ function tokenClasses(item) {
     'is-pending': item.pending,
     'is-selected': isSelected(item.index),
     'is-edge': isSelectionEdge(item.index),
+    'is-active': item.index === props.activeIndex,
   }
 }
 
@@ -184,6 +187,20 @@ watch(
     caret?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' })
   },
 )
+
+/**
+ * 播放头跟随：当前播放词变化时高亮并滚入可视区。
+ * 只在播放中高亮，暂停后保留最后一个高亮位置直到下次播放。
+ */
+watch(
+  () => props.activeIndex,
+  async (index) => {
+    if (index < 0) return
+    await nextTick()
+    const el = rootRef.value?.querySelector?.(`[data-token-index="${index}"]`)
+    el?.scrollIntoView?.({ block: 'center', inline: 'nearest', behavior: 'smooth' })
+  },
+)
 </script>
 
 <template>
@@ -220,6 +237,7 @@ watch(
               :class="tokenClasses(item)"
               role="button"
               tabindex="-1"
+              :data-token-index="item.index"
               :title="`${item.id} · ${item.start.toFixed(2)}s–${item.end.toFixed(2)}s · 置信度 ${item.confidence.toFixed(2)}`"
               @click.stop="onTokenClick(item, $event)"
               >{{ item.glyph }}</span
@@ -313,6 +331,17 @@ watch(
 
 .token.is-selected.is-edge {
   background: rgba(59, 130, 246, 0.42);
+}
+
+/* 播放头跟随：当前正在播放的词（琥珀色，与波形播放头同色系） */
+.token.is-active {
+  background: rgba(245, 158, 11, 0.45);
+  color: var(--text-strong);
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.65);
+}
+
+.token.is-active.is-deleted {
+  background: rgba(245, 158, 11, 0.25);
 }
 
 /* 光标：2px 蓝色竖线。 */

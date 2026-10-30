@@ -11,7 +11,7 @@ node_modules/
 dist/
 .vite/
 
-# 模型与大文件(不入库)
+# 模型与大文件（不入库）
 models/
 *.bin
 *.wav
@@ -19,7 +19,7 @@ models/
 *.m4a
 data/audio/
 
-# 实验临时
+# 实验临时产物
 experiments/*/output/
 *.log
 
@@ -27,15 +27,18 @@ experiments/*/output/
 .idea/
 .vscode/
 
-# ����ʱ����
+# 运行时产物（上传/导出/工程文件）
 uploads/
 outputs/
-
-# ���Ĺ����ļ�
 *.wcproj
 src/00*
 
-# SQLite ���ݿ�
+# SQLite 数据库
 data/*.db
 data/*.db-wal
 data/*.db-shm
+
+# 会话导出（体积大，可用 docs/export_openclaw_session.py 重新生成）
+docs/openclaw-transcript-v4.jsonl
+docs/openclaw-dialogue-numbered.json
+docs/openclaw-dialogue-numbered.md

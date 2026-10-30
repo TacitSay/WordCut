@@ -11,10 +11,10 @@
 * 参数校验（越界 / 类型错误）抛异常而不是静默忽略；
 * 统计指标口径（峰值、RMS、静音占比、削顶计数）。
 """
+import json
 import math
 
 import numpy as np
-
 from audio_fx import (
     DEFAULT_TARGET_DBFS,
     MAX_FADE_SECONDS,
@@ -179,6 +179,13 @@ check("满幅样本计为削顶", measure(clipped, rate).clipped_samples == 100)
 
 empty = measure(np.zeros(0), rate)
 check("空音频统计不崩溃且时长为 0", empty.duration == 0.0 and empty.silence_ratio == 1.0)
+
+empty_dict = empty.to_dict()
+check("全静音的 -inf 在 to_dict 后变成 None（JSON 可序列化）", empty_dict["peak_dbfs"] is None and empty_dict["rms_dbfs"] is None)
+
+silent_dict = measure(np.zeros(rate), rate).to_dict()
+check("全零音频同样输出 None 而不是 -inf", silent_dict["peak_dbfs"] is None)
+check("to_dict 结果可被严格 JSON 序列化", json.dumps(empty_dict, allow_nan=False) != "")
 
 print(f"\nRESULT: {passed} passed, {failed} failed")
 raise SystemExit(1 if failed else 0)

@@ -170,8 +170,18 @@ class AudioStats:
     clipped_samples: int
 
     def to_dict(self) -> Dict[str, Any]:
-        """转成可 JSON 序列化的字典。"""
-        return asdict(self)
+        """转成可 JSON 序列化的字典。
+
+        注意：全静音时 ``peak_dbfs`` / ``rms_dbfs`` 内部是 ``-inf``，而标准 JSON
+        不允许 Infinity（FastAPI 的 ``JSONResponse`` 用 ``allow_nan=False``）。
+        这里统一转成 ``None``，由前端显示为"静音"。
+        """
+        data = asdict(self)
+        for key in ("peak_dbfs", "rms_dbfs"):
+            value = data.get(key)
+            if isinstance(value, float) and not math.isfinite(value):
+                data[key] = None
+        return data
 
 
 # ----------------------------------------------------------------------

@@ -173,6 +173,32 @@ const selectionRange = computed(() => {
   return { start: Math.min(anchor, cursor), end: Math.max(anchor, cursor), empty: false }
 })
 
+/**
+ * 正在播放的 Token 下标（播放头跟随）。
+ *
+ * 用二分查找定位 currentTime 落在哪个 Token 的 [start, end) 内；
+ * 区间之间的空隙（停顿）返回 -1，此时不高亮——这比"永远高亮最近的词"
+ * 更符合直觉：停顿处就是没有人在说话。
+ */
+const activeTokenIndex = computed(() => {
+  if (!playback.state.playing) return -1
+  const time = Number(playback.state.currentTime)
+  const list = tokens.value
+  if (!Number.isFinite(time) || !list.length) return -1
+  let low = 0
+  let high = list.length - 1
+  while (low <= high) {
+    const mid = (low + high) >> 1
+    const start = Number(list[mid].start)
+    const end = Number(list[mid].end)
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return -1
+    if (time < start) high = mid - 1
+    else if (time >= end) low = mid + 1
+    else return mid
+  }
+  return -1
+})
+
 // ----------------------------------------------------------------------
 // 工具函数
 // ----------------------------------------------------------------------
@@ -1549,6 +1575,7 @@ onBeforeUnmount(() => {
             :pending-ids="pendingIds"
             :cursor-index="cursorIndex"
             :selection-anchor="selectionAnchor"
+            :active-index="activeTokenIndex"
             :disabled="transcribing || exporting"
             @cursor-change="handleCursorChange"
             @restore="handleRestoreToken"
@@ -1610,7 +1637,7 @@ onBeforeUnmount(() => {
           <section class="panel-section">
             <h3 class="panel-section-title">音频后处理</h3>
             <div class="param-field">
-              <label class="param-label" for="param-gain">
+              <label class="param-label" for="param-normalize">
                 <input
                   id="param-normalize"
                   v-model="audioParams.normalize"
