@@ -314,8 +314,10 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  height: 100%;
-  flex: 1 1 auto;
+  /* 父级 editor-dock 是 flex 列（顶部可能还有搜索栏），这里靠 flex 撑满剩余空间，
+     不能写 height:100%（会叠加上方搜索栏高度而溢出） */
+  flex: 1 1 0;
+  overflow: hidden;
 }
 
 .editor-body {
