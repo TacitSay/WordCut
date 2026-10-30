@@ -58,6 +58,8 @@ let deleteSpans = []
 let selectionSpan = null
 /** 选区试听的终点（秒）；null 表示不限制播放范围。 */
 let rangeEnd = null
+/** 播放时是否跳过已删除区间（默认开：播放听到的就是剪辑后的结果）。 */
+let skipDeleted = true
 
 /** 安全转数字：非法值返回 fallback。 */
 function toNumber(value, fallback = 0) {
@@ -180,7 +182,26 @@ export function attachWaveform(container, url) {
     renderRegions()
   })
   instance.on('timeupdate', (time) => {
-    playbackState.currentTime = toNumber(time, 0)
+    const now = toNumber(time, 0)
+    playbackState.currentTime = now
+
+    // 播放时跳过已删除区间：否则用户会听到"已经删掉的原声"，
+    // 这与"文本驱动剪辑"的预期相反（试听应当等于成片）。
+    if (skipDeleted && playbackState.playing) {
+      const span = deleteSpans.find(
+        (item) => now >= item.start - 1e-4 && now < item.end - 1e-4,
+      )
+      if (span && Number.isFinite(span.end)) {
+        const target = Math.min(span.end, playbackState.duration || span.end)
+        try {
+          instance.setTime(target)
+        } catch {
+          /* 忽略跳转异常 */
+        }
+        playbackState.currentTime = target
+      }
+    }
+
     // 选区试听：到达终点自动停止并停在终点
     if (rangeEnd !== null && playbackState.currentTime >= rangeEnd) {
       const stopAt = rangeEnd
@@ -312,6 +333,17 @@ export function clearRange() {
   rangeEnd = null
 }
 
+/** 开关"播放时跳过已删除区间"。 */
+export function setSkipDeleted(enabled) {
+  skipDeleted = Boolean(enabled)
+  return skipDeleted
+}
+
+/** 当前是否跳过已删除区间。 */
+export function isSkipDeleted() {
+  return skipDeleted
+}
+
 /** 更新删除区间（红色标注）。 */
 export function setDeletes(spans) {
   deleteSpans = Array.isArray(spans)
@@ -366,6 +398,8 @@ let sharedApi = null
  *   playRange: (start: number, end: number) => boolean,
  *   setSelection: (span: {start: number, end: number}|null) => void,
  *   clearRange: () => void,
+ *   setSkipDeleted: (enabled: boolean) => boolean,
+ *   isSkipDeleted: () => boolean,
  *   setDeletes: (spans: object[]) => void,
  *   isPlaying: () => boolean,
  *   getCurrentTime: () => number,
@@ -389,6 +423,8 @@ export function usePlayback() {
       playRange,
       setSelection,
       clearRange,
+      setSkipDeleted,
+      isSkipDeleted,
       setDeletes,
       isPlaying,
       getCurrentTime,

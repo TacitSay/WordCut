@@ -1861,6 +1861,7 @@ def get_audio_info(pid: str) -> AudioInfoResponse:
     token_count = 0
     deleted_count = 0
     total_deleted = 0.0
+    words = project.get("words") or []
 
     # 未转写时没有删除区间，但仍然要算"源 + 当前参数"的成片指标：
     # 否则用户刚上传、还没转写时点「应用参数」，面板里一个数字都不会变，

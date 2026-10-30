@@ -206,6 +206,9 @@ const paramSummary = computed(() => {
   return parts.length ? parts.join(' · ') : '无（原样输出）'
 })
 
+/** 成片是否削顶（超出 0 dBFS 会被硬截，听感破音）。 */
+const clipWarning = computed(() => Number(audioInfo.value?.edited?.clipped_samples) > 0)
+
 /**
  * 正在播放的 Token 下标（播放头跟随）。
  *
@@ -301,6 +304,17 @@ async function playAudition(sourceTime) {
     // 试听是辅助功能，失败不能打断删除/恢复主流程
     console.warn('[audition] 试听失败', error)
   }
+}
+
+/** 开关「播放时跳过删除区间」。 */
+function toggleSkipDeleted() {
+  const enabled = playback.setSkipDeleted(!playback.isSkipDeleted())
+  setStatus(
+    enabled
+      ? '已开启：播放时自动跳过已删除区间（听到的是剪辑结果）'
+      : '已关闭：播放的是原始音频（删除区间只做标注）',
+    'info',
+  )
 }
 
 /** 停止正在播放的试听片段。 */
@@ -475,7 +489,12 @@ async function handleSaveAudioParams() {
       Number.isFinite(Number(beforePeak)) && Number.isFinite(Number(after))
         ? `（成片峰值 ${formatDbfs(beforePeak)} → ${formatDbfs(after)}）`
         : ''
-    setStatus(`音频参数已保存，导出时按此渲染${delta}`, 'success')
+    setStatus(
+      clipWarning.value
+        ? `参数已保存，但成片削顶 ${audioInfo.value?.edited?.clipped_samples} 个样本，建议开启标准化或降低增益`
+        : `音频参数已保存，导出时按此渲染${delta}`,
+      clipWarning.value ? 'error' : 'success',
+    )
   } catch (error) {
     setStatus(`保存音频参数失败：${error.message}`, 'error')
   } finally {
@@ -707,6 +726,21 @@ async function handleRestoreSelection() {
     return
   }
   await performEdit(targets, 'restore', { nextCursor: selectionRange.value.start })
+}
+
+/** 恢复全部已删除的 Token（"删错了想全撤"的兜底入口）。 */
+async function handleRestoreAll() {
+  if (!deletedIds.value.length) {
+    setStatus('当前没有被删除的 Token', 'info')
+    return
+  }
+  if (busy.value) {
+    setStatus('正在处理中，请稍候', 'busy')
+    return
+  }
+  const count = deletedIds.value.length
+  await performEdit([...deletedIds.value], 'restore', { nextCursor: cursorIndex.value })
+  setStatus(`已恢复全部 ${count} 个被删除的 Token`, 'success')
 }
 
 /** 静音检测：调用后端分析并批量删除无发音的长停顿。 */
@@ -1479,6 +1513,13 @@ registerCommands([
     handler: () => handleRestoreSelection(),
   },
   {
+    id: 'edit.restoreAll',
+    title: '恢复全部删除',
+    menu: 'edit',
+    handler: () => handleRestoreAll(),
+    enabled: () => Boolean(project.value) && deletedCount.value > 0 && !busy.value,
+  },
+  {
     id: 'edit.removeSilences',
     title: '检测静音并批量删除…',
     menu: 'edit',
@@ -1563,6 +1604,12 @@ registerCommands([
     title: '编辑后自动试听（开关）',
     menu: 'playback',
     handler: () => toggleAuditionOnEdit(),
+  },
+  {
+    id: 'playback.toggleSkipDeleted',
+    title: '播放时跳过删除区间（开关）',
+    menu: 'playback',
+    handler: () => toggleSkipDeleted(),
   },
   {
     id: 'tools.audioInfo',
@@ -1656,6 +1703,13 @@ watch(
       selectionAnchor.value = length
     }
   },
+)
+
+// 删除区间变化 → 同步给播放器（"播放时跳过删除区间"依赖它）
+watch(
+  () => deletes.value,
+  (spans) => playback.setDeletes(spans),
+  { deep: true },
 )
 
 // 选区变化 → 波形上同步高亮（蓝色区间），便于确认试听范围
@@ -1983,6 +2037,10 @@ onBeforeUnmount(() => {
             </h3>
             <template v-if="audioInfo">
               <p class="panel-note">源素材只读，不随参数变化；只看「成片」那一栏。</p>
+              <p v-if="clipWarning" class="panel-warn">
+                ⚠ 成片有 {{ audioInfo.edited?.clipped_samples }} 个样本削顶（超出 0 dBFS），
+                听感会破音。建议勾选「峰值标准化」或降低增益。
+              </p>
               <dl class="panel-list">
                 <div class="panel-row panel-row-sub">
                   <dt>源 · 时长</dt>
@@ -2411,6 +2469,18 @@ onBeforeUnmount(() => {
 
 .param-warn {
   color: var(--danger, #e5534b);
+}
+
+/* 削顶警告条：成片峰值超过 0 dBFS 时出现 */
+.panel-warn {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--danger, #e5534b);
+  background: rgba(229, 83, 75, 0.12);
+  border: 1px solid rgba(229, 83, 75, 0.4);
+  border-radius: 4px;
 }
 
 /* 统计表：源 / 成片 两组口径的视觉区分 */

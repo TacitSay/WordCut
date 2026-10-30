@@ -172,11 +172,20 @@ function positionFromPointer(item, event) {
  * 拖拽选区状态。
  *
  * 交互设计：
- *  - 按下 → 落光标并记锚点；拖动经过其它 Token → 持续扩展选区（Shift+方向键同款语义）；
- *  - 松开时若位置没变（没拖动）→ 视为普通点击：已删词恢复、未删词定位播放头；
- *  - 拖动过程中 `preventDefault`，避免触发浏览器原生文字选择（会和 Token 选区打架）。
+ *  - 按下 → 落光标并记锚点；
+ *  - 指针移动超过 ``DRAG_THRESHOLD_PX`` 才算"开始拖拽"，否则仍按点击处理
+ *    （人按鼠标时手会抖 2–3px，若一移动就判定拖拽，"点击红字恢复"会失灵）；
+ *  - 拖动经过其它 Token → 持续扩展选区（Shift+方向键同款语义）；
+ *  - 松开时若没超过阈值 → 点击语义：已删词恢复、未删词定位播放头；
+ *  - 拖动过程中 `preventDefault`，避免触发浏览器原生文字选择。
  */
+const DRAG_THRESHOLD_PX = 4
+
 const drag = ref({ active: false, moved: false, position: 0, item: null })
+
+/** 刚拖拽结束时置位：用来吞掉紧随其后的段落 click（否则会清空选区）。 */
+let suppressParagraphClick = false
+
 /** 拖拽期间阻止原生 selectstart。 */
 function onSelectStart(event) {
   if (drag.value.active) event.preventDefault()
@@ -187,38 +196,74 @@ function beginDrag(item, event) {
   if (event.button !== 0) return
   event.preventDefault()
   const position = positionFromPointer(item, event)
-  drag.value = { active: true, moved: false, position, item }
+  drag.value = {
+    active: true,
+    moved: false,
+    position,
+    item,
+    startX: event.clientX,
+    startY: event.clientY,
+  }
   emitCursor(position, { shiftKey: event.shiftKey })
 }
 
-/** 拖动中：命中的 Token 变化就把光标移过去（保持锚点 → 形成选区）。 */
+/** 拖动中：超过阈值后才生效，命中的 Token 变化就把光标移过去（保持锚点 → 形成选区）。 */
 function onDocumentMouseMove(event) {
-  if (!drag.value.active) return
+  const state = drag.value
+  if (!state.active) return
+  const dx = event.clientX - (state.startX ?? event.clientX)
+  const dy = event.clientY - (state.startY ?? event.clientY)
+  if (!state.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return
+
   const target = document.elementFromPoint?.(event.clientX, event.clientY)
   const tokenEl = target?.closest?.('[data-token-index]')
-  if (!tokenEl) return
+  if (!tokenEl) {
+    // 拖到词与词之间的空白：保持当前选区，等继续移动或松开
+    if (!state.moved) drag.value = { ...state, moved: true }
+    return
+  }
   const index = Number(tokenEl.dataset.tokenIndex)
   if (!Number.isFinite(index)) return
   const rect = tokenEl.getBoundingClientRect()
   const position = index + (event.clientX - rect.left > rect.width / 2 ? 1 : 0)
-  if (position === drag.value.position) return
-  drag.value = { ...drag.value, position, moved: true }
+  if (position === state.position && state.moved) return
+  drag.value = { ...state, position, moved: true }
   emitCursor(position, { shiftKey: true })
 }
 
-/** 松开：没拖动就是点击语义；拖过就是单纯选区，不触发恢复/定位。 */
-function onDocumentMouseUp() {
+/** 松开：没拖动就是点击语义；拖过就保留选区，不触发恢复/定位。 */
+function finishDrag(clicked) {
   const state = drag.value
   if (!state.active) return
   drag.value = { ...state, active: false }
-  if (state.moved || !state.item) return
+
+  if (state.moved) {
+    // 拖拽结束：标记一下，吞掉紧随其后的段落 click
+    suppressParagraphClick = true
+    setTimeout(() => {
+      suppressParagraphClick = false
+    }, 0)
+    return
+  }
+  if (!clicked || !state.item) return
   if (state.item.deleted) emit('restore', [state.item.id])
   else emit('seek', state.item.start)
 }
 
-/** 点击段落空白处：光标落到该段末尾。 */
+function onDocumentMouseUp() {
+  finishDrag(true)
+}
+
+/** 窗口失焦（拖到别的程序后松手）：按拖拽结束处理，避免状态卡住。 */
+function onWindowBlur() {
+  if (!drag.value.active) return
+  finishDrag(false)
+}
+
+/** 点击段落空白处：光标落到该段末尾（拖拽刚结束时忽略，保住选区）。 */
 function onParagraphClick(para, event) {
   if (props.disabled) return
+  if (suppressParagraphClick) return
   if (event.target !== event.currentTarget) return
   const last = para.items[para.items.length - 1]
   emitCursor((last?.index ?? 0) + 1, event)
@@ -253,12 +298,14 @@ onMounted(() => {
   document.addEventListener('mousemove', onDocumentMouseMove)
   document.addEventListener('mouseup', onDocumentMouseUp)
   document.addEventListener('selectstart', onSelectStart)
+  window.addEventListener('blur', onWindowBlur)
 })
 
 onBeforeUnmount(() => {
   document.removeEventListener('mousemove', onDocumentMouseMove)
   document.removeEventListener('mouseup', onDocumentMouseUp)
   document.removeEventListener('selectstart', onSelectStart)
+  window.removeEventListener('blur', onWindowBlur)
 })
 </script>
 
