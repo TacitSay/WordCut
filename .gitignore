@@ -19,6 +19,9 @@ models/
 *.m4a
 data/audio/
 
+# CUDA 运行库与下载的 wheel（约 1.7GB，用 scripts/fetch_cuda_libs.py 重新获取）
+libs/
+
 # 实验临时产物
 experiments/*/output/
 *.log

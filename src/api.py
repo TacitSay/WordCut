@@ -626,12 +626,68 @@ _cuda_usable: Optional[bool] = None
 #: 探测失败原因（用于健康检查与错误提示）。
 _cuda_probe_reason: str = ""
 
+#: 本项目自带的 CUDA 运行库目录（由 ``scripts/fetch_cuda_libs.py`` 解包）。
+_LOCAL_CUDA_BIN: Path = Path(__file__).resolve().parent.parent / "libs" / "cuda" / "bin"
+
+#: ``os.add_dll_directory`` 返回的句柄：必须持有，释放后目录就不再被搜索。
+_cuda_dll_handles: List[Any] = []
+
+
+def _cuda_dll_dirs() -> List[Path]:
+    """收集可能存放 CUDA DLL 的目录（本项目自带 + pip 装的 nvidia-* 包）。"""
+    dirs: List[Path] = []
+    if _LOCAL_CUDA_BIN.is_dir():
+        dirs.append(_LOCAL_CUDA_BIN)
+    nvidia_root = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
+    if nvidia_root.is_dir():
+        for sub in sorted(nvidia_root.glob("*/bin")):
+            if sub.is_dir():
+                dirs.append(sub)
+    return dirs
+
+
+def _prepare_cuda_dll_paths() -> List[str]:
+    """把 CUDA DLL 目录加入 Windows DLL 搜索路径，返回已加入的目录字符串。
+
+    ctranslate2 通过 ``LoadLibrary`` 找 ``cublas64_12.dll`` / ``cudnn_*64_8.dll``，
+    只认 PATH 与 ``os.add_dll_directory`` 注册过的目录。ctranslate2 自带的
+    ``cudnn64_8.dll`` 只是个 0.3MB 的转发壳，真正的算子库必须另外提供。
+    """
+    added: List[str] = []
+    for directory in _cuda_dll_dirs():
+        path_text = str(directory)
+        if path_text in added:
+            continue
+        added.append(path_text)
+        # 1) 加进 PATH（部分库内部用 LoadLibrary 裸名字加载）
+        current = os.environ.get("PATH", "")
+        if path_text not in current.split(os.pathsep):
+            os.environ["PATH"] = path_text + os.pathsep + current
+        # 2) 注册 DLL 目录（Python 3.8+ 在 Windows 上默认不再搜索 PATH，
+        #    必须显式注册，否则 ctranslate2 仍找不到依赖）
+        if hasattr(os, "add_dll_directory"):
+            try:
+                _cuda_dll_handles.append(os.add_dll_directory(path_text))
+            except OSError:
+                pass
+    return added
+
 #: 探测子进程的源码：只做"加载模型 + 转写 0.5 秒静音"。
 #: 关键点是**必须放在子进程里**：cuDNN 版本不匹配时 ctranslate2 是硬崩溃
 #: （0xC0000005 / DLL 加载失败），在同一进程里 try/except 根本抓不住，
 #: 会把整个后端带走。
 _CUDA_PROBE_CODE: str = r"""
-import sys
+import json, os, sys
+
+for directory in json.loads(sys.argv[2]):
+    if os.path.isdir(directory):
+        os.environ["PATH"] = directory + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            try:
+                os.add_dll_directory(directory)
+            except OSError:
+                pass
+
 import numpy as np
 from faster_whisper import WhisperModel
 model = WhisperModel(sys.argv[1], device="cuda", compute_type="float16")
@@ -665,7 +721,13 @@ def _probe_cuda_usable(model_path: Path) -> bool:
 
     try:
         completed = subprocess.run(
-            [sys.executable, "-c", _CUDA_PROBE_CODE, str(model_path)],
+            [
+                sys.executable,
+                "-c",
+                _CUDA_PROBE_CODE,
+                str(model_path),
+                json.dumps([str(item) for item in _cuda_dll_dirs()]),
+            ],
             capture_output=True,
             timeout=300,
         )
@@ -743,6 +805,9 @@ def _get_whisper_model() -> Any:
 
         device, compute_type = _resolve_whisper_device()
         fallback_reason = ""
+        if device == "cuda":
+            # 让 ctranslate2 能找到 cublas64_12.dll / cudnn_*64_8.dll
+            _prepare_cuda_dll_paths()
         try:
             _whisper_model = WhisperModel(
                 str(model_path), device=device, compute_type=compute_type
