@@ -24,6 +24,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Union
 
 import numpy as np
 
+import audio_fx
 import edl_render
 import exporter
 import subtitle
@@ -206,6 +207,7 @@ def run_pipeline(
     output_dir: Union[str, Path],
     basename: str,
     audio_format: str = "wav",
+    audio_params: Optional[Mapping[str, object]] = None,
 ) -> Dict[str, object]:
     """跑完整链路：对齐词表 → 建 EDL → 渲染音频 → 重建字幕 → 导出三件套。
 
@@ -220,6 +222,8 @@ def run_pipeline(
     6. :func:`edl_render.compute_keep_segments` 预检，若删除后没有任何保留
        区间（全删光）则抛 ``ValueError``；
     7. :func:`edl_render.render`：渲染剪辑后的音频（新数组，不动 ``samples``）；
+    7.5. :func:`audio_fx.apply`：在渲染副本上施加增益 / 标准化 / 淡入淡出
+       （只改幅度，不改长度，不影响 EDL 与 TimeMap）；
     8. :func:`subtitle.rebuild_srt`：按目标时间轴重建 SRT；
     9. :func:`exporter.export_all`：写出 ``{basename}.wav`` /
        ``{basename}.srt`` / ``{basename}.edl.json``。
@@ -233,6 +237,10 @@ def run_pipeline(
         deleted_ids: 被删除的 Token id 集合，可迭代；为 ``None`` 时视作空集合。
         output_dir: 输出目录，不存在时自动创建。
         basename: 输出文件主名（不含扩展名与路径分隔符）。
+        audio_format: 导出音频格式（``wav`` / ``mp3`` / ``flac`` / ``m4a``）。
+        audio_params: 可选音频后处理参数（增益 / 峰值标准化 / 首尾淡入淡出），
+            形如 ``{"gain_db": 3.0, "normalize": true, "fade_in": 0.2}``；
+            为 ``None`` 或全默认值时不做任何后处理。
 
     返回:
         字典，包含以下键：
@@ -286,14 +294,19 @@ def run_pipeline(
     rendered = edl_render.render(samples, rate, edl.deletes)
     if np.asarray(rendered).size == 0:
         raise ValueError("渲染结果为空音频，无法导出")
-    output_duration = float(np.asarray(rendered).size) / float(rate)
+
+    # ---- 音频后处理（增益 / 标准化 / 淡入淡出）----
+    # 只改幅度、不改长度：EDL 与 TimeMap 不受影响，字幕时间轴保持一致。
+    params = audio_fx.AudioParams.from_mapping(audio_params)
+    processed = audio_fx.apply(rendered, rate, params) if not params.is_noop() else rendered
+    output_duration = float(np.asarray(processed).size) / float(rate)
 
     # ---- 字幕（一律走 TimeMap，见不变量 6）----
     srt_text = subtitle.rebuild_srt(tokens, time_map, ids)
 
     # ---- 导出 ----
     paths = exporter.export_all(
-        samples=rendered,
+        samples=processed,
         sample_rate=rate,
         output_dir=output_dir,
         basename=basename,

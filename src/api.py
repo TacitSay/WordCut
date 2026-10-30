@@ -46,7 +46,9 @@ _SRC_DIR: Path = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
+import audio_fx  # noqa: E402
 import media  # noqa: E402  （必须在 sys.path 调整之后导入）
+import edl_render  # noqa: E402
 import pipeline  # noqa: E402
 import project_file  # noqa: E402
 import segmenter  # noqa: E402
@@ -287,6 +289,13 @@ class ExportRequest(BaseModel):
     )
     video_mode: str = Field(
         "precise", description="视频剪辑模式：precise（fast 已禁用，自动回退）"
+    )
+    audio_params: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "可选的音频后处理覆盖：gain_db / normalize / fade_in / fade_out。"
+            "不传则使用项目已保存的参数（POST /api/projects/{pid}/audio-params）"
+        ),
     )
 
 
@@ -964,6 +973,7 @@ async def create_project(
         "sample_rate": SAMPLE_RATE,
         "words": [],
         "deleted_ids": set(),
+        "audio_params": {},
         "created_at": _now_iso(),
     }
     _store.put(project)
@@ -1229,6 +1239,13 @@ def export_project(pid: str, payload: Optional[ExportRequest] = None) -> ExportR
     sample_rate = int(project["sample_rate"])
     output_dir = OUTPUT_DIR / pid
 
+    # 后处理参数：请求体显式覆盖优先，否则用项目里保存的参数
+    effective_params = (
+        options.audio_params
+        if options.audio_params is not None
+        else (project.get("audio_params") or {})
+    )
+
     try:
         result = pipeline.run_pipeline(
             words=words,
@@ -1238,6 +1255,7 @@ def export_project(pid: str, payload: Optional[ExportRequest] = None) -> ExportR
             output_dir=output_dir,
             basename=f"{pid}_cut",
             audio_format=audio_format,
+            audio_params=effective_params,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"导出失败：{exc}") from exc
@@ -1433,6 +1451,7 @@ def load_project_file(payload: LoadProjectRequest) -> LoadProjectResponse:
         "sample_rate": loaded["sample_rate"] or SAMPLE_RATE,
         "words": loaded["words"],
         "deleted_ids": set(loaded["deleted_ids"]),
+        "audio_params": loaded.get("audio_params") or {},
         "created_at": loaded["created_at"] or _now_iso(),
     }
     _store.put(project)
@@ -1485,6 +1504,7 @@ def _restore_project_from_doc(loaded: Dict[str, Any]) -> Dict[str, Any]:
         "sample_rate": loaded["sample_rate"] or SAMPLE_RATE,
         "words": loaded["words"],
         "deleted_ids": set(loaded["deleted_ids"]),
+        "audio_params": loaded.get("audio_params") or {},
         "created_at": loaded["created_at"] or _now_iso(),
     }
     _store.put(project)
@@ -1702,6 +1722,182 @@ def detect_project_silences(
         total_silence=round(sum(item["duration"] for item in silences), 3),
         total_deleted=round(_total_deleted(deletes), 3),
     )
+
+
+# ----------------------------------------------------------------------
+# 接口：音频后处理参数（增益 / 标准化 / 淡入淡出）
+# ----------------------------------------------------------------------
+class AudioParamsResponse(BaseModel):
+    """音频后处理参数的读写响应。"""
+
+    project_id: str = Field(..., description="项目 id")
+    audio_params: Dict[str, Any] = Field(
+        ..., description="当前生效的后处理参数（默认值已补齐）"
+    )
+    limits: Dict[str, Any] = Field(
+        ..., description="取值上限，供前端生成控件（增益范围、淡入淡出上限）"
+    )
+
+
+@app.get(
+    "/api/projects/{pid}/audio-params",
+    response_model=AudioParamsResponse,
+    summary="读取音频后处理参数",
+)
+def get_audio_params(pid: str) -> AudioParamsResponse:
+    """读取项目当前的音频后处理参数；未设置过时返回全默认值。
+
+    参数:
+        pid: 项目 id。
+
+    返回:
+        ``{project_id, audio_params, limits}``。
+
+    异常:
+        404: 项目不存在；500: 库里存的参数已损坏。
+    """
+    project = _get_project(pid)
+    raw = project.get("audio_params") or {}
+    try:
+        params = audio_fx.AudioParams.from_mapping(raw)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"项目里保存的音频参数非法：{exc}"
+        ) from exc
+    return AudioParamsResponse(
+        project_id=pid, audio_params=params.to_dict(), limits=_audio_param_limits()
+    )
+
+
+@app.post(
+    "/api/projects/{pid}/audio-params",
+    response_model=AudioParamsResponse,
+    summary="保存音频后处理参数（增益 / 标准化 / 淡入淡出）",
+)
+def set_audio_params(pid: str, payload: Dict[str, Any]) -> AudioParamsResponse:
+    """校验并持久化音频后处理参数，随后导出即按新参数生效。
+
+    只影响**导出阶段**的渲染副本：不改变源文件（不变量 1），也不改变 EDL
+    与字幕时间轴（后处理只改幅度，不改长度）。
+
+    参数:
+        pid: 项目 id。
+        payload: ``{gain_db, normalize, fade_in, fade_out, target_dbfs}``，
+            缺省字段沿用默认值。
+
+    返回:
+        ``{project_id, audio_params, limits}``。
+
+    异常:
+        400: 参数非法（越界或类型错误）；404: 项目不存在。
+    """
+    try:
+        params = audio_fx.AudioParams.from_mapping(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"音频参数非法：{exc}") from exc
+
+    project = _get_project(pid)
+    project["audio_params"] = params.to_dict()
+    _store.put(project)
+
+    return AudioParamsResponse(
+        project_id=pid, audio_params=params.to_dict(), limits=_audio_param_limits()
+    )
+
+
+# ----------------------------------------------------------------------
+# 接口：音频信息统计
+# ----------------------------------------------------------------------
+class AudioInfoResponse(BaseModel):
+    """音频信息统计响应。"""
+
+    project_id: str = Field(..., description="项目 id")
+    source: Dict[str, Any] = Field(..., description="源音频的客观指标")
+    edited: Optional[Dict[str, Any]] = Field(
+        None, description="按当前删除状态渲染后的指标（未转写时为 null）"
+    )
+    token_count: int = Field(0, description="Token 总数")
+    deleted_count: int = Field(0, description="被删 Token 数")
+    total_deleted: float = Field(0.0, description="删除总时长（秒）")
+
+
+@app.get(
+    "/api/projects/{pid}/audio-info",
+    response_model=AudioInfoResponse,
+    summary="音频信息统计（源音频与剪辑后）",
+)
+def get_audio_info(pid: str) -> AudioInfoResponse:
+    """统计源音频与"按当前删除状态渲染后"的客观指标。
+
+    用途：界面参数面板展示、论文第 6 章实验数据（时长 / 峰值 / RMS /
+    波峰因数 / 静音占比 / 削顶样本数）。
+
+    源音频指标反映素材本身；``edited`` 反映剪辑 + 后处理后的成片，
+    因此在调整增益或删减内容后能直接看到响度变化。
+
+    参数:
+        pid: 项目 id。
+
+    返回:
+        ``{project_id, source, edited, token_count, deleted_count, total_deleted}``。
+
+    异常:
+        404: 项目不存在；500: 读取或渲染失败。
+    """
+    project = _get_project(pid)
+    samples = _load_samples(project)
+    rate = int(project["sample_rate"])
+
+    try:
+        source_stats = audio_fx.measure(samples, rate).to_dict()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=500, detail=f"统计源音频失败：{exc}"
+        ) from exc
+
+    words = project.get("words") or []
+    edited: Optional[Dict[str, Any]] = None
+    token_count = 0
+    deleted_count = 0
+    total_deleted = 0.0
+
+    if words:
+        deleted_ids = _snapshot_deleted_ids(project)
+        tokens = _tokens_of(project, deleted_ids)
+        deletes = _deletes_of(tokens, deleted_ids)
+        token_count = len(tokens)
+        deleted_count = len(deleted_ids)
+        total_deleted = round(_total_deleted(deletes), 3)
+        try:
+            rendered = edl_render.render(samples, rate, deletes)
+            params = audio_fx.AudioParams.from_mapping(
+                project.get("audio_params") or {}
+            )
+            processed = audio_fx.apply(rendered, rate, params)
+            edited = audio_fx.measure(processed, rate).to_dict()
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=500, detail=f"统计剪辑后音频失败：{exc}"
+            ) from exc
+
+    return AudioInfoResponse(
+        project_id=pid,
+        source=source_stats,
+        edited=edited,
+        token_count=token_count,
+        deleted_count=deleted_count,
+        total_deleted=total_deleted,
+    )
+
+
+def _audio_param_limits() -> Dict[str, Any]:
+    """后处理参数的取值上限（一次构造，供两个接口共用）。"""
+    return {
+        "min_gain_db": audio_fx.MIN_GAIN_DB,
+        "max_gain_db": audio_fx.MAX_GAIN_DB,
+        "max_fade_seconds": audio_fx.MAX_FADE_SECONDS,
+        "default_target_dbfs": audio_fx.DEFAULT_TARGET_DBFS,
+    }
 
 
 # ----------------------------------------------------------------------

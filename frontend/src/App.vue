@@ -39,12 +39,15 @@ import {
   detectSilences,
   exportFileUrl,
   exportProject,
+  fetchAudioInfo,
+  fetchAudioParams,
   fetchTokens,
   buildProjectFile,
   health,
   loadProject,
   loadProjectFile,
   restoreTokens,
+  saveAudioParams,
   sourceAudioUrl,
   saveProject,
   transcribeProject,
@@ -108,6 +111,29 @@ const history = createHistory()
 const waveformVisible = ref(true)
 /** 右侧参数面板是否展开（默认收起，L3） */
 const panelOpen = ref(false)
+
+/**
+ * 音频后处理参数（增益 / 峰值标准化 / 首尾淡入淡出）。
+ * 与后端 AudioParams 对齐；保存后导出按此渲染，不改源文件。
+ */
+const audioParams = ref({
+  gain_db: 0,
+  normalize: false,
+  fade_in: 0,
+  fade_out: 0,
+})
+/** 后端返回的参数上限（供控件约束） */
+const audioLimits = ref({
+  min_gain_db: -24,
+  max_gain_db: 24,
+  max_fade_seconds: 5,
+})
+/** 参数保存中 */
+const savingParams = ref(false)
+/** 音频信息统计（AudioInfoResponse）：源音频与剪辑后的指标 */
+const audioInfo = ref(null)
+/** 统计加载中 */
+const loadingInfo = ref(false)
 
 const toolbarRef = ref(null)
 const playback = usePlayback()
@@ -177,6 +203,72 @@ function mergeSpans(spans) {
 
 function totalOf(spans) {
   return spans.reduce((sum, span) => sum + Math.max(0, span.end - span.start), 0)
+}
+
+// ----------------------------------------------------------------------
+// 音频后处理参数 + 音频信息统计
+// ----------------------------------------------------------------------
+/** 把 dBFS 数值格式化成 xx.x dB；-inf（全静音）显示为“静音”。 */
+function formatDbfs(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '静音'
+  return `${number.toFixed(1)} dB`
+}
+
+/** 把 0..1 的比例格式化成百分比。 */
+function formatPercent(ratio) {
+  const number = Number(ratio)
+  if (!Number.isFinite(number)) return '—'
+  return `${(number * 100).toFixed(1)}%`
+}
+
+/** 读取项目的后处理参数（打开/加载工程后调用）。 */
+async function loadAudioParams() {
+  if (!project.value?.id) return
+  try {
+    const data = await fetchAudioParams(project.value.id)
+    audioParams.value = { ...audioParams.value, ...(data?.audio_params || {}) }
+    if (data?.limits) audioLimits.value = { ...audioLimits.value, ...data.limits }
+  } catch (error) {
+    setStatus(`读取音频参数失败：${error.message}`, 'error')
+  }
+}
+
+/** 保存后处理参数；exporting 时不允许改，避免导出中途参数变动。 */
+async function handleSaveAudioParams() {
+  if (!project.value?.id) {
+    setStatus('请先创建或打开项目', 'info')
+    return
+  }
+  savingParams.value = true
+  setStatus('正在保存音频参数…', 'info')
+  try {
+    const data = await saveAudioParams(project.value.id, audioParams.value)
+    audioParams.value = { ...audioParams.value, ...(data?.audio_params || {}) }
+    setStatus('音频参数已保存，导出时生效', 'success')
+    await loadAudioInfo()
+  } catch (error) {
+    setStatus(`保存音频参数失败：${error.message}`, 'error')
+  } finally {
+    savingParams.value = false
+  }
+}
+
+/** 重新统计音频指标（源音频 + 当前删除状态下渲染后的成片）。 */
+async function loadAudioInfo() {
+  if (!project.value?.id) {
+    audioInfo.value = null
+    return
+  }
+  loadingInfo.value = true
+  try {
+    audioInfo.value = await fetchAudioInfo(project.value.id)
+  } catch (error) {
+    audioInfo.value = null
+    setStatus(`读取音频统计失败：${error.message}`, 'error')
+  } finally {
+    loadingInfo.value = false
+  }
 }
 
 /**
@@ -565,6 +657,8 @@ async function handleUpload() {
       `上传成功：项目「${created.name}」（${formatSeconds(created.duration)}，${created.sample_rate} Hz），下一步点击「转写」`,
       'success',
     )
+    await loadAudioParams()
+    await loadAudioInfo()
   } catch (error) {
     setStatus(`上传失败：${error.message}`, 'error')
   } finally {
@@ -729,6 +823,7 @@ async function applyLoadedProject(loaded) {
       `已打开「${loaded.name}」但源文件有变动：${integrity.message || ''}`,
       'error',
     )
+    await loadAudioParams()
     return
   }
 
@@ -738,6 +833,8 @@ async function applyLoadedProject(loaded) {
       : `已打开「${loaded.name}」：${tokens.value.length} 个 Token（音频未恢复，请重新导入源文件）`,
     audioRestored ? 'success' : 'error',
   )
+  await loadAudioParams()
+  await loadAudioInfo()
 }
 
 /** 直接读取工程文件内容并加载（无需绝对路径）。 */
@@ -978,6 +1075,67 @@ function handleEditorSeek(seconds) {
   playback.seekTo(seconds)
 }
 
+/** 光标所在 Token 的音频起点（秒）；无 Token 时返回 null。 */
+function timeAtCursor() {
+  if (!tokens.value.length) return null
+  const index = Math.min(Math.max(cursorIndex.value, 0), tokens.value.length - 1)
+  const token = tokens.value[index]
+  const start = Number(token?.start)
+  return Number.isFinite(start) ? start : null
+}
+
+/** Enter：从光标所在 Token 开始播放到结尾。 */
+function handlePlayFromCursor() {
+  if (!audioUrl.value) {
+    setStatus('还没有音频：请先选择文件', 'info')
+    return
+  }
+  if (!playback.state.ready) {
+    setStatus('音频还在解码，稍后再试', 'busy')
+    return
+  }
+  const start = timeAtCursor()
+  if (start === null) {
+    // 没有 Token（未转写）：退化为普通播放 / 暂停
+    playback.toggle()
+    return
+  }
+  playback.clearRange()
+  playback.seekTo(start)
+  playback.play()
+  setStatus(`从 ${formatSeconds(start)} 开始播放`, 'info')
+}
+
+/** Ctrl+Enter：试听选区（选区内首 Token 起点 → 末 Token 终点）。 */
+function handlePlaySelection() {
+  if (!audioUrl.value) {
+    setStatus('还没有音频：请先选择文件', 'info')
+    return
+  }
+  if (!playback.state.ready) {
+    setStatus('音频还在解码，稍后再试', 'busy')
+    return
+  }
+  const range = selectionRange.value
+  if (range.empty) {
+    setStatus('请先用 Shift+点击 或 Shift+方向键 选一段文字', 'info')
+    return
+  }
+  const first = tokens.value[range.start]
+  const last = tokens.value[range.end - 1]
+  const start = Number(first?.start)
+  const end = Number(last?.end)
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    setStatus('选区的音频区间无效，无法试听', 'error')
+    return
+  }
+  if (playback.playRange(start, end)) {
+    setStatus(`试听选区 ${formatSeconds(end - start)}（到终点自动停止）`, 'info')
+  } else {
+    setStatus('试听启动失败，请稍后重试', 'error')
+  }
+}
+
 /** 文本编辑器点击 Token → 光标变更（Shift 时扩展选区）。 */
 function handleCursorChange(payload) {
   setCursor(payload?.index ?? cursorIndex.value, { extend: Boolean(payload?.extend) })
@@ -1139,6 +1297,33 @@ registerCommands([
     enabled: () => playback.state.ready,
   },
   {
+    id: 'playback.playFromCursor',
+    title: '从光标处播放',
+    menu: 'playback',
+    shortcut: 'Enter',
+    handler: () => handlePlayFromCursor(),
+    enabled: () => Boolean(audioUrl.value),
+  },
+  {
+    id: 'playback.playSelection',
+    title: '试听选区',
+    menu: 'playback',
+    shortcut: 'Ctrl+Enter',
+    handler: () => handlePlaySelection(),
+    enabled: () => Boolean(audioUrl.value) && !selectionRange.value.empty,
+  },
+  {
+    id: 'tools.audioInfo',
+    title: '音频统计与后处理…',
+    menu: 'tools',
+    handler: () => {
+      panelOpen.value = true
+      loadAudioParams()
+      loadAudioInfo()
+    },
+    enabled: () => Boolean(project.value),
+  },
+  {
     id: 'transcribe.run',
     title: '转写（faster-whisper）…',
     menu: 'tools',
@@ -1197,6 +1382,9 @@ function onKeydown(event) {
     return
   }
 
+  // Enter 落在按钮上时交给按钮本身（避免「按钮聚焦 + Enter」被当成播放命令）
+  if (key === 'Enter' && event.target?.tagName === 'BUTTON') return
+
   // 其余交给命令注册表的快捷键表（Delete / Ctrl+O / Ctrl+E / Ctrl+R …）。
   const commandId = shortcutMap().get(shortcutFromEvent(event))
   if (commandId) {
@@ -1215,6 +1403,27 @@ watch(
     if (selectionAnchor.value !== null && selectionAnchor.value > length) {
       selectionAnchor.value = length
     }
+  },
+)
+
+// 选区变化 → 波形上同步高亮（蓝色区间），便于确认试听范围
+watch(
+  () => [selectionRange.value.empty, selectionRange.value.start, selectionRange.value.end],
+  () => {
+    const range = selectionRange.value
+    if (range.empty) {
+      playback.setSelection(null)
+      return
+    }
+    const first = tokens.value[range.start]
+    const last = tokens.value[range.end - 1]
+    const start = Number(first?.start)
+    const end = Number(last?.end)
+    playback.setSelection(
+      Number.isFinite(start) && Number.isFinite(end) && end > start
+        ? { start, end }
+        : null,
+    )
   },
 )
 
@@ -1397,11 +1606,157 @@ onBeforeUnmount(() => {
             </dl>
           </section>
 
-          <!-- 预留：参数面板插槽（分段策略 / 剪辑点精修 / 导出参数 / 主题等后定） -->
+          <!-- 音频后处理：增益 / 标准化 / 首尾淡入淡出（导出时生效，不改源文件） -->
           <section class="panel-section">
-            <h3 class="panel-section-title">参数</h3>
+            <h3 class="panel-section-title">音频后处理</h3>
+            <div class="param-field">
+              <label class="param-label" for="param-gain">
+                <input
+                  id="param-normalize"
+                  v-model="audioParams.normalize"
+                  class="param-check"
+                  type="checkbox"
+                />
+                峰值标准化
+              </label>
+              <span class="param-hint">拉到 -1 dBFS</span>
+            </div>
+
+            <div class="param-field" :class="{ 'param-disabled': audioParams.normalize }">
+              <label class="param-label" for="param-gain">
+                增益
+                <span class="param-value">{{ Number(audioParams.gain_db).toFixed(1) }} dB</span>
+              </label>
+              <input
+                id="param-gain"
+                v-model.number="audioParams.gain_db"
+                class="param-range"
+                type="range"
+                :min="audioLimits.min_gain_db"
+                :max="audioLimits.max_gain_db"
+                step="0.5"
+                :disabled="audioParams.normalize"
+              />
+            </div>
+
+            <div class="param-field">
+              <label class="param-label" for="param-fade-in">
+                淡入
+                <span class="param-value">{{ Number(audioParams.fade_in).toFixed(2) }} s</span>
+              </label>
+              <input
+                id="param-fade-in"
+                v-model.number="audioParams.fade_in"
+                class="param-range"
+                type="range"
+                min="0"
+                :max="audioLimits.max_fade_seconds"
+                step="0.05"
+              />
+            </div>
+
+            <div class="param-field">
+              <label class="param-label" for="param-fade-out">
+                淡出
+                <span class="param-value">{{ Number(audioParams.fade_out).toFixed(2) }} s</span>
+              </label>
+              <input
+                id="param-fade-out"
+                v-model.number="audioParams.fade_out"
+                class="param-range"
+                type="range"
+                min="0"
+                :max="audioLimits.max_fade_seconds"
+                step="0.05"
+              />
+            </div>
+
+            <button
+              class="btn btn-small param-apply"
+              type="button"
+              :disabled="!project?.id || savingParams"
+              @click="handleSaveAudioParams"
+            >
+              {{ savingParams ? '保存中…' : '应用参数' }}
+            </button>
+          </section>
+
+          <!-- 音频信息统计：源音频 与 当前编辑后的成片 -->
+          <section class="panel-section">
+            <h3 class="panel-section-title">
+              音频统计
+              <button
+                class="btn btn-small btn-link"
+                type="button"
+                :disabled="!project?.id || loadingInfo"
+                @click="loadAudioInfo"
+              >
+                {{ loadingInfo ? '统计中…' : '刷新' }}
+              </button>
+            </h3>
+            <template v-if="audioInfo">
+              <dl class="panel-list">
+                <div class="panel-row">
+                  <dt>源时长</dt>
+                  <dd class="mono">{{ formatSeconds(audioInfo.source?.duration) }}</dd>
+                </div>
+                <div class="panel-row">
+                  <dt>源峰值 / RMS</dt>
+                  <dd class="mono">
+                    {{ formatDbfs(audioInfo.source?.peak_dbfs) }} /
+                    {{ formatDbfs(audioInfo.source?.rms_dbfs) }}
+                  </dd>
+                </div>
+                <div class="panel-row">
+                  <dt>波峰因数</dt>
+                  <dd class="mono">{{ formatDbfs(audioInfo.source?.crest_factor_db) }}</dd>
+                </div>
+                <div class="panel-row">
+                  <dt>静音占比</dt>
+                  <dd class="mono">{{ formatPercent(audioInfo.source?.silence_ratio) }}</dd>
+                </div>
+                <template v-if="audioInfo.edited">
+                  <div class="panel-row">
+                    <dt>成片时长</dt>
+                    <dd class="mono">{{ formatSeconds(audioInfo.edited?.duration) }}</dd>
+                  </div>
+                  <div class="panel-row">
+                    <dt>成片峰值 / RMS</dt>
+                    <dd class="mono">
+                      {{ formatDbfs(audioInfo.edited?.peak_dbfs) }} /
+                      {{ formatDbfs(audioInfo.edited?.rms_dbfs) }}
+                    </dd>
+                  </div>
+                  <div class="panel-row">
+                    <dt>成片静音占比</dt>
+                    <dd class="mono">{{ formatPercent(audioInfo.edited?.silence_ratio) }}</dd>
+                  </div>
+                  <div class="panel-row">
+                    <dt>削顶样本</dt>
+                    <dd
+                      class="mono"
+                      :class="{ 'param-warn': Number(audioInfo.edited?.clipped_samples) > 0 }"
+                    >
+                      {{ audioInfo.edited?.clipped_samples ?? 0 }}
+                    </dd>
+                  </div>
+                </template>
+                <div v-else class="panel-row">
+                  <dt>成片</dt>
+                  <dd>尚未转写，无法统计</dd>
+                </div>
+              </dl>
+            </template>
+            <p v-else class="panel-placeholder">
+              {{ loadingInfo ? '正在统计音频指标…' : '创建或打开项目后显示音频指标。' }}
+            </p>
+          </section>
+
+          <!-- 预留：参数面板插槽（分段策略 / 剪辑点精修 / 主题等后定） -->
+          <section class="panel-section">
+            <h3 class="panel-section-title">预留</h3>
             <p class="panel-placeholder">
-              预留区域（240px 占位）：分段策略、剪辑点精修、导出参数、主题等后续在此挂载。
+              预留区域：分段策略、剪辑点精修、主题等后续在此挂载。
             </p>
           </section>
         </div>
@@ -1649,6 +2004,76 @@ onBeforeUnmount(() => {
   color: var(--text-faint);
   border: 1px dashed var(--border-strong);
   border-radius: 4px;
+}
+
+/* 参数面板：音频后处理控件 */
+.param-field {
+  margin-bottom: 8px;
+}
+
+.param-field.param-disabled {
+  opacity: 0.45;
+}
+
+.param-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-bottom: 3px;
+  cursor: pointer;
+}
+
+.param-label .param-check {
+  margin-right: 5px;
+}
+
+.param-value {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+}
+
+.param-range {
+  width: 100%;
+  height: 16px;
+  accent-color: var(--accent, #4f8cff);
+  cursor: pointer;
+}
+
+.param-range:disabled {
+  cursor: not-allowed;
+}
+
+.param-hint {
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.param-apply {
+  width: 100%;
+  margin-top: 2px;
+}
+
+.btn-link {
+  padding: 0 4px;
+  background: transparent;
+  border: none;
+  color: var(--accent, #4f8cff);
+  font-size: 10.5px;
+  font-weight: 400;
+  cursor: pointer;
+}
+
+.btn-link:disabled {
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
+
+.param-warn {
+  color: var(--danger, #e5534b);
 }
 
 /* 底部状态栏 */

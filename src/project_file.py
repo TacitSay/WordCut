@@ -16,6 +16,7 @@
         "sample_rate": 16000, "duration": 300.0
       },
       "words": [...], "deleted_ids": [...], "in_out": null,
+      "audio_params": {"gain_db": 0.0, "normalize": false, "fade_in": 0.0, "fade_out": 0.0},
       "created_at": "...", "modified_at": "..."
     }
 
@@ -113,6 +114,7 @@ def build_project_doc(project: Dict[str, Any]) -> Dict[str, Any]:
         },
         "words": [dict(item) for item in words],
         "deleted_ids": sorted(str(item) for item in deleted_ids),
+        "audio_params": dict(project.get("audio_params") or {}),
         "in_out": project.get("in_out"),
         "created_at": str(project.get("created_at", "")),
         "modified_at": _now_iso(),
@@ -202,6 +204,11 @@ def parse_project_doc(doc: Any) -> Dict[str, Any]:
         "modified_at": str(doc.get("modified_at") or ""),
         "source_path": source.get("original_path"),
         "source_kind": str(source.get("original_kind") or "audio"),
+        "audio_params": (
+            dict(doc.get("audio_params"))
+            if isinstance(doc.get("audio_params"), dict)
+            else {}
+        ),
         "in_out": doc.get("in_out"),
         "tokens": tokens,
         "integrity": integrity,

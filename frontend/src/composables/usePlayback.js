@@ -29,6 +29,9 @@ import RegionsPlugin from 'wavesurfer.js/plugins/regions'
 /** 删除区间填充色（红色半透明，与界面图例一致）。 */
 const REGION_COLOR = 'rgba(239, 68, 68, 0.28)'
 
+/** 选区（试听范围）填充色（蓝色半透明）。 */
+const SELECTION_COLOR = 'rgba(59, 130, 246, 0.22)'
+
 /** 容器高度量不到时的兜底高度（px）。 */
 const DEFAULT_WAVE_HEIGHT = 140
 
@@ -51,6 +54,10 @@ let regions = null
 let currentContainer = null
 /** 当前要标注的删除区间（跨 attach 保留，便于重建后立即重绘）。 */
 let deleteSpans = []
+/** 当前选区区间（试听范围，跨 attach 保留）。 */
+let selectionSpan = null
+/** 选区试听的终点（秒）；null 表示不限制播放范围。 */
+let rangeEnd = null
 
 /** 安全转数字：非法值返回 fallback。 */
 function toNumber(value, fallback = 0) {
@@ -90,6 +97,7 @@ function renderRegions() {
   const plugin = regions
   if (!plugin || !playbackState.ready) return
   plugin.clearRegions()
+  // 先画删除区间（红），再画选区（蓝），选区在上层更醒目
   for (const span of deleteSpans) {
     const start = toNumber(span?.start, Number.NaN)
     const end = toNumber(span?.end, Number.NaN)
@@ -101,6 +109,19 @@ function renderRegions() {
       drag: false,
       resize: false,
     })
+  }
+  if (selectionSpan) {
+    const start = toNumber(selectionSpan.start, Number.NaN)
+    const end = toNumber(selectionSpan.end, Number.NaN)
+    if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+      plugin.addRegion({
+        start,
+        end,
+        color: SELECTION_COLOR,
+        drag: false,
+        resize: false,
+      })
+    }
   }
 }
 
@@ -160,6 +181,19 @@ export function attachWaveform(container, url) {
   })
   instance.on('timeupdate', (time) => {
     playbackState.currentTime = toNumber(time, 0)
+    // 选区试听：到达终点自动停止并停在终点
+    if (rangeEnd !== null && playbackState.currentTime >= rangeEnd) {
+      const stopAt = rangeEnd
+      rangeEnd = null
+      try {
+        instance.pause()
+        instance.setTime(stopAt)
+      } catch {
+        /* 忽略停止异常 */
+      }
+      playbackState.currentTime = stopAt
+      playbackState.playing = false
+    }
   })
   instance.on('seeking', (time) => {
     playbackState.currentTime = toNumber(time, 0)
@@ -235,6 +269,49 @@ export function seekBy(delta) {
   return seekTo(base + toNumber(delta, 0))
 }
 
+/**
+ * 选区试听：从 start 播到 end 自动停止。
+ *
+ * 参数:
+ * @param {number} start 起点（秒）
+ * @param {number} end 终点（秒，必须大于 start）
+ * @returns {boolean} 是否真的开始播放
+ */
+export function playRange(start, end) {
+  if (!wave || !playbackState.ready) return false
+  const from = Math.max(0, toNumber(start, 0))
+  const to = toNumber(end, 0)
+  if (!(to > from)) return false
+  if (!seekTo(from)) return false
+  rangeEnd = to
+  const started = play()
+  if (!started) rangeEnd = null
+  return started
+}
+
+/**
+ * 设置选区高亮区间（蓝）；传 null 清除。
+ * @param {{start: number, end: number}|null} span
+ */
+export function setSelection(span) {
+  if (!span) {
+    selectionSpan = null
+  } else {
+    const start = toNumber(span.start, Number.NaN)
+    const end = toNumber(span.end, Number.NaN)
+    selectionSpan =
+      Number.isFinite(start) && Number.isFinite(end) && end > start
+        ? { start, end }
+        : null
+  }
+  renderRegions()
+}
+
+/** 清除选区试听的范围限制（例如用户手动拖动播放头时）。 */
+export function clearRange() {
+  rangeEnd = null
+}
+
 /** 更新删除区间（红色标注）。 */
 export function setDeletes(spans) {
   deleteSpans = Array.isArray(spans)
@@ -286,6 +363,9 @@ let sharedApi = null
  *   seekBy: (delta: number) => boolean,
  *   seekBack: (step?: number) => boolean,
  *   seekForward: (step?: number) => boolean,
+ *   playRange: (start: number, end: number) => boolean,
+ *   setSelection: (span: {start: number, end: number}|null) => void,
+ *   clearRange: () => void,
  *   setDeletes: (spans: object[]) => void,
  *   isPlaying: () => boolean,
  *   getCurrentTime: () => number,
@@ -306,6 +386,9 @@ export function usePlayback() {
       seekBy,
       seekBack: (step = 2) => seekBy(-Math.abs(toNumber(step, 2))),
       seekForward: (step = 2) => seekBy(Math.abs(toNumber(step, 2))),
+      playRange,
+      setSelection,
+      clearRange,
       setDeletes,
       isPlaying,
       getCurrentTime,

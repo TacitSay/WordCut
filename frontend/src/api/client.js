@@ -291,7 +291,50 @@ export function exportProject(projectId, options = {}) {
     export_video: Boolean(options.export_video),
     video_mode: options.video_mode ?? 'precise',
   }
+  if (options.audio_params) body.audio_params = options.audio_params
   return request(projectPath(projectId, '/export'), { method: 'POST', body })
+}
+
+/**
+ * GET /api/projects/{pid}/audio-params -> AudioParamsResponse
+ *
+ * 读取项目已保存的音频后处理参数（增益 / 标准化 / 淡入淡出）。
+ *
+ * @param {string} projectId
+ */
+export function fetchAudioParams(projectId) {
+  return request(projectPath(projectId, '/audio-params'))
+}
+
+/**
+ * POST /api/projects/{pid}/audio-params -> AudioParamsResponse
+ *
+ * 保存音频后处理参数；保存后导出即按新参数渲染。
+ *
+ * @param {string} projectId
+ * @param {{ gain_db?: number, normalize?: boolean, fade_in?: number, fade_out?: number }} params
+ */
+export function saveAudioParams(projectId, params = {}) {
+  return request(projectPath(projectId, '/audio-params'), {
+    method: 'POST',
+    body: {
+      gain_db: Number(params.gain_db ?? 0),
+      normalize: Boolean(params.normalize),
+      fade_in: Number(params.fade_in ?? 0),
+      fade_out: Number(params.fade_out ?? 0),
+    },
+  })
+}
+
+/**
+ * GET /api/projects/{pid}/audio-info -> AudioInfoResponse
+ *
+ * 源音频与"按当前删除状态渲染后"的客观指标（时长 / 峰值 / RMS / 静音占比等）。
+ *
+ * @param {string} projectId
+ */
+export function fetchAudioInfo(projectId) {
+  return request(projectPath(projectId, '/audio-info'))
 }
 
 /**
@@ -316,4 +359,7 @@ export default {
   restoreTokens,
   exportProject,
   previewSubtitle,
+  fetchAudioParams,
+  saveAudioParams,
+  fetchAudioInfo,
 }

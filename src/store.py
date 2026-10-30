@@ -24,6 +24,7 @@
     updated_at         TEXT NOT NULL
     words_json         TEXT NOT NULL DEFAULT '[]'   -- JSON 数组
     deleted_ids_json   TEXT NOT NULL DEFAULT '[]'   -- JSON 数组
+    audio_params_json  TEXT NOT NULL DEFAULT '{}'   -- JSON 对象（增益/标准化/淡入淡出）
 
 线程模型：
 
@@ -91,9 +92,17 @@ CREATE TABLE IF NOT EXISTS projects (
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL,
     words_json        TEXT NOT NULL DEFAULT '[]',
-    deleted_ids_json  TEXT NOT NULL DEFAULT '[]'
+    deleted_ids_json  TEXT NOT NULL DEFAULT '[]',
+    audio_params_json TEXT NOT NULL DEFAULT '{}'
 )
 """
+
+#: 增量迁移：老库缺的列在这里补（``ALTER TABLE ... ADD COLUMN`` 幂等性靠
+#: :func:`Repository._init_schema` 里的 ``PRAGMA table_info`` 检查保证）。
+#: 键为列名，值为列定义。
+_MIGRATION_COLUMNS: Dict[str, str] = {
+    "audio_params_json": "TEXT NOT NULL DEFAULT '{}'",
+}
 
 #: 列表接口按创建时间倒序，建索引避免全表排序。
 _CREATE_INDEX_SQL: str = (
@@ -106,24 +115,27 @@ _CREATE_INDEX_SQL: str = (
 _UPSERT_SQL: str = """
 INSERT INTO projects (
     id, name, audio_path, source_path, source_kind,
-    sample_rate, created_at, updated_at, words_json, deleted_ids_json
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    sample_rate, created_at, updated_at, words_json, deleted_ids_json,
+    audio_params_json
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
-    name             = excluded.name,
-    audio_path       = excluded.audio_path,
-    source_path      = excluded.source_path,
-    source_kind      = excluded.source_kind,
-    sample_rate      = excluded.sample_rate,
-    created_at       = excluded.created_at,
-    updated_at       = excluded.updated_at,
-    words_json       = excluded.words_json,
-    deleted_ids_json = excluded.deleted_ids_json
+    name              = excluded.name,
+    audio_path        = excluded.audio_path,
+    source_path       = excluded.source_path,
+    source_kind       = excluded.source_kind,
+    sample_rate       = excluded.sample_rate,
+    created_at        = excluded.created_at,
+    updated_at        = excluded.updated_at,
+    words_json        = excluded.words_json,
+    deleted_ids_json  = excluded.deleted_ids_json,
+    audio_params_json = excluded.audio_params_json
 """
 
 #: 查询列顺序与 :func:`_row_to_project` 的取值一一对应（写全列名，不用 ``SELECT *``）。
 _SELECT_COLUMNS: str = (
     "id, name, audio_path, source_path, source_kind, "
-    "sample_rate, created_at, updated_at, words_json, deleted_ids_json"
+    "sample_rate, created_at, updated_at, words_json, deleted_ids_json, "
+    "audio_params_json"
 )
 
 
@@ -198,6 +210,33 @@ def _loads_ids(raw: Any) -> Set[str]:
     return {str(item) for item in parsed}
 
 
+def _loads_params(raw: Any) -> Dict[str, Any]:
+    """把 ``audio_params_json`` 解析成音频后处理参数字典；异常时回退为 ``{}``。
+
+    返回空字典等价于"全部默认值"（不增益、不标准化、不淡入淡出），
+    因此老库、老工程文件读出来都能正常走渲染链路。
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return {}
+    if not isinstance(raw, str):
+        return {}
+    text = raw.strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return dict(parsed)
+
+
 def _as_int(value: Any, default: int = 0) -> int:
     """把值转成 int；``None`` 或非法值用 ``default``（避免一行坏数据炸掉整个列表）。"""
     if value is None:
@@ -231,6 +270,7 @@ def _row_to_project(row: sqlite3.Row) -> Dict[str, Any]:
         "sample_rate": _as_int(row["sample_rate"]),
         "words": _loads_words(row["words_json"]),
         "deleted_ids": _loads_ids(row["deleted_ids_json"]),
+        "audio_params": _loads_params(row["audio_params_json"]),
         "created_at": _as_str(row["created_at"]),
         "updated_at": _as_str(row["updated_at"]),
     }
@@ -344,6 +384,16 @@ class Repository:
         try:
             conn.execute(_CREATE_PROJECTS_SQL)
             conn.execute(_CREATE_INDEX_SQL)
+            # 老库补列：CREATE TABLE IF NOT EXISTS 不会给已有表加新列
+            existing = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(projects)").fetchall()
+            }
+            for column, definition in _MIGRATION_COLUMNS.items():
+                if column not in existing:
+                    conn.execute(
+                        f"ALTER TABLE projects ADD COLUMN {column} {definition}"
+                    )
             conn.commit()
         except sqlite3.Error as exc:  # pragma: no cover
             conn.rollback()
@@ -368,6 +418,7 @@ class Repository:
             now,
             _dumps(project.get("words") or []),
             _dumps(sorted(str(item) for item in (project.get("deleted_ids") or ()))),
+            _dumps(project.get("audio_params") or {}),
         )
 
     def _existing_created_at(self, pid: str) -> Optional[str]:
