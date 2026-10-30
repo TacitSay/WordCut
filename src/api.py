@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 import threading
@@ -915,6 +916,183 @@ def list_projects() -> List[ProjectSummary]:
         )
     summaries.sort(key=lambda item: item.created_at, reverse=True)
     return summaries
+
+
+# ----------------------------------------------------------------------
+# 接口：项目详情（切换到已有项目）
+# ----------------------------------------------------------------------
+class ProjectDetailResponse(BaseModel):
+    """``GET /api/projects/{pid}`` 的响应：足以恢复整个编辑界面。"""
+
+    project_id: str = Field(..., description="项目 id")
+    name: str = Field(..., description="项目名")
+    audio_path: str = Field(..., description="工程内 16kHz WAV 路径")
+    sample_rate: int = Field(..., description="采样率（Hz）")
+    duration: float = Field(..., description="源音频时长（秒）")
+    source_kind: str = Field("audio", description="原始素材类型：audio / video")
+    words: List[WordOut] = Field(default_factory=list, description="词级对齐结果")
+    deleted_ids: List[str] = Field(default_factory=list, description="被删 Token id")
+    tokens: List[TokenOut] = Field(default_factory=list, description="Token 列表")
+    segments: List[SegmentOut] = Field(default_factory=list, description="段落")
+
+
+@app.get(
+    "/api/projects/{pid}",
+    response_model=ProjectDetailResponse,
+    summary="取项目详情（用于切换到已有项目）",
+)
+def get_project_detail(pid: str) -> ProjectDetailResponse:
+    """返回一个项目当前完整的编辑状态，前端据此直接恢复界面。
+
+    与「打开工程文件（.wcproj）」的区别：本接口读的是后端数据库里的项目，
+    不需要用户提供任何路径；波形音频仍走 ``/source-audio`` 取回。
+
+    参数:
+        pid: 项目 id。
+
+    返回:
+        ``{project_id, name, audio_path, sample_rate, duration, source_kind,
+        words, deleted_ids, tokens, segments}``。
+
+    异常:
+        404: 项目不存在。
+    """
+    project = _get_project(pid)
+    try:
+        duration = _duration_of(project)
+    except HTTPException:
+        duration = 0.0
+
+    words = [WordOut(**item) for item in (project.get("words") or [])]
+    deleted_ids = _snapshot_deleted_ids(project)
+    tokens = _tokens_of(project, deleted_ids)
+    segments = segmenter.segment_tokens(tokens)
+
+    return ProjectDetailResponse(
+        project_id=str(project["id"]),
+        name=str(project["name"]),
+        audio_path=str(project.get("audio_path") or ""),
+        sample_rate=int(project["sample_rate"]),
+        duration=duration,
+        source_kind=str(project.get("source_kind") or "audio"),
+        words=words,
+        deleted_ids=sorted(deleted_ids),
+        tokens=[TokenOut(**token.to_dict()) for token in tokens],
+        segments=[SegmentOut(**seg.to_dict()) for seg in segments],
+    )
+
+
+# ----------------------------------------------------------------------
+# 接口：项目重命名 / 删除
+# ----------------------------------------------------------------------
+class RenameProjectRequest(BaseModel):
+    """``PATCH /api/projects/{pid}`` 的请求体。"""
+
+    name: str = Field(..., description="新的项目名（去空格后不能为空）")
+
+
+class DeletedProjectResponse(BaseModel):
+    """``DELETE /api/projects/{pid}`` 的响应。"""
+
+    project_id: str = Field(..., description="被删除的项目 id")
+    removed_files: List[str] = Field(
+        default_factory=list, description="一并删除的运行时文件路径（未清理时为空）"
+    )
+
+
+@app.patch(
+    "/api/projects/{pid}",
+    response_model=ProjectSummary,
+    summary="重命名项目",
+)
+def rename_project(pid: str, payload: RenameProjectRequest) -> ProjectSummary:
+    """修改项目名（只改数据库里的 name，不动任何音频文件）。
+
+    参数:
+        pid: 项目 id。
+        payload: ``{name}``；首尾空格会被去掉，空名直接拒绝。
+
+    返回:
+        更新后的项目摘要。
+
+    异常:
+        400: 新名称为空；404: 项目不存在。
+    """
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="项目名不能为空")
+
+    project = _get_project(pid)
+    project["name"] = name
+    _store.put(project)
+
+    try:
+        duration = _duration_of(project)
+    except HTTPException:
+        duration = 0.0
+    word_count = len(project.get("words") or [])
+    delete_count = len(project.get("deleted_ids") or ())
+    return ProjectSummary(
+        id=str(project["id"]),
+        name=str(project["name"]),
+        sample_rate=int(project["sample_rate"]),
+        duration=duration,
+        word_count=word_count,
+        deleted_count=delete_count,
+        transcribed=word_count > 0,
+        created_at=str(project["created_at"]),
+    )
+
+
+@app.delete(
+    "/api/projects/{pid}",
+    response_model=DeletedProjectResponse,
+    summary="删除项目",
+)
+def delete_project(
+    pid: str,
+    purge_files: bool = Query(
+        False, description="是否同时删除 uploads/ 与 outputs/ 下的运行时文件"
+    ),
+) -> DeletedProjectResponse:
+    """从数据库删除项目；可选连带清理运行时文件。
+
+    默认 **只删数据库记录**（不碰源音频，遵循"源文件只读"的谨慎口径）：
+    误删项目还能重新导入源文件恢复；传 ``purge_files=true`` 才额外清理
+    ``uploads/{pid}.*`` 与 ``outputs/{pid}/``——这两个目录里都是本工具生成的
+    副本，删掉不影响用户的原始素材。
+
+    参数:
+        pid: 项目 id。
+        purge_files: 是否清理运行时副本。
+
+    返回:
+        ``{project_id, removed_files}``。
+
+    异常:
+        404: 项目不存在。
+    """
+    if not _store.exists(pid):
+        raise HTTPException(status_code=404, detail=f"项目不存在：{pid}")
+
+    removed: List[str] = []
+    if purge_files:
+        for candidate in UPLOAD_DIR.glob(f"{pid}.*"):
+            try:
+                candidate.unlink()
+                removed.append(str(candidate))
+            except OSError:
+                continue
+        project_dir = OUTPUT_DIR / pid
+        if project_dir.is_dir():
+            try:
+                shutil.rmtree(project_dir)
+                removed.append(str(project_dir))
+            except OSError:
+                pass
+
+    _store.delete(pid)
+    return DeletedProjectResponse(project_id=pid, removed_files=removed)
 
 
 # ----------------------------------------------------------------------

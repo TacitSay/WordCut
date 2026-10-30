@@ -28,6 +28,7 @@ import { createHistory, createTokenEditEntry } from './core/history.js'
 import MenuBar from './components/MenuBar.vue'
 import Toolbar from './components/Toolbar.vue'
 import ExportDialog from './components/ExportDialog.vue'
+import ProjectDialog from './components/ProjectDialog.vue'
 
 import TextEditor from './components/TextEditor.vue'
 import WaveformView from './components/WaveformView.vue'
@@ -45,6 +46,8 @@ import {
   fetchTokens,
   buildProjectFile,
   health,
+  listProjects,
+  fetchProject,
   loadProject,
   loadProjectFile,
   restoreTokens,
@@ -81,6 +84,8 @@ const totalDeleted = ref(0)
 const exportInfo = ref(null)
 /** 导出对话框是否打开 */
 const exportDialogOpen = ref(false)
+/** 项目管理对话框是否打开 */
+const projectDialogOpen = ref(false)
 /** 工程文件保存中 */
 const saving = ref(false)
 /** 正在检测静音 */
@@ -741,6 +746,87 @@ async function handleRestoreAll() {
   const count = deletedIds.value.length
   await performEdit([...deletedIds.value], 'restore', { nextCursor: cursorIndex.value })
   setStatus(`已恢复全部 ${count} 个被删除的 Token`, 'success')
+}
+
+/** 把 /api/projects/{pid} 的详情恢复成界面状态。 */
+async function applyProjectDetail(detail) {
+  resetProjectState()
+
+  project.value = {
+    id: detail.project_id,
+    name: detail.name,
+    sample_rate: detail.sample_rate,
+    duration: detail.duration,
+    source_kind: detail.source_kind,
+  }
+  projectName.value = detail.name
+  tokens.value = Array.isArray(detail.tokens) ? [...detail.tokens] : []
+  segments.value = Array.isArray(detail.segments) ? [...detail.segments] : []
+  deletedIds.value = Array.isArray(detail.deleted_ids) ? [...detail.deleted_ids] : []
+  deletes.value = buildDeletesFromTokens(tokens.value, deletedIds.value)
+  totalDeleted.value = totalOf(deletes.value)
+  playback.setDeletes(deletes.value)
+  exportInfo.value = null
+
+  // 源音频：后端按项目记录的路径重新转码一份 WAV，前端换成新的 blob URL
+  try {
+    const response = await fetch(`${sourceAudioUrl(detail.project_id)}?t=${Date.now()}`)
+    if (response.ok) {
+      const blob = await response.blob()
+      if (audioUrl.value) URL.revokeObjectURL(audioUrl.value)
+      audioUrl.value = URL.createObjectURL(blob)
+    }
+  } catch {
+    /* 音频拿不到时仍可编辑文本，只是没有波形 */
+  }
+
+  setStatus(
+    `已打开「${detail.name}」：${tokens.value.length} 个 Token，删除 ${deletedIds.value.length} 个`,
+    'success',
+  )
+  await loadAudioParams()
+  await loadAudioInfo()
+}
+
+/** 从项目管理里打开某个已有项目（不用重新上传）。 */
+async function handleOpenProjectById(pid) {
+  if (busy.value) {
+    setStatus('当前有任务在进行，请稍后再打开项目', 'error')
+    return
+  }
+  loadingProject.value = true
+  setStatus('正在打开项目…', 'busy')
+  try {
+    const detail = await fetchProject(pid)
+    await applyProjectDetail(detail)
+    projectDialogOpen.value = false
+  } catch (error) {
+    setStatus(`打开项目失败：${error.message}`, 'error')
+  } finally {
+    loadingProject.value = false
+  }
+}
+
+/** 项目被重命名/删除后核对当前项目（名字同步、被删则清空状态）。 */
+async function handleProjectDialogChanged() {
+  const current = project.value
+  if (!current?.id) return
+  try {
+    const list = await listProjects()
+    const found = (Array.isArray(list) ? list : []).find((item) => item.id === current.id)
+    if (!found) {
+      resetProjectState()
+      setStatus('当前项目已在项目管理中被删除，状态已清空', 'info')
+      return
+    }
+    if (found.name !== current.name) {
+      project.value = { ...current, name: found.name }
+      projectName.value = found.name
+      setStatus(`项目已重命名为「${found.name}」`, 'success')
+    }
+  } catch (error) {
+    setStatus(`刷新项目信息失败：${error.message}`, 'error')
+  }
 }
 
 /** 静音检测：调用后端分析并批量删除无发音的长停顿。 */
@@ -1499,6 +1585,14 @@ registerCommands([
     enabled: () => !busy.value,
   },
   {
+    id: 'file.manageProjects',
+    title: '项目管理（重命名 / 删除）…',
+    menu: 'file',
+    handler: () => {
+      projectDialogOpen.value = true
+    },
+  },
+  {
     id: 'edit.delete',
     title: '删除选中 Token',
     menu: 'edit',
@@ -2162,6 +2256,14 @@ onBeforeUnmount(() => {
       :result="exportInfo"
       @close="exportDialogOpen = false"
       @confirm="handleExportConfirm"
+    />
+
+    <!-- 项目管理对话框（打开 / 重命名 / 删除） -->
+    <ProjectDialog
+      v-if="projectDialogOpen"
+      @close="projectDialogOpen = false"
+      @changed="handleProjectDialogChanged"
+      @open="handleOpenProjectById"
     />
   </div>
 </template>

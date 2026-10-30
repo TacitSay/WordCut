@@ -159,29 +159,79 @@ function emitCursor(index, event) {
   emit('cursor-change', { index, extend: Boolean(event?.shiftKey) })
 }
 
-/** 按鼠标落在 Token 的左/右半边换算光标位置（词前 / 词后）。 */
-function positionFromPointer(item, event) {
-  const el = event?.currentTarget
-  const rect =
-    typeof el?.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null
-  const rightHalf = rect ? event.clientX - rect.left > rect.width / 2 : true
-  return item.index + (rightHalf ? 1 : 0)
+/**
+ * 由屏幕坐标解析出「第几个 Token + 光标落在词前还是词后」。
+ *
+ * 为什么不用事件目标：用户常常从词与词之间的空白、段首段尾、甚至两个字符中间
+ * 开始拖拽。只看 `event.target` 会解析失败（空白处不是 Token），导致"必须先点
+ * 一下定位光标，再拖"——这正是之前难用的根因。
+ *
+ * 优先用 `caretRangeFromPoint` / `caretPositionFromPoint`（浏览器原生的"这个坐标
+ * 对应文本的哪个位置"），它能精确到字符偏移，也能跨段落命中；不支持时退回
+ * 元素命中 + 左右半边估算。
+ *
+ * @returns {{index: number, position: number}|null}
+ */
+function resolvePoint(x, y) {
+  let textNode = null
+  let offset = 0
+
+  if (typeof document.caretRangeFromPoint === 'function') {
+    const range = document.caretRangeFromPoint(x, y)
+    if (range) {
+      textNode = range.startContainer
+      offset = range.startOffset
+    }
+  } else if (typeof document.caretPositionFromPoint === 'function') {
+    const pos = document.caretPositionFromPoint(x, y)
+    if (pos) {
+      textNode = pos.offsetNode
+      offset = pos.offset
+    }
+  }
+
+  if (textNode) {
+    const holder = textNode.nodeType === 3 ? textNode.parentElement : textNode
+    const tokenEl = holder?.closest?.('[data-token-index]')
+    if (tokenEl) {
+      const index = Number(tokenEl.dataset.tokenIndex)
+      if (Number.isFinite(index)) {
+        const text = textNode.nodeType === 3 ? String(textNode.textContent ?? '') : ''
+        const rightHalf = text.length ? offset * 2 >= text.length : false
+        return { index, position: index + (rightHalf ? 1 : 0) }
+      }
+    }
+  }
+
+  // 退化路径：坐标处正好是 Token 元素
+  const target = document.elementFromPoint?.(x, y)
+  const tokenEl = target?.closest?.('[data-token-index]')
+  if (tokenEl) {
+    const index = Number(tokenEl.dataset.tokenIndex)
+    if (Number.isFinite(index)) {
+      const rect = tokenEl.getBoundingClientRect()
+      const rightHalf = x - rect.left > rect.width / 2
+      return { index, position: index + (rightHalf ? 1 : 0) }
+    }
+  }
+  return null
 }
 
 /**
  * 拖拽选区状态。
  *
- * 交互设计：
- *  - 按下 → 落光标并记锚点；
- *  - 指针移动超过 ``DRAG_THRESHOLD_PX`` 才算"开始拖拽"，否则仍按点击处理
- *    （人按鼠标时手会抖 2–3px，若一移动就判定拖拽，"点击红字恢复"会失灵）；
- *  - 拖动经过其它 Token → 持续扩展选区（Shift+方向键同款语义）；
- *  - 松开时若没超过阈值 → 点击语义：已删词恢复、未删词定位播放头；
- *  - 拖动过程中 `preventDefault`，避免触发浏览器原生文字选择。
+ * 交互设计（重做后）：
+ *  - **任意位置按下即可拖选**：按下时用 :func:`resolvePoint` 解析锚点，
+ *    不再要求先点一个 Token 定位光标；
+ *  - 指针移动超过 ``DRAG_THRESHOLD_PX`` 才算拖拽，否则仍按点击处理
+ *    （手抖 2–3px 不能把"点击红字恢复"吞掉）；
+ *  - 拖动中持续扩展选区（Shift+方向键同款语义），跨段落也有效；
+ *  - 松开若没超过阈值 → 点击语义：已删词恢复、未删词定位播放头；
+ *  - 拖动过程 `preventDefault`，避免触发浏览器原生文字选择。
  */
 const DRAG_THRESHOLD_PX = 4
 
-const drag = ref({ active: false, moved: false, position: 0, item: null })
+const drag = ref({ active: false, moved: false, position: 0, index: -1 })
 
 /** 刚拖拽结束时置位：用来吞掉紧随其后的段落 click（否则会清空选区）。 */
 let suppressParagraphClick = false
@@ -191,23 +241,27 @@ function onSelectStart(event) {
   if (drag.value.active) event.preventDefault()
 }
 
-function beginDrag(item, event) {
-  if (props.disabled || item.pending) return
-  if (event.button !== 0) return
+/** 按下：解析锚点、落光标、进入"待定"状态（还没算拖拽）。 */
+function beginDragAt(event) {
+  if (props.disabled || event.button !== 0) return
+  const hit = resolvePoint(event.clientX, event.clientY)
+  if (!hit) return
+  const token = props.tokens[hit.index]
+  if (!token || pendingSet.value.has(token.id)) return
+
   event.preventDefault()
-  const position = positionFromPointer(item, event)
   drag.value = {
     active: true,
     moved: false,
-    position,
-    item,
+    position: hit.position,
+    index: hit.index,
     startX: event.clientX,
     startY: event.clientY,
   }
-  emitCursor(position, { shiftKey: event.shiftKey })
+  emitCursor(hit.position, { shiftKey: event.shiftKey })
 }
 
-/** 拖动中：超过阈值后才生效，命中的 Token 变化就把光标移过去（保持锚点 → 形成选区）。 */
+/** 拖动中：超过阈值后才生效，坐标变化就把光标移过去（保持锚点 → 形成选区）。 */
 function onDocumentMouseMove(event) {
   const state = drag.value
   if (!state.active) return
@@ -215,20 +269,15 @@ function onDocumentMouseMove(event) {
   const dy = event.clientY - (state.startY ?? event.clientY)
   if (!state.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return
 
-  const target = document.elementFromPoint?.(event.clientX, event.clientY)
-  const tokenEl = target?.closest?.('[data-token-index]')
-  if (!tokenEl) {
-    // 拖到词与词之间的空白：保持当前选区，等继续移动或松开
+  const hit = resolvePoint(event.clientX, event.clientY)
+  if (!hit) {
+    // 拖到文本区外（波形/面板）：保持现有选区，等继续移动或松开
     if (!state.moved) drag.value = { ...state, moved: true }
     return
   }
-  const index = Number(tokenEl.dataset.tokenIndex)
-  if (!Number.isFinite(index)) return
-  const rect = tokenEl.getBoundingClientRect()
-  const position = index + (event.clientX - rect.left > rect.width / 2 ? 1 : 0)
-  if (position === state.position && state.moved) return
-  drag.value = { ...state, position, moved: true }
-  emitCursor(position, { shiftKey: true })
+  if (hit.position === state.position && state.moved) return
+  drag.value = { ...state, position: hit.position, moved: true }
+  emitCursor(hit.position, { shiftKey: true })
 }
 
 /** 松开：没拖动就是点击语义；拖过就保留选区，不触发恢复/定位。 */
@@ -237,17 +286,18 @@ function finishDrag(clicked) {
   if (!state.active) return
   drag.value = { ...state, active: false }
 
-  if (state.moved) {
-    // 拖拽结束：标记一下，吞掉紧随其后的段落 click
-    suppressParagraphClick = true
-    setTimeout(() => {
-      suppressParagraphClick = false
-    }, 0)
-    return
-  }
-  if (!clicked || !state.item) return
-  if (state.item.deleted) emit('restore', [state.item.id])
-  else emit('seek', state.item.start)
+  // 无论拖动还是点击，都吞掉紧随其后的段落 click：
+  // 否则"点在段落空白处"会把刚解析好的光标/选区又改成段尾。
+  suppressParagraphClick = true
+  setTimeout(() => {
+    suppressParagraphClick = false
+  }, 0)
+
+  if (state.moved || !clicked) return
+  const token = props.tokens[state.index]
+  if (!token) return
+  if (token.deleted) emit('restore', [token.id])
+  else emit('seek', Number(token.start ?? 0))
 }
 
 function onDocumentMouseUp() {
@@ -332,6 +382,7 @@ onBeforeUnmount(() => {
           v-for="para in paragraphs"
           :key="para.key"
           class="segment"
+          @mousedown="beginDragAt($event)"
           @click="onParagraphClick(para, $event)"
         >
           <template v-for="item in para.items" :key="item.id">
@@ -345,7 +396,6 @@ onBeforeUnmount(() => {
               tabindex="-1"
               :data-token-index="item.index"
               :title="`${item.id} · ${item.start.toFixed(2)}s–${item.end.toFixed(2)}s · 置信度 ${item.confidence.toFixed(2)}`"
-              @mousedown.stop="beginDrag(item, $event)"
               >{{ item.glyph }}</span
             >
           </template>

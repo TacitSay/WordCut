@@ -144,6 +144,40 @@ export function listProjects() {
 }
 
 /**
+ * GET /api/projects/{pid} -> 项目详情（足以恢复界面）
+ *
+ * @param {string} projectId
+ */
+export function fetchProject(projectId) {
+  return request(projectPath(projectId, ''))
+}
+
+/**
+ * PATCH /api/projects/{pid} -> ProjectSummary
+ *
+ * @param {string} projectId
+ * @param {string} name 新项目名
+ */
+export function renameProject(projectId, name) {
+  return request(projectPath(projectId, ''), {
+    method: 'PATCH',
+    body: { name },
+  })
+}
+
+/**
+ * DELETE /api/projects/{pid} -> { project_id, removed_files }
+ *
+ * @param {string} projectId
+ * @param {{ purgeFiles?: boolean }} [options] purgeFiles=true 时连带清理
+ *        uploads/{pid}.* 与 outputs/{pid}/（源素材永不改动）
+ */
+export function deleteProject(projectId, { purgeFiles = false } = {}) {
+  const query = purgeFiles ? '?purge_files=true' : ''
+  return request(projectPath(projectId, query), { method: 'DELETE' })
+}
+
+/**
  * POST /api/projects （multipart：file + name）
  * @param {{ file: File, name: string }} payload
  * @returns {Promise<{id: string, name: string, sample_rate: number, duration: number}>}
@@ -378,6 +412,9 @@ export default {
   ApiError,
   health,
   listProjects,
+  fetchProject,
+  renameProject,
+  deleteProject,
   createProject,
   transcribeProject,
   fetchTokens,
