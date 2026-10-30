@@ -199,6 +199,25 @@ export function transcribeProject(projectId) {
 }
 
 /**
+ * POST /api/projects/{pid}/transcribe/start -> TranscribeJobResponse
+ *
+ * 启动后台转写并立刻返回任务 id（长音频必须异步，否则请求会挂几十分钟）。
+ * @param {string} projectId
+ */
+export function startTranscription(projectId) {
+  return request(projectPath(projectId, '/transcribe/start'), { method: 'POST' })
+}
+
+/**
+ * GET /api/projects/{pid}/transcribe/status -> TranscribeJobResponse
+ *
+ * @param {string} projectId
+ */
+export function fetchTranscriptionStatus(projectId) {
+  return request(projectPath(projectId, '/transcribe/status'))
+}
+
+/**
  * GET /api/projects/{pid}/tokens -> TokenListResponse
  * @param {string} projectId
  */
@@ -419,6 +438,8 @@ export default {
   deleteProject,
   createProject,
   transcribeProject,
+  startTranscription,
+  fetchTranscriptionStatus,
   fetchTokens,
   deleteTokens,
   restoreTokens,

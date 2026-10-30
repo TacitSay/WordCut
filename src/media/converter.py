@@ -22,7 +22,7 @@ from typing import List, Optional
 
 from .ffmpeg_bin import TOOL_TIMEOUT_SECONDS, MediaToolError, resolve_ffmpeg
 
-__all__ = ["convert_to_wav16k", "DEFAULT_SAMPLE_RATE"]
+__all__ = ["convert_to_wav16k", "convert_to_compact_preview", "DEFAULT_SAMPLE_RATE"]
 
 #: 全项目统一采样率（Hz，单声道），与 ``api.SAMPLE_RATE`` 口径一致。
 DEFAULT_SAMPLE_RATE: int = 16_000
@@ -121,5 +121,71 @@ def convert_to_wav16k(
     if completed.returncode != 0:
         raise MediaToolError(
             f"ffmpeg 转码失败（退出码 {completed.returncode}）：{source} -> {target}\n"
+            f"{_tail(_decode(completed.stderr))}"
+        )
+
+
+def convert_to_compact_preview(
+    src: Path, dst: Path, sample_rate: int = 8000, bitrate: str = "24k"
+) -> None:
+    """把源媒体转成"轻量波形预览"（低采样率单声道 MP3）。
+
+    长素材（例如 2 小时访谈）如果把完整 WAV 交给浏览器画波形，前端要先下载
+    两百多 MB、再整体解码成 float32（内存翻倍），很容易把标签页拖死。
+    预览只需要"时间轴 + 大致包络"，因此压成 8kHz/24kbps 单声道 MP3：
+    2 小时约 20MB，解码内存也降到 1/4，波形与播放都还能用。
+
+    参数:
+        src: 输入媒体（只读）。
+        dst: 输出 MP3 路径。
+        sample_rate: 预览采样率（Hz），默认 8000。
+        bitrate: 目标码率，默认 ``24k``。
+
+    异常:
+        MediaToolError: ffmpeg 不可用、输入不存在或转码失败。
+        ValueError: ``sample_rate`` 非正整数。
+    """
+    ffmpeg = resolve_ffmpeg()
+    source = Path(src)
+    target = Path(dst)
+    if not source.is_file():
+        raise MediaToolError(f"待转换的媒体文件不存在：{source}")
+    if sample_rate <= 0:
+        raise ValueError(f"sample_rate 必须是正整数，实际为 {sample_rate!r}")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    argv: List[str] = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(source),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(sample_rate),
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        bitrate,
+        str(target),
+    ]
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, timeout=TOOL_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise MediaToolError(
+            f"ffmpeg 生成预览超时（>{TOOL_TIMEOUT_SECONDS} 秒）：{source}"
+        ) from exc
+    except OSError as exc:
+        raise MediaToolError(f"无法启动 ffmpeg（{ffmpeg}）：{exc}") from exc
+
+    if completed.returncode != 0:
+        raise MediaToolError(
+            f"ffmpeg 生成预览失败（退出码 {completed.returncode}）：{source}\n"
             f"{_tail(_decode(completed.stderr))}"
         )

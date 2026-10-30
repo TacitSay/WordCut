@@ -54,7 +54,8 @@ import {
   saveAudioParams,
   sourceAudioUrl,
   saveProject,
-  transcribeProject,
+  startTranscription,
+  fetchTranscriptionStatus,
 } from './api/client.js'
 
 /** 播放头前进/后退步长（秒）。 */
@@ -1066,7 +1067,9 @@ async function handleTranscribe() {
   transcribing.value = true
   setStatus('正在转写（首次加载模型可能需要十几秒）…', 'busy')
   try {
-    const result = await transcribeProject(project.value.id)
+    const result = await runTranscriptionJob(project.value.id)
+    if (!result) return
+
     const list = await fetchTokens(project.value.id)
     tokens.value = Array.isArray(list?.tokens) ? [...list.tokens] : []
     segments.value = Array.isArray(list?.segments) ? [...list.segments] : []
@@ -1080,7 +1083,7 @@ async function handleTranscribe() {
     setStatus(
       `转写完成：${tokens.value.length} 个词级单元 / ${segments.value.length} 个段落，耗时 ${Number(
         result?.elapsed_seconds ?? 0,
-      ).toFixed(1)} 秒`,
+      ).toFixed(1)} 秒（${result?.device || 'cpu'}/${result?.compute_type || 'int8'}）`,
       'success',
     )
   } catch (error) {
@@ -1088,6 +1091,49 @@ async function handleTranscribe() {
   } finally {
     transcribing.value = false
   }
+}
+
+/**
+ * 跑一次异步转写并轮询进度，成功返回最终状态，失败返回 null。
+ *
+ * 长音频（2 小时）在 CPU 上要几十分钟，同步请求会一直挂着；
+ * 改成"启动任务 + 轮询状态"后，界面能显示百分比，网络抖动也不丢进度
+ * （结果落在后端数据库里）。
+ *
+ * @param {string} projectId
+ */
+async function runTranscriptionJob(projectId) {
+  const started = await startTranscription(projectId)
+  let job = started
+  let lastPaint = 0
+
+  while (job && job.status === 'running') {
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    try {
+      job = await fetchTranscriptionStatus(projectId)
+    } catch (error) {
+      // 轮询偶发失败不终止：只要后端还在跑，下一次就能拿到
+      if (error?.status === 404) throw error
+      continue
+    }
+
+    const now = Date.now()
+    if (now - lastPaint > 900) {
+      lastPaint = now
+      const pct = Math.round(Number(job.progress || 0) * 100)
+      setStatus(
+        `转写中 ${pct}% · 已出 ${job.words} 词 · ${Number(job.elapsed_seconds).toFixed(0)}s` +
+          `（${job.device || 'cpu'}/${job.compute_type || 'int8'}）`,
+        'busy',
+      )
+    }
+  }
+
+  if (job?.status === 'error') {
+    setStatus(`转写失败：${job.error || '未知错误'}`, 'error')
+    return null
+  }
+  return job
 }
 
 /** Ctrl+S：保存工程文件（.wcproj）。 */

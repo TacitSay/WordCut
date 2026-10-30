@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from .converter import convert_to_wav16k
+from .converter import convert_to_compact_preview, convert_to_wav16k
 from .denoiser import denoise_array
 from .ffmpeg_bin import (
     MediaToolError,
@@ -30,6 +30,7 @@ __all__ = [
     "MediaInfo",
     "MediaStream",
     "convert_to_wav16k",
+    "convert_to_compact_preview",
     "denoise_array",
     "separate_vocals",
     "cut_video",

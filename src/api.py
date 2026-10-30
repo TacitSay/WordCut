@@ -22,7 +22,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -30,7 +32,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -71,6 +73,12 @@ __all__ = [
 # ----------------------------------------------------------------------
 #: 统一转码后的采样率（Hz，单声道）。全项目口径一致，避免重采样混用。
 SAMPLE_RATE: int = 16_000
+
+#: 上传落盘的分块大小（8MB）：2 小时视频不再一次性读进内存。
+_UPLOAD_CHUNK_BYTES: int = 8 * 1024 * 1024
+
+#: 超过该时长（秒）的素材，波形改用低码率 MP3 预览（避免浏览器解码巨型 WAV）。
+_COMPACT_PREVIEW_MIN_SECONDS: float = 1800.0
 
 #: 项目根目录（``src`` 的上一级）。
 BASE_DIR: Path = _SRC_DIR.parent
@@ -127,6 +135,18 @@ _PROJECTS_LOCK: threading.Lock = threading.Lock()
 #: faster-whisper 模型单例（惰性加载）及其锁。
 _whisper_model: Optional[Any] = None
 _whisper_lock: threading.Lock = threading.Lock()
+
+#: 实际生效的转写后端信息（``{"device": "cuda", "compute_type": "float16"}``）。
+_whisper_runtime: Dict[str, Any] = {
+    "device": "",
+    "compute_type": "",
+    "fallback_reason": "",
+}
+
+#: 设备策略环境变量：``auto``（默认）/ ``cuda`` / ``cpu``。
+_WHISPER_DEVICE_ENV: str = "WORDCUT_WHISPER_DEVICE"
+#: 计算精度环境变量：不设时按设备取默认（cuda→float16，cpu→int8）。
+_WHISPER_COMPUTE_ENV: str = "WORDCUT_WHISPER_COMPUTE"
 
 
 # ----------------------------------------------------------------------
@@ -347,6 +367,16 @@ class HealthResponse(BaseModel):
     version: str = Field(..., description="API 版本")
     project_count: int = Field(..., description="当前内存中的项目数")
     sample_rate: int = Field(..., description="统一采样率（Hz）")
+    whisper_device: str = Field(
+        "", description="转写设备（cuda / cpu）；模型尚未加载时为空"
+    )
+    whisper_compute_type: str = Field(
+        "", description="转写计算精度（float16 / int8 等）；未加载时为空"
+    )
+    whisper_note: str = Field(
+        "", description="转写后端说明（例如 CUDA 不可用的原因）"
+    )
+    cuda_devices: int = Field(0, description="可用的 CUDA 设备数（0 表示无 GPU）")
 
 
 # ----------------------------------------------------------------------
@@ -581,12 +611,127 @@ def _resolve_model_path() -> Path:
     )
 
 
+def _cuda_device_count() -> int:
+    """探测可用的 CUDA 设备数；探测失败（无 GPU / 缺 ctranslate2）返回 0。"""
+    try:
+        import ctranslate2
+
+        return int(ctranslate2.get_cuda_device_count())
+    except Exception:  # noqa: BLE001 - 探测失败一律当作"没有 GPU"
+        return 0
+
+
+#: CUDA 可用性探测结果缓存：``None`` 表示还没探测过。
+_cuda_usable: Optional[bool] = None
+#: 探测失败原因（用于健康检查与错误提示）。
+_cuda_probe_reason: str = ""
+
+#: 探测子进程的源码：只做"加载模型 + 转写 0.5 秒静音"。
+#: 关键点是**必须放在子进程里**：cuDNN 版本不匹配时 ctranslate2 是硬崩溃
+#: （0xC0000005 / DLL 加载失败），在同一进程里 try/except 根本抓不住，
+#: 会把整个后端带走。
+_CUDA_PROBE_CODE: str = r"""
+import sys
+import numpy as np
+from faster_whisper import WhisperModel
+model = WhisperModel(sys.argv[1], device="cuda", compute_type="float16")
+audio = np.zeros(8000, dtype=np.float32)
+list(model.transcribe(audio, language="zh", word_timestamps=True, beam_size=1)[0])
+print("CUDA_OK")
+"""
+
+
+def _probe_cuda_usable(model_path: Path) -> bool:
+    """在独立子进程里验证 CUDA 是否真的可用（结果缓存）。
+
+    为什么值得多花几秒：GPU 能把 2 小时素材的转写从"几十分钟"压到"几分钟"，
+    但 cuDNN/cuBLAS 缺失时 ctranslate2 会直接崩进程。子进程探测既能拿到结论，
+    又保证崩溃不影响正在运行的后端。
+
+    参数:
+        model_path: faster-whisper 模型目录。
+
+    返回:
+        ``True`` 表示 CUDA 可正常推理。
+    """
+    global _cuda_usable, _cuda_probe_reason
+    if _cuda_usable is not None:
+        return _cuda_usable
+
+    if _cuda_device_count() <= 0:
+        _cuda_usable = False
+        _cuda_probe_reason = "未检测到 CUDA 设备"
+        return False
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", _CUDA_PROBE_CODE, str(model_path)],
+            capture_output=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        _cuda_usable = False
+        _cuda_probe_reason = "CUDA 探测超时（300s）"
+        return False
+    except OSError as exc:
+        _cuda_usable = False
+        _cuda_probe_reason = f"无法启动探测子进程：{exc}"
+        return False
+
+    if completed.returncode == 0 and b"CUDA_OK" in (completed.stdout or b""):
+        _cuda_usable = True
+        _cuda_probe_reason = ""
+        return True
+
+    stderr = (completed.stderr or b"").decode("utf-8", errors="replace")
+    tail = stderr.strip().splitlines()[-1] if stderr.strip() else ""
+    _cuda_usable = False
+    _cuda_probe_reason = (
+        f"CUDA 不可用（退出码 {completed.returncode}）：{tail or '子进程异常退出'}"
+    )
+    return False
+
+
+def _resolve_whisper_device() -> Tuple[str, str]:
+    """决定转写用的 ``(device, compute_type)``。
+
+    策略（环境变量可覆盖，便于论文里做 CPU/GPU 对照实验）：
+
+    * ``WORDCUT_WHISPER_DEVICE=auto``（默认）：先用子进程探测 CUDA，可用才用
+      ``cuda``，否则 ``cpu``；
+    * ``WORDCUT_WHISPER_DEVICE=cuda|cpu``：强制指定（``cuda`` 仍会先探测，
+      探测不过就回退 CPU，避免服务被硬崩溃带走）；
+    * ``WORDCUT_WHISPER_COMPUTE``：计算精度，默认 ``cuda→float16`` / ``cpu→int8``。
+
+    返回:
+        ``(device, compute_type)``。
+    """
+    requested = (os.environ.get(_WHISPER_DEVICE_ENV) or "auto").strip().lower()
+    compute = (os.environ.get(_WHISPER_COMPUTE_ENV) or "").strip()
+
+    if requested == "cpu":
+        device = "cpu"
+    else:
+        model_path = _resolve_model_path()
+        device = "cuda" if _probe_cuda_usable(model_path) else "cpu"
+
+    if not compute:
+        compute = "float16" if device == "cuda" else "int8"
+    return device, compute
+
+
 def _get_whisper_model() -> Any:
-    """惰性加载并复用 faster-whisper 模型（进程级单例，线程安全）。"""
+    """惰性加载并复用 faster-whisper 模型（进程级单例，线程安全）。
+
+    默认优先用 GPU（fp16）：2 小时素材在 CPU 上要跑几十分钟，GPU 是可用性的前提。
+    GPU 初始化失败时自动回退 CPU/int8 并把原因记进 :data:`_whisper_runtime`，
+    避免"有显卡但驱动/cuDNN 不匹配"直接让转写不可用。
+    """
     global _whisper_model
     with _whisper_lock:
         if _whisper_model is not None:
             return _whisper_model
+
         model_path = _resolve_model_path()
         try:
             from faster_whisper import WhisperModel
@@ -595,15 +740,42 @@ def _get_whisper_model() -> Any:
                 status_code=503,
                 detail=f"未安装 faster-whisper，无法转写：{exc}",
             ) from exc
+
+        device, compute_type = _resolve_whisper_device()
+        fallback_reason = ""
         try:
             _whisper_model = WhisperModel(
-                str(model_path), device="cpu", compute_type="int8"
+                str(model_path), device=device, compute_type=compute_type
             )
         except Exception as exc:  # noqa: BLE001 - 底层可能抛任意异常
-            raise HTTPException(
-                status_code=500,
-                detail=f"加载 faster-whisper 模型失败：{model_path}（{exc}）",
-            ) from exc
+            if device != "cuda":
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"加载 faster-whisper 模型失败：{model_path}（{exc}）",
+                ) from exc
+            # GPU 起不来（缺 cuBLAS/cuDNN、显存不足等）：回退 CPU，保证还能用
+            fallback_reason = str(exc)
+            try:
+                _whisper_model = WhisperModel(
+                    str(model_path), device="cpu", compute_type="int8"
+                )
+            except Exception as cpu_exc:  # noqa: BLE001
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"加载 faster-whisper 模型失败：GPU 与 CPU 均不可用"
+                        f"（GPU: {exc}；CPU: {cpu_exc}）"
+                    ),
+                ) from cpu_exc
+            device, compute_type = "cpu", "int8"
+
+        _whisper_runtime.update(
+            {
+                "device": device,
+                "compute_type": compute_type,
+                "fallback_reason": fallback_reason,
+            }
+        )
         return _whisper_model
 
 
@@ -671,7 +843,7 @@ def _resample(
 
 
 def _keep_source_media(
-    raw: bytes, suffix: str, project_id: str, media_info: Dict[str, Any]
+    source_file: Path, suffix: str, project_id: str, media_info: Dict[str, Any]
 ) -> Optional[Path]:
     """保留原始上传文件（仅视频），供导出时剪视频使用。
 
@@ -679,10 +851,10 @@ def _keep_source_media(
     视频必须保留原文件：按 EDL 剪视频需要原始码流（重编码会损失画质与速度）。
 
     参数:
-        raw: 上传文件的原始字节。
+        source_file: 已落盘的原始上传文件（只读，本函数用 ``copy`` 复制）。
         suffix: 原扩展名（含点）。
         project_id: 项目 id，用于命名。
-        media_info: :func:`_detect_media_kind` 的结果。
+        media_info: :func:`_ingest_media` 的结果。
 
     返回:
         保留的源文件路径；非视频或保存失败时返回 None（不影响上传成功）。
@@ -693,83 +865,68 @@ def _keep_source_media(
     target = UPLOAD_DIR / f"{project_id}.source{suffix}"
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(raw)
+        shutil.copyfile(source_file, target)
         return target
     except OSError:
         return None
 
 
-def _ingest_media(raw: bytes, suffix: str, destination: Path) -> Dict[str, Any]:
-    """把上传的原始字节落成 16kHz 单声道 WAV，返回时长（秒）。
+def _ingest_media(source_file: Path, destination: Path) -> Dict[str, Any]:
+    """把已落盘的上传文件转成 16kHz 单声道 WAV，返回媒体信息。
 
     走 ffprobe 探测 + ffmpeg 转码，支持任意音视频容器（视频自动丢弃画面）。
-    先写临时文件（保留原扩展名，便于 ffmpeg 识别容器），转换成功后删除。
 
     参数:
-        raw: 上传文件的原始字节。
-        suffix: 原文件扩展名（含点，如 .mp4）；未知时用 .bin。
+        source_file: 已落盘的上传文件（只读，不会被修改）。
         destination: 目标 WAV 路径（父目录自动创建）。
 
     返回:
-        目标音频时长（秒），由 ffprobe 对输出文件探测得出。
+        ``{duration, kind, has_audio, format_name}``，``duration`` 单位秒。
 
     异常:
         400: 文件不是有效媒体，或不含音频流。
         500: ffmpeg/ffprobe 不可用或转码失败。
     """
-    temp_path: Optional[Path] = None
+    # 1. 探测：确认是有效媒体且含音频流
     try:
-        with tempfile.NamedTemporaryFile(
-            suffix=suffix, delete=False, dir=str(UPLOAD_DIR)
-        ) as handle:
-            handle.write(raw)
-            temp_path = Path(handle.name)
+        info = media.probe(source_file)
+    except media.MediaToolError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无法识别的媒体文件（需要 ffmpeg 可解码的音频或视频）：{exc}",
+        ) from exc
 
-        # 1. 探测：确认是有效媒体且含音频流
-        try:
-            info = media.probe(temp_path)
-        except media.MediaToolError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=f"无法识别的媒体文件（需要 ffmpeg 可解码的音频或视频）：{exc}",
-            ) from exc
+    if not any(stream.type == "audio" for stream in info.streams):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "上传的文件中没有音频流"
+                f"（探测到：{[s.type for s in info.streams] or '无任何流'}）"
+            ),
+        )
 
-        if not any(stream.type == "audio" for stream in info.streams):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "上传的文件中没有音频流"
-                    f"（探测到：{[s.type for s in info.streams] or '无任何流'}）"
-                ),
-            )
+    # 2. 转码：任意音视频 -> 16kHz 单声道 PCM16 WAV
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        media.convert_to_wav16k(source_file, destination, SAMPLE_RATE)
+    except media.MediaToolError as exc:
+        raise HTTPException(status_code=500, detail=f"音频转码失败：{exc}") from exc
 
-        # 2. 转码：任意音视频 -> 16kHz 单声道 PCM16 WAV
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            media.convert_to_wav16k(temp_path, destination, SAMPLE_RATE)
-        except media.MediaToolError as exc:
-            raise HTTPException(
-                status_code=500, detail=f"音频转码失败：{exc}"
-            ) from exc
+    # 3. 以输出文件为准取时长（转码后可能因重采样有毫秒级差异）
+    try:
+        out_info = media.probe(destination)
+    except media.MediaToolError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"转码后探测输出失败：{exc}"
+        ) from exc
 
-        # 3. 以输出文件为准取时长（转码后可能因重采样有毫秒级差异）
-        try:
-            out_info = media.probe(destination)
-        except media.MediaToolError as exc:
-            raise HTTPException(
-                status_code=500, detail=f"转码后探测输出失败：{exc}"
-            ) from exc
-
-        has_video = any(stream.type == "video" for stream in info.streams)
-        return {
-            "duration": float(out_info.duration),
-            "kind": "video" if has_video else "audio",
-            "has_audio": True,
-            "format_name": info.format_name,
-        }
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
+    has_video = any(stream.type == "video" for stream in info.streams)
+    return {
+        "duration": float(out_info.duration),
+        "kind": "video" if has_video else "audio",
+        "has_audio": True,
+        "format_name": info.format_name,
+    }
 
 
 def _write_wav(destination: Path, samples: np.ndarray) -> None:
@@ -874,13 +1031,17 @@ def _srt_to_plain(srt_text: str) -> str:
 # ----------------------------------------------------------------------
 @app.get("/api/health", response_model=HealthResponse, summary="健康检查")
 def health() -> HealthResponse:
-    """返回服务存活状态与内存中的项目数量。"""
+    """返回服务存活状态、项目数量与转写后端信息。"""
     count = len(_store.list_all())
     return HealthResponse(
         status="ok",
         version=app.version,
         project_count=count,
         sample_rate=SAMPLE_RATE,
+        whisper_device=str(_whisper_runtime.get("device") or ""),
+        whisper_compute_type=str(_whisper_runtime.get("compute_type") or ""),
+        whisper_note=str(_cuda_probe_reason or _whisper_runtime.get("fallback_reason") or ""),
+        cuda_devices=_cuda_device_count(),
     )
 
 
@@ -1128,19 +1289,36 @@ async def create_project(
     if not project_name:
         raise HTTPException(status_code=400, detail="项目名 name 不能为空")
 
-    raw = await file.read()
-    await file.close()
-    if not raw:
-        raise HTTPException(status_code=400, detail="上传的文件为空")
-
     suffix = Path(file.filename or "").suffix.lower() or ".bin"
     project_id = uuid.uuid4().hex[:12]
     audio_path = UPLOAD_DIR / f"{project_id}.wav"
-    media_info = _ingest_media(raw, suffix, audio_path)
-    duration = float(media_info["duration"])
 
-    # 若上传的是视频，额外保留一份原始文件，供导出时剪视频使用（只读，不变量 1）
-    source_path = _keep_source_media(raw, suffix, project_id, media_info)
+    # 分块落盘：2 小时视频动辄几个 GB，一次性 read() 进内存会直接 OOM。
+    # 边读边写临时文件，内存占用恒定在一个块（8MB）以内。
+    upload_temp: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=suffix, delete=False, dir=str(UPLOAD_DIR)
+        ) as handle:
+            upload_temp = Path(handle.name)
+            while True:
+                chunk = await file.read(_UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                handle.write(chunk)
+        await file.close()
+
+        if upload_temp.stat().st_size == 0:
+            raise HTTPException(status_code=400, detail="上传的文件为空")
+
+        media_info = _ingest_media(upload_temp, audio_path)
+        duration = float(media_info["duration"])
+
+        # 若上传的是视频，额外保留一份原始文件，供导出时剪视频使用（只读，不变量 1）
+        source_path = _keep_source_media(upload_temp, suffix, project_id, media_info)
+    finally:
+        if upload_temp is not None:
+            upload_temp.unlink(missing_ok=True)
 
     project: Dict[str, Any] = {
         "id": project_id,
@@ -1192,50 +1370,10 @@ def transcribe_project(pid: str) -> TranscribeResponse:
     project = _get_project(pid)
     model = _get_whisper_model()
     model_path = _resolve_model_path()
-    audio_path = Path(project["audio_path"])
-    if not audio_path.is_file():
-        raise HTTPException(
-            status_code=500, detail=f"源音频不存在：{audio_path}（请重新上传）"
-        )
 
     started = time.perf_counter()
-    words: List[Dict[str, Any]] = []
     try:
-        segments, info = model.transcribe(
-            str(audio_path),
-            language="zh",
-            word_timestamps=True,
-            vad_filter=False,
-            beam_size=5,
-        )
-        audio_duration = float(getattr(info, "duration", 0.0) or 0.0)
-        for segment in segments:
-            seg_id = int(getattr(segment, "id", 0) or 0)
-            for word in getattr(segment, "words", None) or []:
-                start = float(getattr(word, "start", 0.0) or 0.0)
-                end = float(getattr(word, "end", 0.0) or 0.0)
-                if start < 0.0:
-                    start = 0.0
-                if not end > start:
-                    end = start + _MIN_WORD_DURATION
-                if audio_duration > 0.0 and start >= audio_duration:
-                    continue
-                probability = getattr(word, "probability", None)
-                try:
-                    prob = float(probability) if probability is not None else 1.0
-                except (TypeError, ValueError):
-                    prob = 1.0
-                prob = min(max(prob, 0.0), 1.0)
-                words.append(
-                    {
-                        "seg": seg_id,
-                        "start": start,
-                        "end": end,
-                        "dur": end - start,
-                        "word": str(getattr(word, "word", "") or ""),
-                        "prob": prob,
-                    }
-                )
+        words, audio_duration = _run_transcription(project, model)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 - 底层可能抛任意异常
@@ -1244,19 +1382,7 @@ def transcribe_project(pid: str) -> TranscribeResponse:
         ) from exc
     elapsed = float(time.perf_counter() - started)
 
-    words.sort(key=lambda item: (item["start"], item["end"]))
-    if not words:
-        raise HTTPException(
-            status_code=422,
-            detail="转写结果为空：音频中未识别到任何词，请检查音频内容与音量",
-        )
-
-    # 不变量 4：id 由词序决定，不重排；旧删除引用只保留仍存在的 id。
-    known_ids = {f"{pipeline.TOKEN_ID_PREFIX}{index:05d}" for index in range(len(words))}
-    project["words"] = words
-    project["deleted_ids"] &= known_ids
-    _store.update_words(pid, words)
-    _store.update_deleted_ids(pid, project["deleted_ids"])
+    _apply_transcription(pid, project, words)
 
     return TranscribeResponse(
         project_id=pid,
@@ -1265,6 +1391,283 @@ def transcribe_project(pid: str) -> TranscribeResponse:
         elapsed_seconds=elapsed,
         model=str(model_path),
     )
+
+
+def _run_transcription(
+    project: Dict[str, Any],
+    model: Any,
+    on_progress: Optional[Any] = None,
+) -> Tuple[List[Dict[str, Any]], float]:
+    """跑一次词级转写，返回 ``(words, audio_duration)``。
+
+    长音频（2 小时）在 CPU 上要跑几十分钟，因此这里按段回调进度：
+    ``on_progress(fraction, words_so_far)`` 由异步任务用来更新状态。
+
+    参数:
+        project: 项目字典（需要 ``audio_path``）。
+        model: 已加载的 faster-whisper 模型。
+        on_progress: 可选回调，签名 ``(fraction: float, word_count: int) -> None``。
+
+    返回:
+        ``(words, audio_duration)``；``words`` 已按时间排序。
+
+    异常:
+        HTTPException: 源音频缺失（500）或转写结果为空（422）。
+        Exception: 底层转写异常，由调用方转换。
+    """
+    audio_path = Path(project["audio_path"])
+    if not audio_path.is_file():
+        raise HTTPException(
+            status_code=500, detail=f"源音频不存在：{audio_path}（请重新上传）"
+        )
+
+    words: List[Dict[str, Any]] = []
+    segments, info = model.transcribe(
+        str(audio_path),
+        language="zh",
+        word_timestamps=True,
+        vad_filter=False,
+        beam_size=5,
+    )
+    audio_duration = float(getattr(info, "duration", 0.0) or 0.0)
+
+    for segment in segments:
+        seg_id = int(getattr(segment, "id", 0) or 0)
+        for word in getattr(segment, "words", None) or []:
+            start = float(getattr(word, "start", 0.0) or 0.0)
+            end = float(getattr(word, "end", 0.0) or 0.0)
+            if start < 0.0:
+                start = 0.0
+            if not end > start:
+                end = start + _MIN_WORD_DURATION
+            if audio_duration > 0.0 and start >= audio_duration:
+                continue
+            probability = getattr(word, "probability", None)
+            try:
+                prob = float(probability) if probability is not None else 1.0
+            except (TypeError, ValueError):
+                prob = 1.0
+            prob = min(max(prob, 0.0), 1.0)
+            words.append(
+                {
+                    "seg": seg_id,
+                    "start": start,
+                    "end": end,
+                    "dur": end - start,
+                    "word": str(getattr(word, "word", "") or ""),
+                    "prob": prob,
+                }
+            )
+
+        if on_progress is not None and audio_duration > 0.0:
+            try:
+                fraction = min(1.0, float(getattr(segment, "end", 0.0) or 0.0) / audio_duration)
+                on_progress(fraction, len(words))
+            except Exception:  # noqa: BLE001 - 进度回调绝不影响转写
+                pass
+
+    words.sort(key=lambda item: (item["start"], item["end"]))
+    if not words:
+        raise HTTPException(
+            status_code=422,
+            detail="转写结果为空：音频中未识别到任何词，请检查音频内容与音量",
+        )
+    return words, audio_duration
+
+
+def _apply_transcription(
+    pid: str, project: Dict[str, Any], words: List[Dict[str, Any]]
+) -> None:
+    """把转写结果写回项目（不变量 4：id 由词序决定，旧删除引用只保留仍存在的）。"""
+    known_ids = {
+        f"{pipeline.TOKEN_ID_PREFIX}{index:05d}" for index in range(len(words))
+    }
+    project["words"] = words
+    project["deleted_ids"] &= known_ids
+    _store.update_words(pid, words)
+    _store.update_deleted_ids(pid, project["deleted_ids"])
+
+
+# ----------------------------------------------------------------------
+# 接口：异步转写（长音频必需：2 小时素材在 CPU 上要几十分钟）
+# ----------------------------------------------------------------------
+class TranscribeJobResponse(BaseModel):
+    """异步转写任务的状态。"""
+
+    job_id: str = Field(..., description="任务 id")
+    project_id: str = Field(..., description="项目 id")
+    status: str = Field(..., description="running / done / error")
+    progress: float = Field(0.0, description="进度 0–1（按已转写时长估算）")
+    words: int = Field(0, description="已产出的词数")
+    elapsed_seconds: float = Field(0.0, description="已运行秒数")
+    duration: float = Field(0.0, description="音频总时长（秒）")
+    device: str = Field("", description="实际使用的设备（cuda / cpu）")
+    compute_type: str = Field("", description="计算精度")
+    error: str = Field("", description="失败原因（status=error 时有值）")
+
+
+#: 进行中的转写任务：job_id -> 状态字典。
+_transcribe_jobs: Dict[str, Dict[str, Any]] = {}
+#: 项目最近一次转写任务：pid -> job_id（供前端"恢复轮询"）。
+_transcribe_latest: Dict[str, str] = {}
+_TRANSCRIBE_JOBS_LOCK: threading.Lock = threading.Lock()
+
+#: 转写执行锁：faster-whisper 的模型实例不保证可并发推理，
+#: 两个项目同时转写会互相拖慢甚至显存/内存翻倍，这里串行化。
+_TRANSCRIBE_EXEC_LOCK: threading.Lock = threading.Lock()
+
+
+def _job_snapshot(job: Dict[str, Any]) -> Dict[str, Any]:
+    """取任务状态的浅拷贝（加锁由调用方负责）。"""
+    return {
+        "job_id": job["job_id"],
+        "project_id": job["project_id"],
+        "status": job["status"],
+        "progress": round(float(job["progress"]), 4),
+        "words": int(job["words"]),
+        "elapsed_seconds": round(float(job["elapsed_seconds"]), 2),
+        "duration": float(job["duration"]),
+        "device": str(job["device"]),
+        "compute_type": str(job["compute_type"]),
+        "error": str(job["error"]),
+    }
+
+
+def _run_transcribe_job(job_id: str, pid: str) -> None:
+    """后台线程主体：跑转写并持续更新任务状态。"""
+    started = time.perf_counter()
+
+    def on_progress(fraction: float, count: int) -> None:
+        with _TRANSCRIBE_JOBS_LOCK:
+            job = _transcribe_jobs.get(job_id)
+            if job is None:
+                return
+            job["progress"] = max(float(job["progress"]), fraction)
+            job["words"] = count
+            job["elapsed_seconds"] = time.perf_counter() - started
+
+    try:
+        project = _get_project(pid)
+        model = _get_whisper_model()
+        with _TRANSCRIBE_JOBS_LOCK:
+            job = _transcribe_jobs.get(job_id)
+            if job is not None:
+                job["device"] = str(_whisper_runtime.get("device") or "")
+                job["compute_type"] = str(_whisper_runtime.get("compute_type") or "")
+        with _TRANSCRIBE_EXEC_LOCK:
+            words, duration = _run_transcription(project, model, on_progress)
+        _apply_transcription(pid, project, words)
+        with _TRANSCRIBE_JOBS_LOCK:
+            job = _transcribe_jobs.get(job_id)
+            if job is not None:
+                job.update(
+                    status="done",
+                    progress=1.0,
+                    words=len(words),
+                    duration=duration,
+                    elapsed_seconds=time.perf_counter() - started,
+                )
+    except HTTPException as exc:
+        with _TRANSCRIBE_JOBS_LOCK:
+            job = _transcribe_jobs.get(job_id)
+            if job is not None:
+                job.update(
+                    status="error",
+                    error=str(exc.detail),
+                    elapsed_seconds=time.perf_counter() - started,
+                )
+    except Exception as exc:  # noqa: BLE001 - 后台线程不能把异常抛出去
+        with _TRANSCRIBE_JOBS_LOCK:
+            job = _transcribe_jobs.get(job_id)
+            if job is not None:
+                job.update(
+                    status="error",
+                    error=f"转写失败：{exc}",
+                    elapsed_seconds=time.perf_counter() - started,
+                )
+
+
+@app.post(
+    "/api/projects/{pid}/transcribe/start",
+    response_model=TranscribeJobResponse,
+    summary="启动异步转写（长音频）",
+)
+def start_transcription(pid: str) -> TranscribeJobResponse:
+    """启动后台转写并立刻返回任务 id，前端轮询状态接口取进度。
+
+    为什么需要异步：2 小时素材在 CPU 上要几十分钟，同步 HTTP 请求会一直挂着，
+    浏览器/代理稍一超时就前功尽弃；异步任务把结果写进数据库，断线也能恢复。
+
+    参数:
+        pid: 项目 id。
+
+    返回:
+        ``{job_id, project_id, status, progress, ...}``。
+
+    异常:
+        404: 项目不存在；409: 该项目已有转写任务在跑。
+    """
+    project = _get_project(pid)
+
+    with _TRANSCRIBE_JOBS_LOCK:
+        latest = _transcribe_latest.get(pid)
+        if latest:
+            running = _transcribe_jobs.get(latest)
+            if running is not None and running["status"] == "running":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"项目 {pid} 已有转写任务在进行（job {latest}）",
+                )
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "job_id": job_id,
+            "project_id": pid,
+            "status": "running",
+            "progress": 0.0,
+            "words": 0,
+            "elapsed_seconds": 0.0,
+            "duration": float(_duration_of(project)),
+            "device": str(_whisper_runtime.get("device") or ""),
+            "compute_type": str(_whisper_runtime.get("compute_type") or ""),
+            "error": "",
+        }
+        _transcribe_jobs[job_id] = job
+        _transcribe_latest[pid] = job_id
+        snapshot = _job_snapshot(job)
+
+    thread = threading.Thread(
+        target=_run_transcribe_job, args=(job_id, pid), daemon=True
+    )
+    thread.start()
+    return TranscribeJobResponse(**snapshot)
+
+
+@app.get(
+    "/api/projects/{pid}/transcribe/status",
+    response_model=TranscribeJobResponse,
+    summary="查询异步转写进度",
+)
+def get_transcription_status(pid: str) -> TranscribeJobResponse:
+    """返回该项目最近一次转写任务的状态；没有任何任务时 404。
+
+    参数:
+        pid: 项目 id。
+
+    返回:
+        ``{job_id, status, progress, words, elapsed_seconds, ...}``。
+
+    异常:
+        404: 项目不存在，或该项目从未启动过转写任务。
+    """
+    _get_project(pid)
+    with _TRANSCRIBE_JOBS_LOCK:
+        job_id = _transcribe_latest.get(pid)
+        job = _transcribe_jobs.get(job_id) if job_id else None
+        if job is None:
+            raise HTTPException(
+                status_code=404, detail=f"项目 {pid} 没有转写任务记录"
+            )
+        return TranscribeJobResponse(**_job_snapshot(job))
 
 
 # ----------------------------------------------------------------------
@@ -1796,6 +2199,33 @@ def get_source_audio(pid: str) -> FileResponse:
 
     cache_dir = OUTPUT_DIR / pid
     cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # 长素材用"轻量预览"：2 小时 WAV 有 200MB+，浏览器要先下载再整体解码成
+    # float32（内存翻倍），很容易把标签页拖死。压成 8kHz/24kbps 单声道 MP3 后
+    # 体积与解码内存都降到 1/4 左右，波形与播放仍然够用。
+    duration = 0.0
+    try:
+        duration = _duration_of(project)
+    except HTTPException:
+        duration = 0.0
+
+    if duration >= _COMPACT_PREVIEW_MIN_SECONDS:
+        compact = cache_dir / "preview_compact.mp3"
+        try:
+            fresh = compact.is_file() and compact.stat().st_mtime >= source.stat().st_mtime
+        except OSError:
+            fresh = False
+        if not fresh:
+            try:
+                media.convert_to_compact_preview(source, compact)
+            except media.MediaToolError as exc:
+                raise HTTPException(
+                    status_code=500, detail=f"生成波形预览失败：{exc}"
+                ) from exc
+        return FileResponse(
+            str(compact), media_type="audio/mpeg", filename="preview.mp3"
+        )
+
     cache = cache_dir / "source_preview.wav"
 
     try:

@@ -333,15 +333,73 @@ watch(
  * 播放头跟随：当前播放词变化时高亮并滚入可视区。
  * 只在播放中高亮，暂停后保留最后一个高亮位置直到下次播放。
  */
+/** 是否让文本跟随播放头自动滚动（播放中用户手动滚动会自动关掉它）。 */
+const followPlayback = ref(true)
+/** 用户滚动过、跟随被自动暂停时，用来提示"点此恢复跟随"。 */
+const followPausedByUser = ref(false)
+
+/**
+ * 播放头跟随：只在当前词**滚出可视区**时才滚，且用 `nearest` 而不是 `center`。
+ *
+ * 之前的实现每个词都 `center` 一次：词大约每 0.2–0.4 秒变一次，等于每几百毫秒
+ * 把视口强行居中一次，用户根本没法往下翻。现在的规则：
+ *  - 当前词还在可视区内 → 完全不动；
+ *  - 滚出可视区 → 最小幅度滚到边缘（`nearest`）；
+ *  - 用户一旦主动滚动（wheel / touchmove）→ 暂停跟随，直到点「恢复跟随」。
+ */
+function scrollToActive(index) {
+  const el = rootRef.value?.querySelector?.(`[data-token-index="${index}"]`)
+  const container = el?.closest?.('.editor-body')
+  if (!el || !container) return
+
+  const rect = el.getBoundingClientRect()
+  const view = container.getBoundingClientRect()
+  const margin = 48
+  const visible = rect.top >= view.top + margin && rect.bottom <= view.bottom - margin
+  if (visible) return
+
+  el.scrollIntoView?.({ block: 'nearest', inline: 'nearest', behavior: 'auto' })
+}
+
 watch(
   () => props.activeIndex,
   async (index) => {
-    if (index < 0) return
+    if (index < 0 || !followPlayback.value) return
     await nextTick()
-    const el = rootRef.value?.querySelector?.(`[data-token-index="${index}"]`)
-    el?.scrollIntoView?.({ block: 'center', inline: 'nearest', behavior: 'smooth' })
+    scrollToActive(index)
   },
 )
+
+/** 用户主动滚动 → 暂停跟随（这是"播放时高亮把视口拽回去"的根治办法）。 */
+function onUserScrollIntent() {
+  if (!followPlayback.value) return
+  if (props.activeIndex < 0) return
+  followPlayback.value = false
+  followPausedByUser.value = true
+}
+
+/** 恢复跟随并立刻对齐到当前词。 */
+function resumeFollow() {
+  followPlayback.value = true
+  followPausedByUser.value = false
+  const index = props.activeIndex
+  if (index >= 0) {
+    nextTick(() => {
+      const el = rootRef.value?.querySelector?.(`[data-token-index="${index}"]`)
+      el?.scrollIntoView?.({ block: 'center', inline: 'nearest', behavior: 'smooth' })
+    })
+  }
+}
+
+/** 切换跟随（面板按钮）。 */
+function toggleFollow() {
+  if (followPlayback.value) {
+    followPlayback.value = false
+    followPausedByUser.value = false
+  } else {
+    resumeFollow()
+  }
+}
 
 // 拖拽选区：mousemove / mouseup 挂在 document 上，鼠标移出编辑器也不会丢事件。
 onMounted(() => {
@@ -349,6 +407,9 @@ onMounted(() => {
   document.addEventListener('mouseup', onDocumentMouseUp)
   document.addEventListener('selectstart', onSelectStart)
   window.addEventListener('blur', onWindowBlur)
+  const body = rootRef.value?.querySelector?.('.editor-body')
+  body?.addEventListener('wheel', onUserScrollIntent, { passive: true })
+  body?.addEventListener('touchmove', onUserScrollIntent, { passive: true })
 })
 
 onBeforeUnmount(() => {
@@ -356,6 +417,9 @@ onBeforeUnmount(() => {
   document.removeEventListener('mouseup', onDocumentMouseUp)
   document.removeEventListener('selectstart', onSelectStart)
   window.removeEventListener('blur', onWindowBlur)
+  const body = rootRef.value?.querySelector?.('.editor-body')
+  body?.removeEventListener('wheel', onUserScrollIntent)
+  body?.removeEventListener('touchmove', onUserScrollIntent)
 })
 </script>
 
@@ -370,6 +434,19 @@ onBeforeUnmount(() => {
         {{ tokens.length }} Token · {{ segments.length }} 段 · 已删 {{ deletedIds.length }}
         <template v-if="selectedCount"> · 选中 {{ selectedCount }}</template>
       </span>
+      <button
+        class="follow-toggle"
+        type="button"
+        :class="{ 'is-off': !followPlayback, 'is-paused': followPausedByUser }"
+        :title="
+          followPlayback
+            ? '播放时文本会跟随高亮自动滚动（点击关闭）'
+            : '已暂停跟随（点击恢复）'
+        "
+        @click="toggleFollow"
+      >
+        {{ followPausedByUser ? '跟随已暂停 · 恢复' : followPlayback ? '跟随播放 ✓' : '跟随已关闭' }}
+      </button>
     </header>
 
     <div class="editor-body" :class="{ 'is-disabled': disabled }">
@@ -415,6 +492,35 @@ onBeforeUnmount(() => {
      不能写 height:100%（会叠加上方搜索栏高度而溢出） */
   flex: 1 1 0;
   overflow: hidden;
+}
+
+/* 跟随播放的开关：默认开启；用户滚动后变"已暂停"样式 */
+.follow-toggle {
+  flex: 0 0 auto;
+  margin-left: 10px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.follow-toggle:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.follow-toggle.is-paused {
+  color: #f0b429;
+  border-color: rgba(240, 180, 41, 0.6);
+  background: rgba(240, 180, 41, 0.12);
+}
+
+.follow-toggle.is-off {
+  color: var(--text-faint);
 }
 
 .editor-body {
