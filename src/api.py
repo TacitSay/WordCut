@@ -1812,9 +1812,12 @@ class AudioInfoResponse(BaseModel):
     """音频信息统计响应。"""
 
     project_id: str = Field(..., description="项目 id")
-    source: Dict[str, Any] = Field(..., description="源音频的客观指标")
+    source: Dict[str, Any] = Field(..., description="源音频的客观指标（不受参数影响）")
     edited: Optional[Dict[str, Any]] = Field(
-        None, description="按当前删除状态渲染后的指标（未转写时为 null）"
+        None, description="按当前删除状态 + 当前后处理参数渲染后的成片指标"
+    )
+    audio_params: Dict[str, Any] = Field(
+        default_factory=dict, description="本次统计所用的后处理参数（回显用）"
     )
     token_count: int = Field(0, description="Token 总数")
     deleted_count: int = Field(0, description="被删 Token 数")
@@ -1855,12 +1858,14 @@ def get_audio_info(pid: str) -> AudioInfoResponse:
             status_code=500, detail=f"统计源音频失败：{exc}"
         ) from exc
 
-    words = project.get("words") or []
-    edited: Optional[Dict[str, Any]] = None
     token_count = 0
     deleted_count = 0
     total_deleted = 0.0
 
+    # 未转写时没有删除区间，但仍然要算"源 + 当前参数"的成片指标：
+    # 否则用户刚上传、还没转写时点「应用参数」，面板里一个数字都不会变，
+    # 看起来就像参数没生效（实际是导出时才生效）。
+    deletes: List[DeleteSpan] = []
     if words:
         deleted_ids = _snapshot_deleted_ids(project)
         tokens = _tokens_of(project, deleted_ids)
@@ -1868,17 +1873,17 @@ def get_audio_info(pid: str) -> AudioInfoResponse:
         token_count = len(tokens)
         deleted_count = len(deleted_ids)
         total_deleted = round(_total_deleted(deletes), 3)
-        try:
-            rendered = edl_render.render(samples, rate, deletes)
-            params = audio_fx.AudioParams.from_mapping(
-                project.get("audio_params") or {}
-            )
-            processed = audio_fx.apply(rendered, rate, params)
-            edited = audio_fx.measure(processed, rate).to_dict()
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(
-                status_code=500, detail=f"统计剪辑后音频失败：{exc}"
-            ) from exc
+
+    edited: Optional[Dict[str, Any]] = None
+    try:
+        rendered = edl_render.render(samples, rate, deletes)
+        params = audio_fx.AudioParams.from_mapping(project.get("audio_params") or {})
+        processed = audio_fx.apply(rendered, rate, params)
+        edited = audio_fx.measure(processed, rate).to_dict()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=500, detail=f"统计剪辑后音频失败：{exc}"
+        ) from exc
 
     return AudioInfoResponse(
         project_id=pid,
@@ -1887,6 +1892,9 @@ def get_audio_info(pid: str) -> AudioInfoResponse:
         token_count=token_count,
         deleted_count=deleted_count,
         total_deleted=total_deleted,
+        audio_params=audio_fx.AudioParams.from_mapping(
+            project.get("audio_params") or {}
+        ).to_dict(),
     )
 
 
@@ -1898,6 +1906,117 @@ def _audio_param_limits() -> Dict[str, Any]:
         "max_fade_seconds": audio_fx.MAX_FADE_SECONDS,
         "default_target_dbfs": audio_fx.DEFAULT_TARGET_DBFS,
     }
+
+
+# ----------------------------------------------------------------------
+# 接口：剪辑结果即时试听（删除/恢复后立刻听到效果）
+# ----------------------------------------------------------------------
+class AuditionRequest(BaseModel):
+    """``POST /api/projects/{pid}/audition`` 的请求体。"""
+
+    source_time: float = Field(
+        ..., description="源时间轴上的关注点（秒），通常是刚被删/恢复词的起点"
+    )
+    pad: float = Field(1.2, description="关注点前后各取多少秒（0.1–3）")
+
+
+#: 试听渲染缓存：key -> (samples, sample_rate)。命中即免去重渲染。
+_AUDITION_CACHE: Dict[tuple, Any] = {}
+#: 缓存上限（条）；超过按插入顺序淘汰最早的。
+_AUDITION_CACHE_LIMIT: int = 6
+
+
+def _audition_key(project: Dict[str, Any]) -> tuple:
+    """缓存键：项目 id + 删除状态 + 后处理参数（任一变化都要重新渲染）。"""
+    params = audio_fx.AudioParams.from_mapping(project.get("audio_params") or {})
+    return (
+        str(project.get("id")),
+        tuple(sorted(str(item) for item in (project.get("deleted_ids") or ()))),
+        params.gain_db,
+        params.normalize,
+        params.fade_in,
+        params.fade_out,
+        params.target_dbfs,
+    )
+
+
+def _rendered_edited_audio(project: Dict[str, Any]) -> np.ndarray:
+    """渲染"当前删除状态 + 当前后处理参数"的成片（带缓存）。"""
+    key = _audition_key(project)
+    cached = _AUDITION_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    samples = _load_samples(project)
+    rate = int(project["sample_rate"])
+    deleted_ids = _snapshot_deleted_ids(project)
+    tokens = _tokens_of(project, deleted_ids)
+    deletes = _deletes_of(tokens, deleted_ids)
+    rendered = edl_render.render(samples, rate, deletes)
+    params = audio_fx.AudioParams.from_mapping(project.get("audio_params") or {})
+    processed = audio_fx.apply(rendered, rate, params)
+
+    if len(_AUDITION_CACHE) >= _AUDITION_CACHE_LIMIT:
+        _AUDITION_CACHE.pop(next(iter(_AUDITION_CACHE)))
+    _AUDITION_CACHE[key] = processed
+    return processed
+
+
+@app.post(
+    "/api/projects/{pid}/audition",
+    summary="取剪辑后的一小段音频（删除/恢复后即时试听）",
+)
+def audition_project(pid: str, payload: AuditionRequest) -> FileResponse:
+    """按当前编辑状态渲染成片，截取关注点前后一小段返回 WAV，用于即时试听。
+
+    关注点用**源时间轴**的秒数给出（前端持有的是源时间戳），内部经
+    :class:`model.TimeMap` 换算到目标时间轴后再切片（不变量 6：时间映射只有
+    一个口径，试听与导出必然一致）。
+
+    参数:
+        pid: 项目 id。
+        payload: ``{source_time, pad}``；``pad`` 夹在 ``[0.1, 3.0]``。
+
+    返回:
+        WAV 文件流（16-bit PCM，采样率与项目一致）。
+
+    异常:
+        400: 参数非法；404: 项目不存在。
+    """
+    pad = float(payload.pad)
+    if not (0.1 <= pad <= 3.0):
+        raise HTTPException(status_code=400, detail=f"pad 必须在 0.1–3.0 秒之间：{pad}")
+
+    project = _get_project(pid)
+    try:
+        processed = _rendered_edited_audio(project)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"渲染剪辑结果失败：{exc}"
+        ) from exc
+
+    rate = int(project["sample_rate"])
+    deleted_ids = _snapshot_deleted_ids(project)
+    tokens = _tokens_of(project, deleted_ids)
+    deletes = _deletes_of(tokens, deleted_ids)
+    time_map = TimeMap.from_deletes(deletes)
+    target_time = float(time_map.source_to_target(float(payload.source_time)))
+
+    total = int(np.asarray(processed).size)
+    center = int(round(target_time * rate))
+    half = int(round(pad * rate))
+    start = max(0, min(center - half, max(0, total - 1)))
+    end = max(start + 1, min(center + half, total))
+    window = np.asarray(processed)[start:end]
+    if window.size == 0:
+        raise HTTPException(status_code=400, detail="试听区间为空")
+
+    handle = tempfile.NamedTemporaryFile(
+        suffix=".wav", prefix=f"audition_{pid}_", delete=False, dir=str(UPLOAD_DIR)
+    )
+    handle.close()
+    _write_wav(Path(handle.name), window)
+    return FileResponse(handle.name, media_type="audio/wav", filename="audition.wav")
 
 
 # ----------------------------------------------------------------------

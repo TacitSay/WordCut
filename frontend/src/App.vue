@@ -23,7 +23,7 @@
  * core/commands.js，菜单栏 / 快捷键 / （将来的右键菜单）共用同一张表，
  * 全部 handler 都是真实实现，不存在「只注册不干活」的命令。
  */
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { createHistory, createTokenEditEntry } from './core/history.js'
 import MenuBar from './components/MenuBar.vue'
 import Toolbar from './components/Toolbar.vue'
@@ -41,6 +41,7 @@ import {
   exportProject,
   fetchAudioInfo,
   fetchAudioParams,
+  fetchAudition,
   fetchTokens,
   buildProjectFile,
   health,
@@ -135,6 +136,25 @@ const audioInfo = ref(null)
 /** 统计加载中 */
 const loadingInfo = ref(false)
 
+// ---- 关键词搜索 ----
+/** 搜索栏是否展开 */
+const searchOpen = ref(false)
+/** 搜索关键词 */
+const searchQuery = ref('')
+/** 当前命中的序号（0 起） */
+const searchIndex = ref(0)
+/** 搜索输入框（用于打开时自动聚焦） */
+const searchInputRef = ref(null)
+
+// ---- 编辑后即时试听 ----
+/** 是否在删除/恢复后自动播一小段剪辑结果 */
+const auditionOnEdit = ref(true)
+/** 试听是否正在播放（状态栏提示用） */
+const auditionPlaying = ref(false)
+/** 隐藏的 <audio> 播放器（懒创建，复用同一个元素） */
+let auditionAudio = null
+let auditionUrl = ''
+
 const toolbarRef = ref(null)
 const playback = usePlayback()
 
@@ -171,6 +191,19 @@ const selectionRange = computed(() => {
     return { start: cursor, end: cursor, empty: true }
   }
   return { start: Math.min(anchor, cursor), end: Math.max(anchor, cursor), empty: false }
+})
+
+/** 统计所用参数的一句话摘要（面板里回显，避免"改了但不知道有没有生效"）。 */
+const paramSummary = computed(() => {
+  const params = audioInfo.value?.audio_params || {}
+  const parts = []
+  if (params.normalize) {
+    parts.push(`标准化 ${Number(params.target_dbfs ?? -1).toFixed(1)} dBFS`)
+  }
+  if (Number(params.gain_db)) parts.push(`增益 ${Number(params.gain_db).toFixed(1)} dB`)
+  if (Number(params.fade_in)) parts.push(`淡入 ${Number(params.fade_in).toFixed(2)} s`)
+  if (Number(params.fade_out)) parts.push(`淡出 ${Number(params.fade_out).toFixed(2)} s`)
+  return parts.length ? parts.join(' · ') : '无（原样输出）'
 })
 
 /**
@@ -232,6 +265,170 @@ function totalOf(spans) {
 }
 
 // ----------------------------------------------------------------------
+// 编辑后即时试听
+// ----------------------------------------------------------------------
+/**
+ * 播一小段"剪辑后的结果"，用来确认刚才删/恢复得对不对。
+ *
+ * @param {number} sourceTime 源时间轴上的关注点（秒），通常是改动词的起点
+ */
+async function playAudition(sourceTime) {
+  if (!auditionOnEdit.value || !project.value?.id) return
+  const time = Number(sourceTime)
+  if (!Number.isFinite(time) || time < 0) return
+  try {
+    const blob = await fetchAudition(project.value.id, { source_time: time, pad: 1.2 })
+    if (auditionUrl) URL.revokeObjectURL(auditionUrl)
+    auditionUrl = URL.createObjectURL(blob)
+    if (!auditionAudio) {
+      auditionAudio = new Audio()
+      auditionAudio.addEventListener('ended', () => {
+        auditionPlaying.value = false
+      })
+      auditionAudio.addEventListener('pause', () => {
+        auditionPlaying.value = false
+      })
+    } else {
+      auditionAudio.pause()
+    }
+    auditionAudio.src = auditionUrl
+    // 与主播放器互斥：两路声音叠在一起会听不清
+    if (playback.state.playing) playback.pause()
+    auditionPlaying.value = true
+    await auditionAudio.play()
+  } catch (error) {
+    auditionPlaying.value = false
+    // 试听是辅助功能，失败不能打断删除/恢复主流程
+    console.warn('[audition] 试听失败', error)
+  }
+}
+
+/** 停止正在播放的试听片段。 */
+function stopAudition() {
+  if (auditionAudio) auditionAudio.pause()
+  auditionPlaying.value = false
+}
+
+/** 开关「编辑后自动试听」。 */
+function toggleAuditionOnEdit() {
+  auditionOnEdit.value = !auditionOnEdit.value
+  if (!auditionOnEdit.value) stopAudition()
+  setStatus(
+    auditionOnEdit.value
+      ? '已开启：删除/恢复后自动试听剪辑结果'
+      : '已关闭：删除/恢复后不再自动试听',
+    'info',
+  )
+}
+
+// ----------------------------------------------------------------------
+// 关键词搜索
+// ----------------------------------------------------------------------
+/**
+ * 搜索命中列表。
+ *
+ * 支持跨 Token 的关键词：中文常被 whisper 切成单字，用户搜"我们"时可能落在
+ * 两个 Token 上。做法是把全部 Token 文本拼成一整串，并维护"字符 → Token 下标"
+ * 的映射，匹配到子串后再反查首尾 Token，从而得到一个 Token 区间。
+ */
+const searchMatches = computed(() => {
+  const query = searchQuery.value.trim()
+  if (!query) return []
+  const list = tokens.value
+  if (!list.length) return []
+
+  let text = ''
+  const charToToken = []
+  for (let index = 0; index < list.length; index += 1) {
+    const tokenText = String(list[index]?.text ?? '')
+    for (let c = 0; c < tokenText.length; c += 1) charToToken.push(index)
+    text += tokenText
+  }
+
+  const haystack = text.toLowerCase()
+  const needle = query.toLowerCase()
+  if (!needle) return []
+
+  const matches = []
+  let from = 0
+  while (from <= haystack.length - needle.length) {
+    const at = haystack.indexOf(needle, from)
+    if (at < 0) break
+    const startToken = charToToken[at]
+    const endToken = charToToken[at + needle.length - 1]
+    if (startToken !== undefined && endToken !== undefined) {
+      matches.push({ start: startToken, end: endToken + 1, at })
+    }
+    from = at + Math.max(1, needle.length)
+  }
+  return matches
+})
+
+/** 命中数量（空查询为 0）。 */
+const searchCount = computed(() => searchMatches.value.length)
+
+/** 关键词变化后回到第一个命中，避免序号越界。 */
+watch(searchMatches, () => {
+  searchIndex.value = 0
+})
+
+async function openSearch() {
+  searchOpen.value = true
+  await nextTick()
+  searchInputRef.value?.focus?.()
+  searchInputRef.value?.select?.()
+}
+
+function closeSearch() {
+  searchOpen.value = false
+  searchQuery.value = ''
+}
+
+/** 跳到第 index 个命中：选中对应 Token 区间，播放头移到起点。 */
+function jumpToMatch(index) {
+  const matches = searchMatches.value
+  if (!matches.length) return
+  const size = matches.length
+  const target = ((index % size) + size) % size
+  searchIndex.value = target
+  const match = matches[target]
+  // 直接构造选区：锚点=命中起点，光标=命中终点
+  selectionAnchor.value = match.start
+  cursorIndex.value = match.end
+  const start = Number(tokens.value[match.start]?.start)
+  if (Number.isFinite(start) && playback.state.ready) playback.seekTo(start)
+}
+
+function nextMatch() {
+  if (!searchMatches.value.length) return
+  jumpToMatch(searchIndex.value + 1)
+}
+
+function prevMatch() {
+  if (!searchMatches.value.length) return
+  jumpToMatch(searchIndex.value - 1)
+}
+
+/** 删除全部命中（文本驱动剪辑的高频操作：清掉口癖、重复词）。 */
+async function deleteSearchMatches() {
+  const matches = searchMatches.value
+  if (!matches.length) {
+    setStatus('没有可删除的匹配', 'info')
+    return
+  }
+  const ids = []
+  for (const match of matches) {
+    for (let i = match.start; i < match.end; i += 1) {
+      const id = tokens.value[i]?.id
+      if (id) ids.push(id)
+    }
+  }
+  const unique = [...new Set(ids)]
+  await performEdit(unique, 'delete', { nextCursor: matches[0].start })
+  setStatus(`已删除 ${unique.length} 个 Token（${matches.length} 处匹配）`, 'success')
+}
+
+// ----------------------------------------------------------------------
 // 音频后处理参数 + 音频信息统计
 // ----------------------------------------------------------------------
 /** 把 dBFS 数值格式化成 xx.x dB；-inf（全静音）显示为“静音”。 */
@@ -267,12 +464,18 @@ async function handleSaveAudioParams() {
     return
   }
   savingParams.value = true
+  const beforePeak = audioInfo.value?.edited?.peak_dbfs
   setStatus('正在保存音频参数…', 'info')
   try {
     const data = await saveAudioParams(project.value.id, audioParams.value)
     audioParams.value = { ...audioParams.value, ...(data?.audio_params || {}) }
-    setStatus('音频参数已保存，导出时生效', 'success')
     await loadAudioInfo()
+    const after = audioInfo.value?.edited?.peak_dbfs
+    const delta =
+      Number.isFinite(Number(beforePeak)) && Number.isFinite(Number(after))
+        ? `（成片峰值 ${formatDbfs(beforePeak)} → ${formatDbfs(after)}）`
+        : ''
+    setStatus(`音频参数已保存，导出时按此渲染${delta}`, 'success')
   } catch (error) {
     setStatus(`保存音频参数失败：${error.message}`, 'error')
   } finally {
@@ -416,6 +619,11 @@ async function performEdit(ids, action, { record = true, nextCursor = null } = {
         : `已恢复 ${targets.length} 个 Token（仍删除 ${deletedIds.value.length} 个）`,
       'success',
     )
+
+    // 及时反馈：按刚改动的位置，播一小段"剪辑后的结果"
+    const anchorToken = tokens.value.find((token) => targets.includes(token.id))
+    const anchorTime = Number(anchorToken?.start)
+    if (Number.isFinite(anchorTime)) playAudition(anchorTime)
   } catch (error) {
     setStatus(`${isDelete ? '删除' : '恢复'}失败：${error.message}`, 'error')
   } finally {
@@ -621,6 +829,11 @@ function resetProjectState() {
   cursorIndex.value = 0
   selectionAnchor.value = null
   playback.setDeletes([])
+  stopAudition()
+  if (auditionUrl) {
+    URL.revokeObjectURL(auditionUrl)
+    auditionUrl = ''
+  }
 }
 
 /** 选择本地文件：清空旧项目状态 → 生成 blob URL → 自动上传。 */
@@ -1273,6 +1486,13 @@ registerCommands([
     enabled: () => Boolean(project.value) && hasTokens.value && !busy.value,
   },
   {
+    id: 'edit.find',
+    title: '搜索关键词…',
+    menu: 'edit',
+    shortcut: 'Ctrl+F',
+    handler: () => openSearch(),
+  },
+  {
     id: 'edit.selectAll',
     title: '全选',
     menu: 'edit',
@@ -1337,6 +1557,12 @@ registerCommands([
     shortcut: 'Ctrl+Enter',
     handler: () => handlePlaySelection(),
     enabled: () => Boolean(audioUrl.value) && !selectionRange.value.empty,
+  },
+  {
+    id: 'playback.toggleAudition',
+    title: '编辑后自动试听（开关）',
+    menu: 'playback',
+    handler: () => toggleAuditionOnEdit(),
   },
   {
     id: 'tools.audioInfo',
@@ -1520,6 +1746,8 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown)
   if (audioUrl.value) URL.revokeObjectURL(audioUrl.value)
+  stopAudition()
+  if (auditionUrl) URL.revokeObjectURL(auditionUrl)
 })
 </script>
 
@@ -1568,6 +1796,38 @@ onBeforeUnmount(() => {
 
         <!-- I1 / I2：分段文本流，独立滚动 -->
         <div class="editor-dock">
+          <div v-if="searchOpen" class="search-bar">
+            <input
+              ref="searchInputRef"
+              v-model="searchQuery"
+              class="search-input"
+              type="text"
+              placeholder="搜索关键词（跨词也能匹配）"
+              @keydown.enter.prevent="nextMatch"
+              @keydown.shift.enter.prevent="prevMatch"
+              @keydown.esc.prevent="closeSearch"
+            />
+            <span class="search-count">
+              {{ searchQuery ? `${searchMatches.length ? searchIndex + 1 : 0}/${searchCount}` : '—' }}
+            </span>
+            <button class="btn btn-small" type="button" :disabled="!searchCount" @click="prevMatch">
+              ↑
+            </button>
+            <button class="btn btn-small" type="button" :disabled="!searchCount" @click="nextMatch">
+              ↓
+            </button>
+            <button
+              class="btn btn-small btn-danger"
+              type="button"
+              :disabled="!searchCount || busy"
+              title="把当前所有匹配的 Token 标记为删除"
+              @click="deleteSearchMatches"
+            >
+              删除全部匹配
+            </button>
+            <button class="btn btn-small" type="button" @click="closeSearch">×</button>
+          </div>
+
           <TextEditor
             :tokens="tokens"
             :segments="segments"
@@ -1722,44 +1982,45 @@ onBeforeUnmount(() => {
               </button>
             </h3>
             <template v-if="audioInfo">
+              <p class="panel-note">源素材只读，不随参数变化；只看「成片」那一栏。</p>
               <dl class="panel-list">
-                <div class="panel-row">
-                  <dt>源时长</dt>
+                <div class="panel-row panel-row-sub">
+                  <dt>源 · 时长</dt>
                   <dd class="mono">{{ formatSeconds(audioInfo.source?.duration) }}</dd>
                 </div>
                 <div class="panel-row">
-                  <dt>源峰值 / RMS</dt>
+                  <dt>源 · 峰值 / RMS</dt>
                   <dd class="mono">
                     {{ formatDbfs(audioInfo.source?.peak_dbfs) }} /
                     {{ formatDbfs(audioInfo.source?.rms_dbfs) }}
                   </dd>
                 </div>
                 <div class="panel-row">
-                  <dt>波峰因数</dt>
-                  <dd class="mono">{{ formatDbfs(audioInfo.source?.crest_factor_db) }}</dd>
-                </div>
-                <div class="panel-row">
-                  <dt>静音占比</dt>
+                  <dt>源 · 静音占比</dt>
                   <dd class="mono">{{ formatPercent(audioInfo.source?.silence_ratio) }}</dd>
                 </div>
                 <template v-if="audioInfo.edited">
-                  <div class="panel-row">
-                    <dt>成片时长</dt>
+                  <div class="panel-row panel-row-hl">
+                    <dt>成片 · 时长</dt>
                     <dd class="mono">{{ formatSeconds(audioInfo.edited?.duration) }}</dd>
                   </div>
-                  <div class="panel-row">
-                    <dt>成片峰值 / RMS</dt>
+                  <div class="panel-row panel-row-hl">
+                    <dt>成片 · 峰值 / RMS</dt>
                     <dd class="mono">
                       {{ formatDbfs(audioInfo.edited?.peak_dbfs) }} /
                       {{ formatDbfs(audioInfo.edited?.rms_dbfs) }}
                     </dd>
                   </div>
-                  <div class="panel-row">
-                    <dt>成片静音占比</dt>
+                  <div class="panel-row panel-row-hl">
+                    <dt>成片 · 波峰因数</dt>
+                    <dd class="mono">{{ formatDbfs(audioInfo.edited?.crest_factor_db) }}</dd>
+                  </div>
+                  <div class="panel-row panel-row-hl">
+                    <dt>成片 · 静音占比</dt>
                     <dd class="mono">{{ formatPercent(audioInfo.edited?.silence_ratio) }}</dd>
                   </div>
-                  <div class="panel-row">
-                    <dt>削顶样本</dt>
+                  <div class="panel-row panel-row-hl">
+                    <dt>成片 · 削顶样本</dt>
                     <dd
                       class="mono"
                       :class="{ 'param-warn': Number(audioInfo.edited?.clipped_samples) > 0 }"
@@ -1767,11 +2028,11 @@ onBeforeUnmount(() => {
                       {{ audioInfo.edited?.clipped_samples ?? 0 }}
                     </dd>
                   </div>
+                  <div class="panel-row">
+                    <dt>统计所用参数</dt>
+                    <dd class="mono param-summary">{{ paramSummary }}</dd>
+                  </div>
                 </template>
-                <div v-else class="panel-row">
-                  <dt>成片</dt>
-                  <dd>尚未转写，无法统计</dd>
-                </div>
               </dl>
             </template>
             <p v-else class="panel-placeholder">
@@ -1821,6 +2082,7 @@ onBeforeUnmount(() => {
         </span>
       </span>
       <span class="status-spacer" />
+      <span v-if="auditionPlaying" class="status-item status-accent">▶ 试听剪辑结果</span>
       <span class="status-item status-muted">
         <span class="status-key">播放头</span>
         <span class="status-value">
@@ -1922,8 +2184,56 @@ onBeforeUnmount(() => {
 .editor-dock {
   flex: 1 1 auto;
   display: flex;
+  flex-direction: column;
   min-height: 0;
   overflow: hidden;
+}
+
+/* 关键词搜索栏（文本编辑区顶部，不占用波形区域） */
+.search-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--bg-toolbar);
+  border-bottom: 1px solid var(--border);
+}
+
+.search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 24px;
+  padding: 0 8px;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg-input, rgba(255, 255, 255, 0.06));
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  outline: none;
+}
+
+.search-input:focus {
+  border-color: var(--accent, #4f8cff);
+}
+
+.search-count {
+  flex: 0 0 auto;
+  min-width: 52px;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.btn-danger {
+  color: #ffb4ae;
+  border-color: rgba(229, 83, 75, 0.5);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: rgba(229, 83, 75, 0.18);
 }
 
 /* 右侧参数面板（240px，默认收起）。 */
@@ -2101,6 +2411,34 @@ onBeforeUnmount(() => {
 
 .param-warn {
   color: var(--danger, #e5534b);
+}
+
+/* 统计表：源 / 成片 两组口径的视觉区分 */
+.panel-note {
+  margin: 0 0 6px;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.panel-row-sub dt,
+.panel-row-sub dd {
+  color: var(--text-faint);
+}
+
+.panel-row-hl dt {
+  color: var(--text-dim);
+}
+
+.panel-row-hl dd {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+.param-summary {
+  font-size: 10.5px;
+  white-space: normal;
+  word-break: break-all;
 }
 
 /* 底部状态栏 */

@@ -338,6 +338,32 @@ export function fetchAudioInfo(projectId) {
 }
 
 /**
+ * POST /api/projects/{pid}/audition -> Blob（WAV）
+ *
+ * 取"当前编辑状态渲染后"的一小段音频，用于删除/恢复后即时试听。
+ *
+ * @param {string} projectId
+ * @param {{ source_time: number, pad?: number }} options
+ *        source_time 用**源时间轴**的秒数（通常是刚改动词的起点）；
+ *        pad 是关注点前后各取多少秒，后端限制 0.1–3.0。
+ * @returns {Promise<Blob>}
+ */
+export async function fetchAudition(projectId, { source_time, pad = 1.2 } = {}) {
+  const url = `${API_BASE}${projectPath(projectId, '/audition')}`
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source_time: Number(source_time), pad: Number(pad) }),
+  })
+  if (!response.ok) {
+    const data = await readBody(response)
+    const detail = data && typeof data === 'object' ? data.detail ?? data : data
+    throw new ApiError(formatDetail(detail) || `试听失败（HTTP ${response.status}）`, response.status, detail)
+  }
+  return response.blob()
+}
+
+/**
  * GET /api/projects/{pid}/preview?srt=true|false -> PreviewResponse
  * @param {string} projectId
  * @param {{ srt?: boolean }} [options]
@@ -362,4 +388,5 @@ export default {
   fetchAudioParams,
   saveAudioParams,
   fetchAudioInfo,
+  fetchAudition,
 }

@@ -20,7 +20,7 @@
  *  - 删除/恢复的按键由 App.vue 的全局键盘处理（Delete / Backspace / Shift+方向键），
  *    本组件只把点击意图通过事件抛给父组件。
  */
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 /** 低置信度阈值（虚线下划线提示）。 */
 const LOW_CONFIDENCE = 0.6
@@ -159,15 +159,61 @@ function emitCursor(index, event) {
   emit('cursor-change', { index, extend: Boolean(event?.shiftKey) })
 }
 
-/** 点击 Token：按左右半边决定光标落点；已删 Token 顺带恢复；未删 Token 顺带定位播放头。 */
-function onTokenClick(item, event) {
-  if (props.disabled || item.pending) return
+/** 按鼠标落在 Token 的左/右半边换算光标位置（词前 / 词后）。 */
+function positionFromPointer(item, event) {
   const el = event?.currentTarget
-  const rect = typeof el?.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null
+  const rect =
+    typeof el?.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null
   const rightHalf = rect ? event.clientX - rect.left > rect.width / 2 : true
-  emitCursor(item.index + (rightHalf ? 1 : 0), event)
-  if (item.deleted) emit('restore', [item.id])
-  else emit('seek', item.start)
+  return item.index + (rightHalf ? 1 : 0)
+}
+
+/**
+ * 拖拽选区状态。
+ *
+ * 交互设计：
+ *  - 按下 → 落光标并记锚点；拖动经过其它 Token → 持续扩展选区（Shift+方向键同款语义）；
+ *  - 松开时若位置没变（没拖动）→ 视为普通点击：已删词恢复、未删词定位播放头；
+ *  - 拖动过程中 `preventDefault`，避免触发浏览器原生文字选择（会和 Token 选区打架）。
+ */
+const drag = ref({ active: false, moved: false, position: 0, item: null })
+/** 拖拽期间阻止原生 selectstart。 */
+function onSelectStart(event) {
+  if (drag.value.active) event.preventDefault()
+}
+
+function beginDrag(item, event) {
+  if (props.disabled || item.pending) return
+  if (event.button !== 0) return
+  event.preventDefault()
+  const position = positionFromPointer(item, event)
+  drag.value = { active: true, moved: false, position, item }
+  emitCursor(position, { shiftKey: event.shiftKey })
+}
+
+/** 拖动中：命中的 Token 变化就把光标移过去（保持锚点 → 形成选区）。 */
+function onDocumentMouseMove(event) {
+  if (!drag.value.active) return
+  const target = document.elementFromPoint?.(event.clientX, event.clientY)
+  const tokenEl = target?.closest?.('[data-token-index]')
+  if (!tokenEl) return
+  const index = Number(tokenEl.dataset.tokenIndex)
+  if (!Number.isFinite(index)) return
+  const rect = tokenEl.getBoundingClientRect()
+  const position = index + (event.clientX - rect.left > rect.width / 2 ? 1 : 0)
+  if (position === drag.value.position) return
+  drag.value = { ...drag.value, position, moved: true }
+  emitCursor(position, { shiftKey: true })
+}
+
+/** 松开：没拖动就是点击语义；拖过就是单纯选区，不触发恢复/定位。 */
+function onDocumentMouseUp() {
+  const state = drag.value
+  if (!state.active) return
+  drag.value = { ...state, active: false }
+  if (state.moved || !state.item) return
+  if (state.item.deleted) emit('restore', [state.item.id])
+  else emit('seek', state.item.start)
 }
 
 /** 点击段落空白处：光标落到该段末尾。 */
@@ -201,6 +247,19 @@ watch(
     el?.scrollIntoView?.({ block: 'center', inline: 'nearest', behavior: 'smooth' })
   },
 )
+
+// 拖拽选区：mousemove / mouseup 挂在 document 上，鼠标移出编辑器也不会丢事件。
+onMounted(() => {
+  document.addEventListener('mousemove', onDocumentMouseMove)
+  document.addEventListener('mouseup', onDocumentMouseUp)
+  document.addEventListener('selectstart', onSelectStart)
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('mousemove', onDocumentMouseMove)
+  document.removeEventListener('mouseup', onDocumentMouseUp)
+  document.removeEventListener('selectstart', onSelectStart)
+})
 </script>
 
 <template>
@@ -208,7 +267,7 @@ watch(
     <header class="pane-header">
       <h2 class="pane-title">文本</h2>
       <span class="pane-hint">
-        点击 = 定位光标 · Delete/Backspace 删除 · Shift+方向键 选区 · 点击红字恢复
+        点击 = 定位光标 · 拖拽 = 选一大片 · Delete/Backspace 删除 · 点击红字恢复
       </span>
       <span class="pane-count">
         {{ tokens.length }} Token · {{ segments.length }} 段 · 已删 {{ deletedIds.length }}
@@ -239,7 +298,7 @@ watch(
               tabindex="-1"
               :data-token-index="item.index"
               :title="`${item.id} · ${item.start.toFixed(2)}s–${item.end.toFixed(2)}s · 置信度 ${item.confidence.toFixed(2)}`"
-              @click.stop="onTokenClick(item, $event)"
+              @mousedown.stop="beginDrag(item, $event)"
               >{{ item.glyph }}</span
             >
           </template>
@@ -292,6 +351,9 @@ watch(
   cursor: pointer;
   border-radius: 2px;
   padding: 1px 0;
+  /* 拖拽选区由组件自己接管，禁掉原生文字选择，避免两层高亮打架 */
+  user-select: none;
+  -webkit-user-select: none;
   transition:
     background-color 0.12s ease,
     color 0.12s ease;
