@@ -4,8 +4,9 @@
 
 * :func:`probe` / :class:`MediaInfo` / :class:`MediaStream` —— ffprobe 探测（已实现）；
 * :func:`convert_to_wav16k` —— 任意音视频 → 16kHz 单声道 PCM16 WAV（已实现）；
+* :func:`denoise_array` —— ffmpeg ``afftdn`` 降噪（已实现，纲领 P2 简单版）；
 * :func:`separate_vocals` —— 人声分离（插件挂载点，抛 ``NotImplementedError``）；
-* :func:`cut_video` / :func:`concat_av` —— 视频剪辑 / 音视频合流（插件挂载点）。
+* :func:`cut_video` / :func:`concat_av` —— 视频剪辑 / 音视频合流（已实现）。
 
 另导出 :class:`MediaToolError`（所有媒体工具类错误的统一类型）与
 :func:`resolve_ffmpeg` / :func:`resolve_ffprobe`（工具路径解析）。
@@ -14,6 +15,7 @@
 from __future__ import annotations
 
 from .converter import convert_to_wav16k
+from .denoiser import denoise_array
 from .ffmpeg_bin import (
     MediaToolError,
     resolve_ffmpeg,
@@ -28,6 +30,7 @@ __all__ = [
     "MediaInfo",
     "MediaStream",
     "convert_to_wav16k",
+    "denoise_array",
     "separate_vocals",
     "cut_video",
     "concat_av",

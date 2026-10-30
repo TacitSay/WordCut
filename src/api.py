@@ -2057,7 +2057,12 @@ def get_audio_info(pid: str) -> AudioInfoResponse:
     try:
         rendered = edl_render.render(samples, rate, deletes)
         params = audio_fx.AudioParams.from_mapping(project.get("audio_params") or {})
-        processed = audio_fx.apply(rendered, rate, params)
+        try:
+            processed = audio_fx.apply(rendered, rate, params)
+        except (RuntimeError, OSError):
+            # 环境缺 ffmpeg 时降噪会失败：统计不能让整个面板挂掉，
+            # 退回"不降噪"的其它后处理，保证峰值/时长等指标仍然可用。
+            processed = audio_fx.apply(rendered, rate, params, enable_denoise=False)
         edited = audio_fx.measure(processed, rate).to_dict()
     except (TypeError, ValueError) as exc:
         raise HTTPException(
@@ -2084,6 +2089,9 @@ def _audio_param_limits() -> Dict[str, Any]:
         "max_gain_db": audio_fx.MAX_GAIN_DB,
         "max_fade_seconds": audio_fx.MAX_FADE_SECONDS,
         "default_target_dbfs": audio_fx.DEFAULT_TARGET_DBFS,
+        "min_denoise_db": audio_fx.DENOISE_MIN_DB,
+        "max_denoise_db": audio_fx.DENOISE_MAX_DB,
+        "default_denoise_db": audio_fx.DENOISE_DEFAULT_DB,
     }
 
 
@@ -2120,7 +2128,12 @@ def _audition_key(project: Dict[str, Any]) -> tuple:
 
 
 def _rendered_edited_audio(project: Dict[str, Any]) -> np.ndarray:
-    """渲染"当前删除状态 + 当前后处理参数"的成片（带缓存）。"""
+    """渲染"当前删除状态 + 当前后处理参数"的成片（带缓存）。
+
+    注意：这里**不做降噪**。降噪要起一次 ffmpeg 进程、对整段音频处理，放在
+    "每次删除都刷新试听"这条热路径上会明显卡顿；试听只需要判断"剪得对不对"，
+    噪声细节不是重点。整段降噪留给导出与统计接口。
+    """
     key = _audition_key(project)
     cached = _AUDITION_CACHE.get(key)
     if cached is not None:
@@ -2133,7 +2146,7 @@ def _rendered_edited_audio(project: Dict[str, Any]) -> np.ndarray:
     deletes = _deletes_of(tokens, deleted_ids)
     rendered = edl_render.render(samples, rate, deletes)
     params = audio_fx.AudioParams.from_mapping(project.get("audio_params") or {})
-    processed = audio_fx.apply(rendered, rate, params)
+    processed = audio_fx.apply(rendered, rate, params, enable_denoise=False)
 
     if len(_AUDITION_CACHE) >= _AUDITION_CACHE_LIMIT:
         _AUDITION_CACHE.pop(next(iter(_AUDITION_CACHE)))
@@ -2189,6 +2202,19 @@ def audition_project(pid: str, payload: AuditionRequest) -> FileResponse:
     window = np.asarray(processed)[start:end]
     if window.size == 0:
         raise HTTPException(status_code=400, detail="试听区间为空")
+
+    # 试听片段若开了降噪，只对这小段跑一次 ffmpeg（约 2 秒音频，几十毫秒）
+    params = audio_fx.AudioParams.from_mapping(project.get("audio_params") or {})
+    if params.denoise:
+        try:
+            window = audio_fx.apply(
+                window,
+                rate,
+                audio_fx.AudioParams(denoise=True, denoise_db=params.denoise_db),
+            )
+        except (RuntimeError, OSError):
+            # 降噪失败不该让试听整个不可用：退回未降噪片段
+            pass
 
     handle = tempfile.NamedTemporaryFile(
         suffix=".wav", prefix=f"audition_{pid}_", delete=False, dir=str(UPLOAD_DIR)

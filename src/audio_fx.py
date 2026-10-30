@@ -45,6 +45,9 @@ __all__ = [
     "MAX_GAIN_DB",
     "MIN_GAIN_DB",
     "MAX_FADE_SECONDS",
+    "DENOISE_DEFAULT_DB",
+    "DENOISE_MIN_DB",
+    "DENOISE_MAX_DB",
     "apply_gain",
     "peak_normalize",
     "apply_fade",
@@ -64,6 +67,13 @@ MIN_GAIN_DB: float = -24.0
 
 #: 允许的单侧淡入 / 淡出时长上限（秒）。
 MAX_FADE_SECONDS: float = 5.0
+
+#: 降噪（ffmpeg afftdn）的默认噪声底噪（dBFS）。
+DENOISE_DEFAULT_DB: float = -30.0
+
+#: 降噪噪声底噪的允许范围（dBFS）。
+DENOISE_MIN_DB: float = -80.0
+DENOISE_MAX_DB: float = -5.0
 
 #: 静音占比统计的分析帧长（秒），20 ms 是语音活动检测的常用帧长。
 _FRAME_SECONDS: float = 0.02
@@ -92,6 +102,8 @@ class AudioParams:
     fade_in: float = 0.0
     fade_out: float = 0.0
     target_dbfs: float = DEFAULT_TARGET_DBFS
+    denoise: bool = False
+    denoise_db: float = DENOISE_DEFAULT_DB
 
     # ------------------------------------------------------------------
     # 构造与序列化
@@ -134,12 +146,22 @@ class AudioParams:
         if target_dbfs >= 0.0:
             raise ValueError(f"target_dbfs 必须是负值（dBFS），收到 {target_dbfs}")
 
+        denoise_db = _as_float(
+            value.get("denoise_db"), DENOISE_DEFAULT_DB, "denoise_db"
+        )
+        if not (DENOISE_MIN_DB <= denoise_db <= DENOISE_MAX_DB):
+            raise ValueError(
+                f"denoise_db 超出范围 [{DENOISE_MIN_DB}, {DENOISE_MAX_DB}]：{denoise_db}"
+            )
+
         return cls(
             gain_db=gain_db,
             normalize=_as_bool(value.get("normalize"), False, "normalize"),
             fade_in=fade_in,
             fade_out=fade_out,
             target_dbfs=target_dbfs,
+            denoise=_as_bool(value.get("denoise"), False, "denoise"),
+            denoise_db=denoise_db,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -153,6 +175,7 @@ class AudioParams:
             and not self.normalize
             and self.fade_in == 0.0
             and self.fade_out == 0.0
+            and not self.denoise
         )
 
 
@@ -373,19 +396,27 @@ def apply(
     samples: np.ndarray,
     sample_rate: int,
     params: Optional[AudioParams] = None,
+    *,
+    enable_denoise: bool = True,
 ) -> np.ndarray:
-    """按处理顺序一次性施加全部后处理：增益 → 标准化 → 淡入 → 淡出。
+    """按处理顺序一次性施加全部后处理：**降噪** → 增益 → 标准化 → 淡入 → 淡出。
+
+    降噪排在最前：它需要基于原始信噪比估计噪声谱，先做增益会把噪声一起抬高，
+    反而更难估计。
 
     参数:
         samples: 一维音频样本（只读）。
         sample_rate: 采样率（Hz）。
         params: 后处理参数；``None`` 或全默认值时返回等值副本。
+        enable_denoise: 是否允许调用 ffmpeg 降噪。极端情况（环境缺 ffmpeg）可传
+            ``False`` 跳过；此时其余后处理照常进行。
 
     返回:
         float64 新数组；入参永远不会被修改（不变量 1）。
 
     异常:
         TypeError / ValueError: 入参或参数非法。
+        media.MediaToolError: 降噪时 ffmpeg 不可用或执行失败（仅当开启降噪）。
     """
     signal = _as_signal(samples)
     rate = _as_rate(sample_rate)
@@ -397,6 +428,11 @@ def apply(
         return signal
 
     result = signal
+    if params.denoise and enable_denoise:
+        # 延迟导入：让纯 numpy 的调用方（如单元测试）不必依赖媒体工具链
+        from media.denoiser import denoise_array
+
+        result = denoise_array(result, rate, params.denoise_db)
     if params.gain_db != 0.0:
         result = apply_gain(result, params.gain_db)
     if params.normalize:

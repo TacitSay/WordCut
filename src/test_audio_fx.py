@@ -152,6 +152,28 @@ try:
 except ValueError:
     check("gain_db 越界应抛 ValueError", True)
 
+# ---- 降噪参数的校验（不依赖 ffmpeg，只测参数层）----
+denoise_params = AudioParams.from_mapping({"denoise": True, "denoise_db": -45})
+check("denoise 字段可读取", denoise_params.denoise is True and denoise_params.denoise_db == -45)
+check("开启降噪后 is_noop 为假", denoise_params.is_noop() is False)
+check("默认不降噪", AudioParams().denoise is False)
+
+try:
+    AudioParams.from_mapping({"denoise": "yes"})
+    check("denoise 传字符串应抛 ValueError", False)
+except ValueError:
+    check("denoise 传字符串应抛 ValueError", True)
+
+try:
+    AudioParams.from_mapping({"denoise_db": 0})
+    check("denoise_db 越界应抛 ValueError", False)
+except ValueError:
+    check("denoise_db 越界应抛 ValueError", True)
+
+# 降噪走 ffmpeg，这里只验证"关掉降噪时不会触碰外部进程"
+no_fx = apply(tone, rate, AudioParams(denoise=True), enable_denoise=False)
+check("enable_denoise=False 时跳过降噪且不报错", no_fx.size == tone.size)
+
 combined = apply(tone, rate, AudioParams(gain_db=-6.0, normalize=True, fade_in=0.1, fade_out=0.1))
 check("组合处理不修改入参", np.array_equal(tone, sine(seconds=1.0, rate=rate, amp=0.8)))
 check("组合处理后峰值仍为目标电平（淡入淡出区之外）", abs(float(np.max(np.abs(combined))) - 10 ** (-1 / 20)) < 1e-6)

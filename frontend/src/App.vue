@@ -127,12 +127,17 @@ const audioParams = ref({
   normalize: false,
   fade_in: 0,
   fade_out: 0,
+  denoise: false,
+  denoise_db: -30,
 })
 /** 后端返回的参数上限（供控件约束） */
 const audioLimits = ref({
   min_gain_db: -24,
   max_gain_db: 24,
   max_fade_seconds: 5,
+  min_denoise_db: -80,
+  max_denoise_db: -5,
+  default_denoise_db: -30,
 })
 /** 参数保存中 */
 const savingParams = ref(false)
@@ -205,6 +210,7 @@ const paramSummary = computed(() => {
   if (params.normalize) {
     parts.push(`标准化 ${Number(params.target_dbfs ?? -1).toFixed(1)} dBFS`)
   }
+  if (params.denoise) parts.push(`降噪 ${Number(params.denoise_db ?? -30).toFixed(0)} dB`)
   if (Number(params.gain_db)) parts.push(`增益 ${Number(params.gain_db).toFixed(1)} dB`)
   if (Number(params.fade_in)) parts.push(`淡入 ${Number(params.fade_in).toFixed(2)} s`)
   if (Number(params.fade_out)) parts.push(`淡出 ${Number(params.fade_out).toFixed(2)} s`)
@@ -616,7 +622,12 @@ async function performEdit(ids, action, { record = true, nextCursor = null } = {
     (id) => id && (isDelete ? !deleted.has(id) : deleted.has(id)),
   )
   if (!targets.length) {
-    setStatus(isDelete ? '选中的 Token 已全部删除' : '选中的 Token 没有可恢复的', 'info')
+    setStatus(
+      isDelete
+        ? '选中的 Token 已全部删除（再按 Delete 即可恢复）'
+        : '选中的 Token 没有可恢复的',
+      'info',
+    )
     return
   }
 
@@ -685,7 +696,7 @@ async function handleDeleteCommand() {
   }
   const range = selectionRange.value
   if (!range.empty) {
-    await performEdit(selectionTokenIds(), 'delete', { nextCursor: range.start })
+    await applyDeleteOrRestore(selectionTokenIds(), range.start)
     return
   }
   // 光标处的 Token 可能已被删除：向后找到第一个仍存活的 Token。
@@ -699,13 +710,33 @@ async function handleDeleteCommand() {
   await performEdit([token.id], 'delete', { nextCursor: index })
 }
 
+/**
+ * Delete / Backspace 的统一语义：**已删的再按一次就恢复**。
+ *
+ * 用户的直觉是"选中删掉的东西，再按删除就还原"——这也让撤销不必去翻菜单。
+ * 规则：
+ *  - 选区里**全部已删** → 恢复；否则删除其中仍存活的（混合选区按删除处理，
+ *    避免"删一半又恢复一半"的歧义）；
+ *  - 光标态没有选区，仍按"删下一个存活词"处理。
+ */
+async function applyDeleteOrRestore(ids, nextCursor) {
+  const allDeleted =
+    ids.length > 0 && ids.every((id) => deletedSet.value.has(id))
+  if (allDeleted) {
+    await performEdit(ids, 'restore', { nextCursor })
+    setStatus(`已恢复选中的 ${ids.length} 个 Token（再按 Delete 可重新删除）`, 'success')
+    return
+  }
+  await performEdit(ids, 'delete', { nextCursor })
+}
+
 /** Backspace：选区优先，否则删光标前一个 Token。 */
 async function handleBackspace() {
   if (!hasTokens.value) return
   if (busy.value) return
   const range = selectionRange.value
   if (!range.empty) {
-    await performEdit(selectionTokenIds(), 'delete', { nextCursor: range.start })
+    await applyDeleteOrRestore(selectionTokenIds(), range.start)
     return
   }
   const index = prevAliveIndex(cursorIndex.value - 1)
@@ -2044,6 +2075,36 @@ onBeforeUnmount(() => {
           <!-- 音频后处理：增益 / 标准化 / 首尾淡入淡出（导出时生效，不改源文件） -->
           <section class="panel-section">
             <h3 class="panel-section-title">音频后处理</h3>
+            <div class="param-field">
+              <label class="param-label" for="param-denoise">
+                <input
+                  id="param-denoise"
+                  v-model="audioParams.denoise"
+                  class="param-check"
+                  type="checkbox"
+                />
+                降噪
+              </label>
+              <span class="param-hint">ffmpeg afftdn，压制底噪（导出时处理，较慢）</span>
+            </div>
+
+            <div class="param-field" :class="{ 'param-disabled': !audioParams.denoise }">
+              <label class="param-label" for="param-denoise-db">
+                噪声底噪
+                <span class="param-value">{{ Number(audioParams.denoise_db).toFixed(0) }} dB</span>
+              </label>
+              <input
+                id="param-denoise-db"
+                v-model.number="audioParams.denoise_db"
+                class="param-range"
+                type="range"
+                :min="audioLimits.min_denoise_db"
+                :max="audioLimits.max_denoise_db"
+                step="1"
+                :disabled="!audioParams.denoise"
+              />
+            </div>
+
             <div class="param-field">
               <label class="param-label" for="param-normalize">
                 <input

@@ -356,6 +356,8 @@ export function saveAudioParams(projectId, params = {}) {
       normalize: Boolean(params.normalize),
       fade_in: Number(params.fade_in ?? 0),
       fade_out: Number(params.fade_out ?? 0),
+      denoise: Boolean(params.denoise),
+      denoise_db: Number(params.denoise_db ?? -30),
     },
   })
 }
