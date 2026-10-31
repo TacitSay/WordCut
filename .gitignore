@@ -31,6 +31,7 @@ experiments/*/output/
 .vscode/
 
 # 运行时产物（上传/导出/工程文件）
+.runtime/
 uploads/
 outputs/
 *.wcproj

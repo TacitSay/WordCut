@@ -12,7 +12,7 @@
  * 音频来源：后端未暴露源音频下载接口，因此直接使用用户选择的本地文件
  * （URL.createObjectURL 生成的 blob URL），与上传给后端的是同一个文件。
  */
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { formatClock, usePlayback } from '../composables/usePlayback.js'
 
 const props = defineProps({
@@ -20,12 +20,39 @@ const props = defineProps({
   audioUrl: { type: String, default: '' },
   /** DeleteSpanOut[]：{ start, end, token_id, cause } */
   deletes: { type: Array, default: () => [] },
+  /**
+   * 预计算波形峰值（二维：[[归一化振幅...]]）。有它就不解码音频，
+   * 长音频（2 小时）也能瞬间出图；没有则退回 WaveSurfer 自行解码。
+   */
+  peaks: { type: Array, default: () => [] },
+  /** 音频总时长（秒），与 peaks 配套使用 */
+  duration: { type: Number, default: 0 },
 })
 
 const emit = defineEmits(['ready'])
 
 const container = ref(null)
-const { state, attach, detach, setDeletes, toggle, play, pause, seekTo, seekBy } = usePlayback()
+const {
+  state,
+  attach,
+  detach,
+  setDeletes,
+  toggle,
+  play,
+  pause,
+  seekTo,
+  seekBy,
+  zoomBy,
+  zoomToFit,
+} = usePlayback()
+
+/** 当前缩放倍率（相对"适应宽度"）。 */
+const zoomLabel = computed(() => {
+  if (!state.zoomed) return '适应'
+  const fit = (container.value?.clientWidth || 1) / (state.duration || 1)
+  const ratio = fit > 0 ? state.pxPerSec / fit : 1
+  return `${ratio.toFixed(1)}×`
+})
 
 /** 播放/暂停按钮（也可由父组件通过 ref 调用 expose 出来的方法）。 */
 function togglePlay() {
@@ -35,16 +62,24 @@ function togglePlay() {
 
 /** 挂载/切换音频时重建实例。 */
 function mount(url) {
-  const instance = attach(container.value, url)
+  const hasPeaks = Array.isArray(props.peaks) && props.peaks.length > 0
+  const instance = attach(container.value, url, {
+    peaks: hasPeaks ? props.peaks : undefined,
+    duration: props.duration || undefined,
+  })
   if (instance) {
-    instance.on('ready', () => emit('ready', state.duration))
+    instance.on('ready', () => {
+      emit('ready', state.duration)
+      // 峰值模式下按容器宽度先"适应"，之后交给用户的缩放操作
+      if (hasPeaks) zoomToFit()
+    })
   }
 }
 
 watch(
   // flush: 'post' —— 等 v-show 生效、容器有真实高度后再挂载波形
-  () => props.audioUrl,
-  (url) => mount(url),
+  () => [props.audioUrl, props.peaks, props.duration],
+  () => mount(props.audioUrl),
   { flush: 'post' },
 )
 
@@ -54,12 +89,53 @@ watch(
   { deep: true },
 )
 
+/**
+ * 滚轮交互：
+ *  - Ctrl / Alt + 滚轮 → 以指针位置为中心缩放；
+ *  - 普通滚轮 / Shift + 滚轮 → 横向滚动（长音频只看局部时最常用）。
+ */
+function onWheel(event) {
+  if (!state.ready) return
+  const element = container.value
+  if (!element) return
+
+  if (event.ctrlKey || event.altKey) {
+    event.preventDefault()
+    // 记录指针位置对应的比例，缩放后把同一位置滚回视野
+    const rect = element.getBoundingClientRect()
+    const ratio = rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0.5
+    const before = element.scrollLeft + element.clientWidth * ratio
+    const timeAtPointer =
+      state.duration > 0 && element.scrollWidth > 0
+        ? ((element.scrollLeft + element.clientWidth * ratio) / element.scrollWidth) *
+          state.duration
+        : 0
+
+    zoomBy(event.deltaY < 0 ? 1.25 : 0.8)
+
+    requestAnimationFrame(() => {
+      if (!element.scrollWidth) return
+      const targetLeft =
+        state.duration > 0 ? (timeAtPointer / state.duration) * element.scrollWidth : before
+      element.scrollLeft = Math.max(0, targetLeft - element.clientWidth * ratio)
+    })
+    return
+  }
+
+  if (!state.zoomed) return // 未放大时没有可滚动内容
+  if (event.deltaY === 0 && event.deltaX === 0) return
+  event.preventDefault()
+  element.scrollLeft += event.deltaY !== 0 ? event.deltaY : event.deltaX
+}
+
 onMounted(() => {
   setDeletes(props.deletes)
   mount(props.audioUrl)
+  container.value?.addEventListener('wheel', onWheel, { passive: false })
 })
 
 onBeforeUnmount(() => {
+  container.value?.removeEventListener('wheel', onWheel)
   detach()
 })
 
@@ -98,7 +174,20 @@ defineExpose({
       <span class="wave-time">
         {{ formatClock(state.currentTime) }} / {{ formatClock(state.duration) }}
       </span>
-      <span class="wave-hint">红色 = 删除区间 · 点击波形只移动播放头</span>
+
+      <!-- 缩放控制：适应 / 缩小 / 放大（Ctrl+滚轮也能缩放，滚轮横向滚动） -->
+      <span class="wave-zoom">
+        <button type="button" title="缩小（Ctrl+滚轮）" :disabled="!state.ready" @click="zoomBy(0.7)">
+          −
+        </button>
+        <button type="button" title="适应宽度" :disabled="!state.ready" @click="zoomToFit()">
+          {{ zoomLabel }}
+        </button>
+        <button type="button" title="放大（Ctrl+滚轮）" :disabled="!state.ready" @click="zoomBy(1.4)">
+          +
+        </button>
+      </span>
+      <span class="wave-hint">红色 = 删除区间 · 点击移动播放头 · Ctrl+滚轮缩放</span>
 
       <ul class="wave-legend">
         <li><span class="legend-swatch legend-deleted" />删除区间</li>
@@ -236,7 +325,38 @@ defineExpose({
   border: 1px solid var(--border);
   border-radius: 4px;
   box-sizing: border-box;
-  overflow: hidden;
+  /* 放大后可横向滚动；未放大时没有滚动内容，行为不变 */
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.wave-zoom {
+  display: inline-flex;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.wave-zoom button {
+  min-width: 22px;
+  height: 20px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.wave-zoom button:hover:not(:disabled) {
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.wave-zoom button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .wave-empty {

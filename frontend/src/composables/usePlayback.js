@@ -44,12 +44,20 @@ export const playbackState = reactive({
   duration: 0,
   errorText: '',
   url: '',
+  /** 当前挂载签名（url + 是否峰值模式 + 时长），用于判断是否需要重建 */
+  signature: '',
+  /** 当前缩放：每秒钟占多少像素（0 表示"适应宽度"） */
+  pxPerSec: 0,
+  /** 是否处于放大状态（放大时容器可横向滚动） */
+  zoomed: false,
 })
 
 /** WaveSurfer 实例（module 作用域单例）。 */
 let wave = null
 /** RegionsPlugin 实例。 */
 let regions = null
+/** 峰值模式下自己创建的 <audio>（用于流式播放，避免整段解码）。 */
+let mediaElementRef = null
 /** 当前挂载的容器元素，用于判断「同一容器 + 同一音频」时无需重建。 */
 let currentContainer = null
 /** 当前要标注的删除区间（跨 attach 保留，便于重建后立即重绘）。 */
@@ -83,6 +91,16 @@ export function destroyWaveform() {
       /* 忽略卸载异常 */
     }
   }
+  if (mediaElementRef) {
+    try {
+      mediaElementRef.pause()
+      mediaElementRef.removeAttribute('src')
+      mediaElementRef.load()
+    } catch {
+      /* 忽略媒体元素清理异常 */
+    }
+    mediaElementRef = null
+  }
   wave = null
   regions = null
   currentContainer = null
@@ -92,6 +110,46 @@ export function destroyWaveform() {
   playbackState.currentTime = 0
   playbackState.duration = 0
   playbackState.url = ''
+  playbackState.signature = ''
+  playbackState.pxPerSec = 0
+  playbackState.zoomed = false
+}
+
+/**
+ * 缩放到指定密度。
+ * @param {number} pxPerSec 每秒像素；传 0 表示"适应容器宽度"
+ */
+export function zoomTo(pxPerSec) {
+  if (!wave) return false
+  const target = toNumber(pxPerSec, 0)
+  const width = currentContainer?.clientWidth || 0
+  const duration = playbackState.duration
+  if (width <= 0 || duration <= 0) return false
+
+  const fit = width / duration
+  const effective = target <= 0 ? fit : Math.max(fit, Math.min(target, 400))
+  try {
+    wave.zoom(effective)
+  } catch {
+    return false
+  }
+  playbackState.pxPerSec = effective
+  playbackState.zoomed = effective > fit * 1.05
+  return true
+}
+
+/** 按倍率缩放（factor>1 放大，<1 缩小）。 */
+export function zoomBy(factor) {
+  const current =
+    playbackState.pxPerSec > 0
+      ? playbackState.pxPerSec
+      : (currentContainer?.clientWidth || 1) / (playbackState.duration || 1)
+  return zoomTo(current * toNumber(factor, 1))
+}
+
+/** 恢复到"适应宽度"。 */
+export function zoomToFit() {
+  return zoomTo(0)
 }
 
 /** 按当前删除区间重绘红色区域（未 ready 时跳过，ready 事件里会再调）。 */
@@ -129,27 +187,66 @@ function renderRegions() {
 
 /**
  * 挂载/重建波形实例。
+ *
+ * 两种模式：
+ *  1. **峰值模式**（推荐，长音频必须用）：传入 ``peaks`` + ``duration``，
+ *     WaveSurfer 只按峰值画图、**完全不调用 decodeAudioData**，播放交给一个
+ *     ``<audio>`` 元素流式读取。2 小时音频解码到 48kHz 要 ~1.3GB 内存，
+ *     Chrome 会直接抛 "Unable to decode audio data"——峰值模式从根上避免。
+ *  2. **解码模式**（兼容旧调用）：只给 url，由 WaveSurfer 自行 fetch + 解码，
+ *     仅适合几分钟的短视频。
+ *
  * @param {HTMLElement|null} container 波形容器
- * @param {string} url 源音频地址（blob URL）
+ * @param {string} url 音频地址（blob URL 或 /api/.../source-audio）
+ * @param {{peaks?: number[][], duration?: number}} [options]
  * @returns {object|null} WaveSurfer 实例
  */
-export function attachWaveform(container, url) {
+export function attachWaveform(container, url, options = {}) {
   if (!container) return null
+
+  const peaks = Array.isArray(options.peaks) && options.peaks.length ? options.peaks : null
+  const duration = toNumber(options.duration, 0)
+  const usePeaks = Boolean(peaks && duration > 0)
+  const signature = `${url}|${usePeaks ? duration : 'decoded'}`
+
   // 同一容器 + 同一音频：复用现有实例（避免重复 create 造成 canvas 堆叠）。
-  if (wave && container === currentContainer && url === playbackState.url) return wave
+  if (wave && container === currentContainer && signature === playbackState.signature) {
+    return wave
+  }
 
   destroyWaveform()
   playbackState.errorText = ''
   if (!url) return null
 
   playbackState.url = url
+  playbackState.signature = signature
   currentContainer = container
+
+  // 峰值模式：自己建 <audio>，用流式播放，避免整段解码
+  let mediaElement = null
+  if (usePeaks) {
+    mediaElement = new Audio()
+    mediaElement.preload = 'auto'
+    mediaElement.src = url
+    mediaElement.addEventListener('error', () => {
+      const code = mediaElement?.error?.code
+      playbackState.errorText =
+        code === 4
+          ? '浏览器不支持该音频格式（或文件已损坏）'
+          : `音频加载失败（错误码 ${code ?? '未知'}）`
+      playbackState.ready = false
+    })
+    mediaElementRef = mediaElement
+  }
 
   let instance = null
   try {
     instance = WaveSurfer.create({
       container,
-      url,
+      // peaks 模式：media 负责播放，peaks 负责绘制
+      ...(usePeaks
+        ? { media: mediaElement, peaks, duration }
+        : { url }),
       height: Math.max(64, Math.round(container.clientHeight || DEFAULT_WAVE_HEIGHT)),
       waveColor: '#4b5563',
       progressColor: '#3b82f6',
@@ -162,10 +259,13 @@ export function attachWaveform(container, url) {
       autoScroll: true,
       autoCenter: false,
       hideScrollbar: true,
+      // 峰值模式不需要解码，给个足够细的初始密度
+      minPxPerSec: usePeaks ? Math.max(1, container.clientWidth / duration) : undefined,
     })
   } catch (error) {
     playbackState.errorText = String(error?.message ?? error ?? '未知错误')
     playbackState.url = ''
+    playbackState.signature = ''
     currentContainer = null
     return null
   }
@@ -386,7 +486,7 @@ let sharedApi = null
  * 取播放控制 API。
  * @returns {{
  *   state: object,
- *   attach: (container: HTMLElement|null, url: string) => object|null,
+ *   attach: (container: HTMLElement|null, url: string, options?: object) => object|null,
  *   detach: () => void,
  *   play: () => boolean,
  *   pause: () => boolean,
@@ -425,6 +525,9 @@ export function usePlayback() {
       clearRange,
       setSkipDeleted,
       isSkipDeleted,
+      zoomTo,
+      zoomBy,
+      zoomToFit,
       setDeletes,
       isPlaying,
       getCurrentTime,

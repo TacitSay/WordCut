@@ -1,67 +1,55 @@
 ﻿# -*- coding: utf-8 -*-
 <#
-WordCut 一键启动脚本（由 start.bat 调用，也可直接右键「使用 PowerShell 运行」）。
+WordCut 一键启动（单窗口版）
 
-做什么：
-  1. 检查 Python / Node 环境与前端依赖；
-  2. 后端（uvicorn :8000）与前端（vite :5173）各开一个独立窗口，日志留在窗口里；
-  3. 轮询等两边真正可用（不是"进程起来了"就算）；
-  4. 自动打开浏览器到 http://localhost:5173。
+一个窗口内同时启动后端与前端，并把两边的日志实时汇总到这里：
+  [后端] ...   [前端] ...
+报错也直接打在这里，不需要再去翻别的窗口。
 
-设计取舍：
-  - 端口已在监听时**不重复启动**，直接复用（方便你手动开过服务后再次双击）；
-  - 用 `/api/health` 判定后端就绪，而不是固定 sleep，机器慢也不会白等；
-  - 前端用 `--strictPort` 锁死 5173，避免 vite 自动跳到 5174 导致打开错地址；
-  - 服务窗口保持打开（`cmd /k`），出错时你能直接看到报错。
+实现方式：两个服务都用 `Start-Process -NoNewWindow -RedirectStandardOutput` 起在
+同一控制台（不弹新窗口），输出写进 .runtime/*.log，再由本脚本 tail 这两个文件、
+加前缀打印。这样既只有一个窗口，又能看到真实日志。
 
 参数：
   -NoBrowser   只启动服务，不打开浏览器
   -Restart     先结束本项目已在跑的服务再启动
-  -NoPause     结束时不等待按键（供脚本/计划任务调用）
+  -Quiet       只显示错误与关键提示（不 tail 完整日志）
 #>
 param(
     [switch]$NoBrowser,
     [switch]$Restart,
-    [switch]$NoPause
+    [switch]$Quiet
 )
 
 $ErrorActionPreference = 'Stop'
 
-$Root        = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root         = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BackendPort  = 8000
 $FrontendPort = 5173
 $FrontendUrl  = "http://localhost:$FrontendPort"
 $HealthUrl    = "http://127.0.0.1:$BackendPort/api/health"
+$RuntimeDir   = Join-Path $Root '.runtime'
+$BackendLog   = Join-Path $RuntimeDir 'backend.log'
+$FrontendLog  = Join-Path $RuntimeDir 'frontend.log'
 
-function Write-Step($text) { Write-Host "  $text" -ForegroundColor Gray }
 function Write-Ok($text)   { Write-Host "  [OK] $text" -ForegroundColor Green }
 function Write-Warn2($text){ Write-Host "  [!]  $text" -ForegroundColor Yellow }
 function Write-Err2($text) { Write-Host "  [X]  $text" -ForegroundColor Red }
+function Write-Info($text) { Write-Host "  $text" -ForegroundColor Gray }
 
 function Test-PortInUse([int]$port) {
-    # 注意：vite 只监听 IPv6 的 ::1，后端监听 127.0.0.1。只测 IPv4 会把
-    # "前端已在跑"误判成"没在跑"，于是重复启动一个必然失败的 vite。
-    # Get-NetTCPConnection 按端口查监听，与协议族无关，最稳。
+    # 注意：vite 只监听 IPv6 的 ::1，后端监听 127.0.0.1，两种都要认
     try {
         $listening = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Stop
         if ($listening) { return $true }
-    } catch {
-        # 老系统没有该 cmdlet 时退回 TCP 探测（两种协议族都试）
-    }
-
+    } catch { }
     foreach ($address in @('127.0.0.1', '::1')) {
         try {
             $client = New-Object System.Net.Sockets.TcpClient
             $iar = $client.BeginConnect($address, $port, $null, $null)
-            if ($iar.AsyncWaitHandle.WaitOne(400)) {
-                $client.EndConnect($iar)
-                $client.Close()
-                return $true
-            }
+            if ($iar.AsyncWaitHandle.WaitOne(400)) { $client.EndConnect($iar); $client.Close(); return $true }
             $client.Close()
-        } catch {
-            # 该地址族连不上，继续试下一个
-        }
+        } catch { }
     }
     return $false
 }
@@ -72,169 +60,245 @@ function Wait-Url([string]$url, [int]$timeoutSeconds) {
         try {
             $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 3
             if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) { return $true }
-        } catch {
-            Start-Sleep -Milliseconds 700
-        }
+        } catch { Start-Sleep -Milliseconds 500 }
     }
     return $false
 }
 
 function Stop-ProjectProcesses {
-    # 按端口 + 命令行双重定位：
-    #   - 后端命令行只有 "python -m uvicorn"，不含项目路径，只能靠端口认；
-    #   - vite 的 node 进程命令行里有项目路径，靠它兜底。
-    # 两条都限定 python / node，避免误杀浏览器等占用端口的程序。
     $ids = New-Object 'System.Collections.Generic.HashSet[int]'
-
     foreach ($port in @($BackendPort, $FrontendPort)) {
-        $connections = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
-        foreach ($conn in $connections) {
+        foreach ($conn in Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) {
             $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
             if ($proc -and ($proc.ProcessName -eq 'python' -or $proc.ProcessName -eq 'node')) {
                 [void]$ids.Add([int]$proc.Id)
             }
         }
     }
-
-    $pattern = "*$Root*"
     foreach ($proc in Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='node.exe'") {
-        if ($proc.CommandLine -and $proc.CommandLine -like $pattern) {
+        if ($proc.CommandLine -and $proc.CommandLine -like "*$Root*") {
             [void]$ids.Add([int]$proc.ProcessId)
         }
     }
-
     foreach ($processId in $ids) {
         try { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue } catch { }
     }
     if ($ids.Count -gt 0) { Start-Sleep -Seconds 2 }
 }
 
-Write-Host ""
-Write-Host "  ==========================================" -ForegroundColor Cyan
-Write-Host "     WordCut 词剪 - 一键启动" -ForegroundColor Cyan
-Write-Host "  ==========================================" -ForegroundColor Cyan
-Write-Host ""
+# ----------------------------------------------------------------------
+# 日志 tail：把文件新增内容按行取出（服务在写，我们在读）
+# ----------------------------------------------------------------------
+function New-Tailer([string]$path) {
+    if (-not (Test-Path $path)) { New-Item -ItemType File -Path $path -Force | Out-Null }
+    $stream = [System.IO.File]::Open(
+        $path,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::ReadWrite
+    )
+    return [pscustomobject]@{ Stream = $stream; Offset = 0; Partial = '' }
+}
+
+<#
+  用 .NET 的 Process 启动后台命令（输出重定向到日志文件）。
+
+  为什么不用 Start-Process -NoNewWindow -RedirectStandardOutput：PowerShell 5.1
+  构造子进程环境变量字典时，若环境里同时有 NO_PROXY 与 no_proxy（Clash 之类
+  工具会设置），会直接抛"已添加项。字典中的关键字…"。换成 .NET 的
+  ProcessStartInfo 让 CreateProcess 继承环境，就不经过那个字典。
+#>
+function Start-BackgroundProcess([string]$commandLine, [string]$workdir) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "$env:ComSpec"
+    $psi.Arguments = '/s /c "' + $commandLine + '"'
+    $psi.WorkingDirectory = $workdir
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    return [System.Diagnostics.Process]::Start($psi)
+}
+
+function Read-NewLines($tailer) {
+    $stream = $tailer.Stream
+    $length = $stream.Length
+    if ($length -le $tailer.Offset) { return @() }
+    try {
+        $null = $stream.Seek($tailer.Offset, [System.IO.SeekOrigin]::Begin)
+        $count = [int]($length - $tailer.Offset)
+        $buffer = New-Object byte[] $count
+        $read = $stream.Read($buffer, 0, $count)
+        if ($read -le 0) { return @() }
+        $tailer.Offset += $read
+        $text = $tailer.Partial + [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+        $lines = $text -split "`r?`n"
+        $tailer.Partial = $lines[$lines.Count - 1]
+        if ($lines.Count -le 1) { return @() }
+        return $lines[0..($lines.Count - 2)] | Where-Object { $_.Trim() -ne '' }
+    } catch {
+        return @()
+    }
+}
+
+function Write-Prefixed([string]$prefix, [string]$colour, $lines) {
+    foreach ($line in $lines) {
+        Write-Host "  $prefix " -ForegroundColor $colour -NoNewline
+        $isError = $line -match 'error|失败|Error|Traceback|EADDRINUSE|Exception'
+        if ($isError) {
+            Write-Host $line -ForegroundColor Red
+        } else {
+            Write-Host $line -ForegroundColor DarkGray
+        }
+    }
+}
 
 # ----------------------------------------------------------------------
-# 0. 可选：重启
+# 0. 重启
 # ----------------------------------------------------------------------
 if ($Restart) {
-    Write-Step "正在结束本项目已在运行的进程…"
+    Write-Info '正在结束本项目已在运行的进程…'
     Stop-ProjectProcesses
 }
+
+Write-Host ''
+Write-Host '  ==========================================' -ForegroundColor Cyan
+Write-Host '     WordCut 词剪 - 一键启动（单窗口）' -ForegroundColor Cyan
+Write-Host '  ==========================================' -ForegroundColor Cyan
+Write-Host ''
+
+if (-not (Test-Path $RuntimeDir)) { New-Item -ItemType Directory -Path $RuntimeDir -Force | Out-Null }
 
 # ----------------------------------------------------------------------
 # 1. 环境检查
 # ----------------------------------------------------------------------
-Write-Step "检查运行环境…"
-
 $PythonExe = $null
-$candidates = @(
-    'E:\Python\Python310\python.exe',
-    (Join-Path $Root '.venv\Scripts\python.exe'),
-    'python'
-)
-foreach ($candidate in $candidates) {
-    if ($candidate -eq 'python') {
-        $found = Get-Command python -ErrorAction SilentlyContinue
-        if ($found) { $PythonExe = $found.Source; break }
-    } elseif (Test-Path $candidate) {
-        $PythonExe = $candidate; break
-    }
+foreach ($candidate in @('E:\Python\Python310\python.exe', (Join-Path $Root '.venv\Scripts\python.exe'))) {
+    if (Test-Path $candidate) { $PythonExe = $candidate; break }
 }
 if (-not $PythonExe) {
-    Write-Err2 "找不到 Python。请安装 Python 3.10 或修改本脚本里的路径。"
-    exit 1
+    $found = Get-Command python -ErrorAction SilentlyContinue
+    if ($found) { $PythonExe = $found.Source }
 }
+if (-not $PythonExe) { Write-Err2 '找不到 Python，请安装 Python 3.10 或修改脚本里的路径。'; exit 1 }
 Write-Ok "Python: $PythonExe"
 
-$NpmCmd = Get-Command npm -ErrorAction SilentlyContinue
-if (-not $NpmCmd) {
-    Write-Err2 "找不到 npm。请安装 Node.js 20+ 并加入 PATH。"
+if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+    Write-Err2 '找不到 npm，请安装 Node.js 20+ 并加入 PATH。'
     exit 1
 }
-Write-Ok "Node  : $((Get-Command node -ErrorAction SilentlyContinue).Source)"
-
 $FrontendDir = Join-Path $Root 'frontend'
-if (-not (Test-Path (Join-Path $FrontendDir 'index.html'))) {
-    Write-Err2 "找不到前端目录：$FrontendDir"
-    exit 1
-}
+if (-not (Test-Path (Join-Path $FrontendDir 'index.html'))) { Write-Err2 "找不到前端目录：$FrontendDir"; exit 1 }
 
-$NodeModules = Join-Path $FrontendDir 'node_modules'
-$NeedInstall = -not (Test-Path (Join-Path $NodeModules 'vite'))
-if ($NeedInstall) {
-    Write-Warn2 "前端依赖未安装（缺 node_modules/vite）"
+if (-not (Test-Path (Join-Path $FrontendDir 'node_modules\vite'))) {
+    Write-Warn2 '前端依赖未安装，先执行 npm install（可能需要几分钟）…'
+    & cmd.exe /c "npm install" | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Err2 'npm install 失败，请手动在 frontend 目录执行。'; exit 1 }
+    Write-Ok '前端依赖安装完成'
 }
 
 # ----------------------------------------------------------------------
-# 2. 启动后端
+# 2. 启动（同一控制台，不弹新窗口）
 # ----------------------------------------------------------------------
-Write-Host ""
+$started = @()
+
+# 先清空日志（tailer 只读增量，清空必须在启动之前）
+foreach ($logPath in @($BackendLog, $FrontendLog, (Join-Path $RuntimeDir 'backend.err.log'), (Join-Path $RuntimeDir 'frontend.err.log'))) {
+    try { [System.IO.File]::WriteAllText($logPath, '') } catch { }
+}
+
 if (Test-PortInUse $BackendPort) {
-    Write-Warn2 "端口 $BackendPort 已被占用，跳过启动后端（复用现有服务）"
+    Write-Warn2 "端口 $BackendPort 已被占用，复用现有后端"
 } else {
-    Write-Step "启动后端（uvicorn :$BackendPort，新窗口）…"
-    $backendCommand = "title WordCut 后端 :$BackendPort & cd /d `"$Root\src`" & `"$PythonExe`" -m uvicorn api:app --host 127.0.0.1 --port $BackendPort"
-    Start-Process -FilePath "$env:ComSpec" -ArgumentList '/k', $backendCommand -WorkingDirectory (Join-Path $Root 'src') | Out-Null
+    Write-Info "启动后端 :$BackendPort"
+    $backendCmd = "`"$PythonExe`" -m uvicorn api:app --host 127.0.0.1 --port $BackendPort >> `"$BackendLog`" 2>&1"
+    $started += (Start-BackgroundProcess $backendCmd (Join-Path $Root 'src'))
 }
 
-# ----------------------------------------------------------------------
-# 3. 启动前端
-# ----------------------------------------------------------------------
 if (Test-PortInUse $FrontendPort) {
-    Write-Warn2 "端口 $FrontendPort 已被占用，跳过启动前端（复用现有服务）"
+    Write-Warn2 "端口 $FrontendPort 已被占用，复用现有前端"
 } else {
-    if ($NeedInstall) {
-        Write-Step "首次运行，先安装前端依赖（npm install，可能需要几分钟）…"
-        $installCommand = "title WordCut 依赖安装 & cd /d `"$FrontendDir`" & npm install"
-        Start-Process -FilePath "$env:ComSpec" -ArgumentList '/c', $installCommand -WorkingDirectory $FrontendDir -Wait | Out-Null
-        Write-Ok "前端依赖安装完成"
-    }
-    Write-Step "启动前端（vite :$FrontendPort，新窗口）…"
-    # --strictPort：端口被占时直接失败，而不是悄悄换到 5174
-    $frontendCommand = "title WordCut 前端 :$FrontendPort & cd /d `"$FrontendDir`" & npm run dev -- --port $FrontendPort --strictPort"
-    Start-Process -FilePath "$env:ComSpec" -ArgumentList '/k', $frontendCommand -WorkingDirectory $FrontendDir | Out-Null
+    Write-Info "启动前端 :$FrontendPort"
+    $frontendCmd = "npm run dev -- --port $FrontendPort --strictPort >> `"$FrontendLog`" 2>&1"
+    $started += (Start-BackgroundProcess $frontendCmd $FrontendDir)
 }
 
+$backendTail     = New-Tailer $BackendLog
+$frontendTail    = New-Tailer $FrontendLog
+$backendErrTail  = New-Tailer (Join-Path $RuntimeDir 'backend.err.log')
+$frontendErrTail = New-Tailer (Join-Path $RuntimeDir 'frontend.err.log')
+
+Write-Host ''
+Write-Host '  ------------------------------------------' -ForegroundColor DarkGray
+
 # ----------------------------------------------------------------------
-# 4. 等待就绪
+# 3. 汇总日志 + 等待就绪 + 开浏览器
 # ----------------------------------------------------------------------
-Write-Host ""
-Write-Step "等待后端就绪（$HealthUrl）…"
-if (Wait-Url $HealthUrl 90) {
-    try {
-        $health = Invoke-RestMethod -Uri $HealthUrl -UseBasicParsing -TimeoutSec 5
-        Write-Ok "后端就绪：v$($health.version)，项目 $($health.project_count) 个，采样率 $($health.sample_rate) Hz"
-        if ($health.cuda_devices -gt 0) {
-            $device = if ($health.whisper_device) { $health.whisper_device } else { '未加载（首次转写时确定）' }
-            Write-Step "GPU：检测到 $($health.cuda_devices) 个 CUDA 设备，转写设备 = $device"
+$browserOpened = $false
+$backendReady = $false
+$frontendReady = $false
+$lastReadyCheck = Get-Date
+
+try {
+    while ($true) {
+        if (-not $Quiet) {
+            Write-Prefixed '[后端]' 'Cyan' (Read-NewLines $backendTail)
+            Write-Prefixed '[后端]' 'Cyan' (Read-NewLines $backendErrTail)
+            Write-Prefixed '[前端]' 'Blue' (Read-NewLines $frontendTail)
+            Write-Prefixed '[前端]' 'Blue' (Read-NewLines $frontendErrTail)
+        } else {
+            $null = Read-NewLines $backendTail
+            $null = Read-NewLines $frontendTail
         }
-    } catch {
-        Write-Ok "后端就绪"
-    }
-} else {
-    Write-Err2 "后端 90 秒内没有就绪，请查看「WordCut 后端」窗口里的报错。"
-}
 
-Write-Step "等待前端就绪（$FrontendUrl）…"
-if (Wait-Url $FrontendUrl 120) {
-    Write-Ok "前端就绪：$FrontendUrl"
-    if (-not $NoBrowser) {
-        Start-Process $FrontendUrl
-        Write-Ok "已在浏览器打开"
-    }
-} else {
-    Write-Err2 "前端 120 秒内没有就绪，请查看「WordCut 前端」窗口（首次可能要编译一会儿）。"
-}
+        $now = Get-Date
+        if (($now - $lastReadyCheck).TotalSeconds -ge 2) {
+            $lastReadyCheck = $now
+            if (-not $backendReady) {
+                $backendReady = Wait-Url $HealthUrl 1
+                if ($backendReady) {
+                    try {
+                        $health = Invoke-RestMethod -Uri $HealthUrl -UseBasicParsing -TimeoutSec 5
+                        Write-Ok "后端就绪 v$($health.version) · 项目 $($health.project_count) 个 · CUDA $($health.cuda_devices)"
+                    } catch { Write-Ok '后端就绪' }
+                }
+            }
+            if (-not $frontendReady) {
+                $frontendReady = Wait-Url $FrontendUrl 1
+                if ($frontendReady) {
+                    Write-Ok "前端就绪 $FrontendUrl"
+                    if (-not $NoBrowser -and -not $browserOpened) {
+                        Start-Process $FrontendUrl | Out-Null
+                        $browserOpened = $true
+                        Write-Ok '已在浏览器打开'
+                    }
+                    Write-Host ''
+                    Write-Host '  ------------------------------------------' -ForegroundColor DarkGray
+                    Write-Host '  服务日志实时显示在下方；按 Ctrl+C 停止前后端并退出' -ForegroundColor DarkGray
+                    Write-Host '  ------------------------------------------' -ForegroundColor DarkGray
+                    Write-Host ''
+                }
+            }
+        }
 
-Write-Host ""
-Write-Host "  窗口说明：" -ForegroundColor Cyan
-Write-Host "    · WordCut 后端   -> 不要关，关了就没法转写/导出" -ForegroundColor Gray
-Write-Host "    · WordCut 前端   -> 不要关，关了页面会白屏" -ForegroundColor Gray
-Write-Host "    · 停止服务：双击 stop.bat，或直接关掉上面两个窗口" -ForegroundColor Gray
-Write-Host ""
-if (-not $NoPause) {
-    Write-Host "  按任意键关闭本窗口（服务继续在后台窗口运行）…" -ForegroundColor DarkGray
-    try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
+        if ($started.Count -gt 0) {
+            $alive = @($started | Where-Object { -not $_.HasExited })
+            if ($alive.Count -eq 0) {
+                Write-Host ''
+                Write-Err2 '前后端进程都已退出，可能启动失败。请检查上方日志。'
+                break
+            }
+        }
+
+        Start-Sleep -Milliseconds 400
+    }
+} finally {
+    Write-Host ''
+    Write-Info '正在停止服务…'
+    foreach ($proc in $started) {
+        try { if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } } catch { }
+    }
+    Stop-ProjectProcesses
+    foreach ($tailer in @($backendTail, $frontendTail, $backendErrTail, $frontendErrTail)) {
+        try { $tailer.Stream.Close() } catch { }
+    }
+    Write-Ok '已停止。'
 }

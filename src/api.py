@@ -143,6 +143,13 @@ _whisper_runtime: Dict[str, Any] = {
     "fallback_reason": "",
 }
 
+#: 需要 onnxruntime；缺失时自动退回顺序转写
+_batched_pipeline: Optional[Any] = None
+_batched_pipeline_model: Optional[Any] = None
+
+#: 长素材分段转写的块长（秒）：每块完成即落库，前端可"先看到一部分"
+_TRANSCRIBE_CHUNK_SECONDS: float = 600.0
+
 #: 设备策略环境变量：``auto``（默认）/ ``cuda`` / ``cpu``。
 _WHISPER_DEVICE_ENV: str = "WORDCUT_WHISPER_DEVICE"
 #: 计算精度环境变量：不设时按设备取默认（cuda→float16，cpu→int8）。
@@ -1458,54 +1465,28 @@ def transcribe_project(pid: str) -> TranscribeResponse:
     )
 
 
-def _run_transcription(
-    project: Dict[str, Any],
-    model: Any,
-    on_progress: Optional[Any] = None,
-) -> Tuple[List[Dict[str, Any]], float]:
-    """跑一次词级转写，返回 ``(words, audio_duration)``。
-
-    长音频（2 小时）在 CPU 上要跑几十分钟，因此这里按段回调进度：
-    ``on_progress(fraction, words_so_far)`` 由异步任务用来更新状态。
+def _extract_words(segments: Any, offset: float = 0.0, limit: float = 0.0) -> List[Dict[str, Any]]:
+    """把 faster-whisper 的 segment 流拍平成 word dict 列表。
 
     参数:
-        project: 项目字典（需要 ``audio_path``）。
-        model: 已加载的 faster-whisper 模型。
-        on_progress: 可选回调，签名 ``(fraction: float, word_count: int) -> None``。
+        segments: ``model.transcribe`` 返回的生成器。
+        offset: 时间偏移（秒）——分段转写时把每块的相对时间加回来。
+        limit: 超过该源时间（秒）的词丢弃；``0`` 表示不限制。
 
     返回:
-        ``(words, audio_duration)``；``words`` 已按时间排序。
-
-    异常:
-        HTTPException: 源音频缺失（500）或转写结果为空（422）。
-        Exception: 底层转写异常，由调用方转换。
+        word dict 列表（按出现顺序，时间已加 ``offset``）。
     """
-    audio_path = Path(project["audio_path"])
-    if not audio_path.is_file():
-        raise HTTPException(
-            status_code=500, detail=f"源音频不存在：{audio_path}（请重新上传）"
-        )
-
     words: List[Dict[str, Any]] = []
-    segments, info = model.transcribe(
-        str(audio_path),
-        language="zh",
-        word_timestamps=True,
-        vad_filter=False,
-        beam_size=5,
-    )
-    audio_duration = float(getattr(info, "duration", 0.0) or 0.0)
-
     for segment in segments:
         seg_id = int(getattr(segment, "id", 0) or 0)
         for word in getattr(segment, "words", None) or []:
-            start = float(getattr(word, "start", 0.0) or 0.0)
-            end = float(getattr(word, "end", 0.0) or 0.0)
+            start = float(getattr(word, "start", 0.0) or 0.0) + offset
+            end = float(getattr(word, "end", 0.0) or 0.0) + offset
             if start < 0.0:
                 start = 0.0
             if not end > start:
                 end = start + _MIN_WORD_DURATION
-            if audio_duration > 0.0 and start >= audio_duration:
+            if limit > 0.0 and start >= limit:
                 continue
             probability = getattr(word, "probability", None)
             try:
@@ -1523,13 +1504,145 @@ def _run_transcription(
                     "prob": prob,
                 }
             )
+    return words
 
-        if on_progress is not None and audio_duration > 0.0:
-            try:
-                fraction = min(1.0, float(getattr(segment, "end", 0.0) or 0.0) / audio_duration)
-                on_progress(fraction, len(words))
-            except Exception:  # noqa: BLE001 - 进度回调绝不影响转写
-                pass
+
+def _get_batched_pipeline(model: Any) -> Any:
+    """惰性构造 faster-whisper 的批处理流水线；不可用时返回 ``None``。
+
+    批处理把 30 秒窗口成批送进 GPU，实测 180 秒素材从 11.0s 降到 3.0s（3.7×），
+    2 小时素材因此从 ~10 分钟降到 ~2 分钟。它依赖 VAD（onnxruntime + silero），
+    环境缺依赖时静默退回顺序解码，不影响可用性。
+
+    ``WORDCUT_WHISPER_BATCHED=0`` 可强制关闭（做对照实验用）。
+    """
+    if (os.environ.get("WORDCUT_WHISPER_BATCHED") or "1").strip() == "0":
+        return None
+    if _whisper_runtime.get("device") != "cuda":
+        return None
+    global _batched_pipeline, _batched_pipeline_model
+    if _batched_pipeline is not None and _batched_pipeline_model is model:
+        return _batched_pipeline
+    try:
+        from faster_whisper import BatchedInferencePipeline
+
+        _batched_pipeline = BatchedInferencePipeline(model=model)
+        _batched_pipeline_model = model
+        return _batched_pipeline
+    except Exception as exc:  # noqa: BLE001 - 缺 onnxruntime 等情况都退回顺序模式
+        _whisper_runtime["batch_note"] = f"批处理不可用，退回顺序模式：{exc}"
+        _batched_pipeline = None
+        _batched_pipeline_model = None
+        return None
+
+
+def _run_transcription(
+    project: Dict[str, Any],
+    model: Any,
+    on_progress: Optional[Any] = None,
+    on_partial: Optional[Any] = None,
+) -> Tuple[List[Dict[str, Any]], float]:
+    """跑一次词级转写，返回 ``(words, audio_duration)``。
+
+    两个提升长素材体验的机制：
+
+    * **批处理**：GPU 上用 ``BatchedInferencePipeline``（3.7× 实测）；
+    * **分段增量**：超过 ``_TRANSCRIBE_CHUNK_SECONDS`` 的音频按块转写，每块完成
+      就通过 ``on_partial`` 把累计词表落库，前端能"先看到一部分"，不必等 2 小时
+      全部跑完。分段边界会切断个别词，属于已知取舍（见 docs）。
+
+    参数:
+        project: 项目字典（需要 ``audio_path``）。
+        model: 已加载的 faster-whisper 模型。
+        on_progress: 可选回调 ``(fraction: float, word_count: int) -> None``。
+        on_partial: 可选回调 ``(words_so_far: list) -> None``，每块完成后调用。
+
+    返回:
+        ``(words, audio_duration)``；``words`` 已按时间排序。
+
+    异常:
+        HTTPException: 源音频缺失（500）或转写结果为空（422）。
+    """
+    audio_path = Path(project["audio_path"])
+    if not audio_path.is_file():
+        raise HTTPException(
+            status_code=500, detail=f"源音频不存在：{audio_path}（请重新上传）"
+        )
+
+    try:
+        info = sf.info(str(audio_path))
+        audio_duration = float(info.frames) / float(info.samplerate or SAMPLE_RATE)
+    except (RuntimeError, OSError):
+        audio_duration = 0.0
+
+    batched = _get_batched_pipeline(model)
+    batch_size = int(os.environ.get("WORDCUT_WHISPER_BATCH_SIZE") or 8)
+
+    def transcribe_once(
+        source: Any, length_limit: float = 0.0, base_offset: float = 0.0
+    ) -> List[Dict[str, Any]]:
+        """转写一段（路径或 numpy 数组），返回 word 列表。
+
+        ``base_offset`` 是这一段在整段音频里的起点（秒），用于把块内相对时间
+        换算成全局进度；拢共只有整段转写（短素材）时传 0。
+        """
+        if batched is not None:
+            segments, _info = batched.transcribe(
+                source,
+                language="zh",
+                word_timestamps=True,
+                batch_size=batch_size,
+                vad_filter=True,
+            )
+        else:
+            segments, _info = model.transcribe(
+                source,
+                language="zh",
+                word_timestamps=True,
+                vad_filter=False,
+                beam_size=int(os.environ.get("WORDCUT_WHISPER_BEAM") or 5),
+            )
+        result: List[Dict[str, Any]] = []
+        for segment in segments:
+            result.extend(_extract_words([segment]))
+            if on_progress is not None and audio_duration > 0.0:
+                try:
+                    done = base_offset + float(getattr(segment, "end", 0.0) or 0.0)
+                    on_progress(min(1.0, done / audio_duration), len(result))
+                except Exception:  # noqa: BLE001
+                    pass
+        return result
+    # ---- 短素材：一次转完 ----
+    if audio_duration <= _TRANSCRIBE_CHUNK_SECONDS * 1.5:
+        words = transcribe_once(str(audio_path), audio_duration)
+    else:
+        # ---- 长素材：按块转写，块内用相对时间，写回时加偏移 ----
+        words: List[Dict[str, Any]] = []  # type: ignore[no-redef]
+        rate = int(info.samplerate or SAMPLE_RATE)
+        chunk = int(_TRANSCRIBE_CHUNK_SECONDS * rate)
+        with sf.SoundFile(str(audio_path)) as handle:
+            index = 0
+            while True:
+                block = handle.read(chunk, dtype="float32", always_2d=False)
+                if block is None or len(block) == 0:
+                    break
+                offset = index * _TRANSCRIBE_CHUNK_SECONDS
+                part = transcribe_once(np.asarray(block), audio_duration, offset)
+                for item in part:
+                    item["start"] += offset
+                    item["end"] += offset
+                words.extend(part)
+                index += 1
+                if on_progress is not None and audio_duration > 0.0:
+                    try:
+                        on_progress(min(1.0, offset / audio_duration), len(words))
+                    except Exception:  # noqa: BLE001
+                        pass
+                if on_partial is not None:
+                    try:
+                        on_partial(sorted(words, key=lambda w: (w["start"], w["end"])))
+                    except Exception:  # noqa: BLE001
+                        pass
 
     words.sort(key=lambda item: (item["start"], item["end"]))
     if not words:
@@ -1568,6 +1681,9 @@ class TranscribeJobResponse(BaseModel):
     duration: float = Field(0.0, description="音频总时长（秒）")
     device: str = Field("", description="实际使用的设备（cuda / cpu）")
     compute_type: str = Field("", description="计算精度")
+    partial: bool = Field(
+        False, description="是否已有分段增量结果落库（前端可提前刷新 Token）"
+    )
     error: str = Field("", description="失败原因（status=error 时有值）")
 
 
@@ -1594,6 +1710,7 @@ def _job_snapshot(job: Dict[str, Any]) -> Dict[str, Any]:
         "duration": float(job["duration"]),
         "device": str(job["device"]),
         "compute_type": str(job["compute_type"]),
+        "partial": bool(job.get("partial")),
         "error": str(job["error"]),
     }
 
@@ -1608,7 +1725,9 @@ def _run_transcribe_job(job_id: str, pid: str) -> None:
             if job is None:
                 return
             job["progress"] = max(float(job["progress"]), fraction)
-            job["words"] = count
+            # 分段转写时 count 是"本块累计"，必须取 max：
+            # 否则每块开始时计数会回跳（829 → 1913 → 896 …），界面看着像出错。
+            job["words"] = max(int(job["words"]), int(count))
             job["elapsed_seconds"] = time.perf_counter() - started
 
     try:
@@ -1619,8 +1738,24 @@ def _run_transcribe_job(job_id: str, pid: str) -> None:
             if job is not None:
                 job["device"] = str(_whisper_runtime.get("device") or "")
                 job["compute_type"] = str(_whisper_runtime.get("compute_type") or "")
+        def on_partial(words_so_far: List[Dict[str, Any]]) -> None:
+            """分段增量：只落词表，不动删除状态。
+
+            注意不能调用 :func:`_apply_transcription`——它会把 ``deleted_ids``
+            截断到当前已知 id，分段中途调用会把用户后面的删除点误删。
+            """
+            try:
+                _store.update_words(pid, words_so_far)
+            except Exception:  # noqa: BLE001 - 增量落库失败不该中断转写
+                pass
+            with _TRANSCRIBE_JOBS_LOCK:
+                job = _transcribe_jobs.get(job_id)
+                if job is not None:
+                    job["words"] = len(words_so_far)
+                    job["partial"] = True
+
         with _TRANSCRIBE_EXEC_LOCK:
-            words, duration = _run_transcription(project, model, on_progress)
+            words, duration = _run_transcription(project, model, on_progress, on_partial)
         _apply_transcription(pid, project, words)
         with _TRANSCRIBE_JOBS_LOCK:
             job = _transcribe_jobs.get(job_id)
@@ -1694,6 +1829,7 @@ def start_transcription(pid: str) -> TranscribeJobResponse:
             "duration": float(_duration_of(project)),
             "device": str(_whisper_runtime.get("device") or ""),
             "compute_type": str(_whisper_runtime.get("compute_type") or ""),
+            "partial": False,
             "error": "",
         }
         _transcribe_jobs[job_id] = job
@@ -2237,20 +2373,30 @@ def get_source_audio(pid: str) -> FileResponse:
     """
     project = _get_project(pid)
 
-    # 优先用工程里记录的原始文件（视频会丢弃画面只取音轨）
-    candidates = [
-        project.get("original_media_path"),
-        project.get("source_path"),
-        project.get("audio_path"),
-    ]
-    source: Optional[Path] = None
-    for item in candidates:
-        if not item:
-            continue
-        candidate = Path(str(item))
-        if candidate.is_file():
-            source = candidate
-            break
+    # 关键：**优先用上传时已经转好的 16kHz WAV**（audio_path）。
+    # 以前这里优先拿 original_media_path / source_path（原始视频），每次打开
+    # 项目都要把 2 小时视频重新转一遍——单次 ffmpeg 可能超过 600 秒超时，
+    # 前端就一直卡在"加载中"，同一时刻的删除请求也会因为线程池被占满而失败。
+    # audio_path 本身就是目标格式（16k 单声道 PCM16），直接回它最快。
+    audio_file = project.get("audio_path")
+    audio_path_obj = Path(str(audio_file)) if audio_file else None
+    if audio_path_obj and audio_path_obj.is_file() and audio_path_obj.stat().st_size > 44:
+        source = audio_path_obj
+        need_transcode = False
+    else:
+        candidates = [
+            project.get("original_media_path"),
+            project.get("source_path"),
+        ]
+        source = None
+        for item in candidates:
+            if not item:
+                continue
+            candidate = Path(str(item))
+            if candidate.is_file():
+                source = candidate
+                break
+        need_transcode = True
 
     if source is None:
         raise HTTPException(
@@ -2266,8 +2412,8 @@ def get_source_audio(pid: str) -> FileResponse:
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # 长素材用"轻量预览"：2 小时 WAV 有 200MB+，浏览器要先下载再整体解码成
-    # float32（内存翻倍），很容易把标签页拖死。压成 8kHz/24kbps 单声道 MP3 后
-    # 体积与解码内存都降到 1/4 左右，波形与播放仍然够用。
+    # float32（内存翻倍），很容易把标签页拖死（表现为 decodeAudioData 失败）。
+    # 压成 8kHz/24kbps 单声道 MP3 后体积与解码内存都降到 1/4 左右。
     duration = 0.0
     try:
         duration = _duration_of(project)
@@ -2277,27 +2423,41 @@ def get_source_audio(pid: str) -> FileResponse:
     if duration >= _COMPACT_PREVIEW_MIN_SECONDS:
         compact = cache_dir / "preview_compact.mp3"
         try:
-            fresh = compact.is_file() and compact.stat().st_mtime >= source.stat().st_mtime
+            fresh = (
+                compact.is_file()
+                and compact.stat().st_size > 1024
+                and compact.stat().st_mtime >= source.stat().st_mtime
+            )
         except OSError:
             fresh = False
         if not fresh:
+            # 先写临时文件再改名：避免并发/中断留下半截 MP3 被当成有效缓存，
+            # 那种文件正好会让浏览器报 "Unable to decode audio data"。
+            temp_target = cache_dir / "preview_compact.tmp.mp3"
+            temp_target.unlink(missing_ok=True)
             try:
-                media.convert_to_compact_preview(source, compact)
+                media.convert_to_compact_preview(source, temp_target)
+                temp_target.replace(compact)
             except media.MediaToolError as exc:
+                temp_target.unlink(missing_ok=True)
                 raise HTTPException(
                     status_code=500, detail=f"生成波形预览失败：{exc}"
                 ) from exc
         return FileResponse(
-            str(compact), media_type="audio/mpeg", filename="preview.mp3"
+            str(compact),
+            media_type="audio/mpeg",
+            filename="preview.mp3",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    # 短素材：直接回 16k WAV（若原本就是 WAV 则零转码）
+    if not need_transcode and source.suffix.lower() == ".wav":
+        return FileResponse(
+            str(source), media_type="audio/wav", filename="source.wav"
         )
 
     cache = cache_dir / "source_preview.wav"
-
     try:
-        # 已经是目标格式的 WAV 直接复用，避免重复转码
-        if source.suffix.lower() == ".wav" and source.name.endswith(".wav"):
-            if source.stat().st_size > 44:
-                return FileResponse(str(source), media_type="audio/wav", filename="source.wav")
         media.convert_to_wav16k(source, cache, SAMPLE_RATE)
     except media.MediaToolError as exc:
         raise HTTPException(
@@ -2305,6 +2465,114 @@ def get_source_audio(pid: str) -> FileResponse:
         ) from exc
 
     return FileResponse(str(cache), media_type="audio/wav", filename="source.wav")
+
+
+@app.get(
+    "/api/projects/{pid}/waveform-peaks",
+    summary="取波形峰值（预计算，前端无需解码整段音频）",
+)
+def get_waveform_peaks(
+    pid: str,
+    buckets: int = Query(4000, description="峰值点数量（越大越细，建议 1000–8000）"),
+) -> Dict[str, Any]:
+    """返回归一化波形峰值，供前端直接绘制，避免 ``decodeAudioData`` 整段解码。
+
+    为什么需要这个接口：2 小时音频即使压成 8kHz MP3，浏览器解码到 AudioContext
+    采样率（通常 48kHz）后仍要 ~1.3GB 内存，Chrome 会直接抛
+    ``Unable to decode audio data``。把"画波形"需要的包络在服务端算好（每个桶
+    一个振幅），前端只传几十 KB，任意长度都能画，也顺带让缩放/滚动变轻。
+
+    参数:
+        pid: 项目 id。
+        buckets: 峰值点数量，夹在 ``[200, 20000]``。
+
+    返回:
+        ``{project_id, duration, sample_rate, buckets, peaks: [[float, ...]]}``
+        （``peaks`` 是"每声道一组"的二维结构，与 WaveSurfer 的格式一致）。
+
+    异常:
+        404: 项目不存在；500: 读取音频失败。
+    """
+    buckets = max(200, min(int(buckets), 20000))
+    project = _get_project(pid)
+    audio_file = Path(str(project.get("audio_path") or ""))
+    if not audio_file.is_file():
+        raise HTTPException(
+            status_code=404, detail=f"项目音频不存在：{audio_file}（请重新上传）"
+        )
+
+    cache_dir = OUTPUT_DIR / pid
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = cache_dir / f"peaks_{buckets}.json"
+
+    try:
+        stat = audio_file.stat()
+        fresh = (
+            cache.is_file()
+            and cache.stat().st_size > 2
+            and cache.stat().st_mtime >= stat.st_mtime
+        )
+    except OSError:
+        fresh = False
+
+    if not fresh:
+        try:
+            peaks, duration, rate = _compute_waveform_peaks(audio_file, buckets)
+        except (RuntimeError, OSError) as exc:
+            raise HTTPException(
+                status_code=500, detail=f"计算波形峰值失败：{exc}"
+            ) from exc
+        payload = {
+            "duration": duration,
+            "sample_rate": rate,
+            "buckets": len(peaks),
+            "peaks": [peaks],
+        }
+        temp = cache.with_suffix(".tmp.json")
+        temp.write_text(json.dumps(payload), encoding="utf-8")
+        temp.replace(cache)
+    else:
+        payload = json.loads(cache.read_text(encoding="utf-8"))
+
+    return {
+        "project_id": pid,
+        "duration": payload.get("duration", 0.0),
+        "sample_rate": payload.get("sample_rate", SAMPLE_RATE),
+        "buckets": payload.get("buckets", 0),
+        "peaks": payload.get("peaks", [[]]),
+    }
+
+
+def _compute_waveform_peaks(
+    audio_file: Path, buckets: int
+) -> tuple[List[float], float, int]:
+    """分块读取音频并计算归一化峰值包络，返回 ``(peaks, duration, rate)``。
+
+    分块读（而不是 ``sf.read`` 整段）是为了让 2 小时素材的内存占用保持在
+    几 MB：每次只读一个桶对应的帧数。
+    """
+    peaks: List[float] = []
+    with sf.SoundFile(str(audio_file)) as handle:
+        rate = int(handle.samplerate) or SAMPLE_RATE
+        total = int(handle.frames)
+        if total <= 0:
+            return [], 0.0, rate
+        span = max(1, total // buckets)
+        while True:
+            block = handle.read(span, dtype="float32", always_2d=False)
+            if block is None or len(block) == 0:
+                break
+            array = np.asarray(block)
+            peaks.append(float(np.max(np.abs(array))))
+            if len(peaks) >= buckets:
+                break
+        duration = float(total) / float(rate)
+
+    # 归一化到 0–1：只影响绘制比例，不改变时间轴
+    peak_max = max(peaks) if peaks else 0.0
+    if peak_max > 0:
+        peaks = [min(1.0, value / peak_max) for value in peaks]
+    return peaks, duration, rate
 
 
 @app.get(

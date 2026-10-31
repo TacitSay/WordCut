@@ -56,6 +56,7 @@ import {
   saveProject,
   startTranscription,
   fetchTranscriptionStatus,
+  fetchWaveformPeaks,
 } from './api/client.js'
 
 /** 播放头前进/后退步长（秒）。 */
@@ -71,6 +72,13 @@ const project = ref(null)
 const audioFile = ref(null)
 /** 源音频的 blob URL */
 const audioUrl = ref('')
+/**
+ * 预计算波形峰值（[[0..1...]]）与对应时长。
+ * 交给 WaveformView 直接绘制，避免 WaveSurfer 整段解码——2 小时音频解码到
+ * 48kHz 要 ~1.3GB，浏览器会抛 "Unable to decode audio data"。
+ */
+const waveformPeaks = ref([])
+const waveformDuration = ref(0)
 /** TokenOut[]：{ id, text, start, end, is_deleted, confidence } */
 const tokens = ref([])
 /** SegmentOut[]：{ index, start, end, duration, text, token_ids } */
@@ -514,6 +522,29 @@ async function handleSaveAudioParams() {
   }
 }
 
+/**
+ * 拉取波形峰值（供 WaveformView 直接绘制，不解码音频）。
+ *
+ * 失败不阻断使用：拿不到峰值就退回 WaveSurfer 自己解码（短视频没问题），
+ * 只是会把 errorText 显示在波形区。
+ */
+async function loadWaveformPeaks() {
+  if (!project.value?.id) {
+    waveformPeaks.value = []
+    waveformDuration.value = 0
+    return
+  }
+  try {
+    const data = await fetchWaveformPeaks(project.value.id, 4000)
+    waveformPeaks.value = Array.isArray(data?.peaks) ? data.peaks : []
+    waveformDuration.value = Number(data?.duration) || sourceDuration.value || 0
+  } catch (error) {
+    waveformPeaks.value = []
+    waveformDuration.value = 0
+    console.warn('[waveform] 获取峰值失败，退回解码模式', error)
+  }
+}
+
 /** 重新统计音频指标（源音频 + 当前删除状态下渲染后的成片）。 */
 async function loadAudioInfo() {
   if (!project.value?.id) {
@@ -818,6 +849,7 @@ async function applyProjectDetail(detail) {
   )
   await loadAudioParams()
   await loadAudioInfo()
+  await loadWaveformPeaks()
 }
 
 /** 从项目管理里打开某个已有项目（不用重新上传）。 */
@@ -977,6 +1009,8 @@ function resetProjectState() {
   deletes.value = []
   totalDeleted.value = 0
   exportInfo.value = null
+  waveformPeaks.value = []
+  waveformDuration.value = 0
   history.clear()
   cursorIndex.value = 0
   selectionAnchor.value = null
@@ -1050,6 +1084,7 @@ async function handleUpload() {
     )
     await loadAudioParams()
     await loadAudioInfo()
+    await loadWaveformPeaks()
   } catch (error) {
     setStatus(`上传失败：${error.message}`, 'error')
   } finally {
@@ -1067,7 +1102,16 @@ async function handleTranscribe() {
   transcribing.value = true
   setStatus('正在转写（首次加载模型可能需要十几秒）…', 'busy')
   try {
-    const result = await runTranscriptionJob(project.value.id)
+    // 分段增量：转写过程中每完成一块就把已有词表刷出来，用户不用干等
+    const refreshPartial = async () => {
+      const list = await fetchTokens(project.value.id)
+      tokens.value = Array.isArray(list?.tokens) ? [...list.tokens] : []
+      segments.value = Array.isArray(list?.segments) ? [...list.segments] : []
+      // 注意：增量阶段不改 deletedIds，避免把已保存的删除点冲掉
+    }
+    const result = await runTranscriptionJob(project.value.id, {
+      onPartial: refreshPartial,
+    })
     if (!result) return
 
     const list = await fetchTokens(project.value.id)
@@ -1100,12 +1144,18 @@ async function handleTranscribe() {
  * 改成"启动任务 + 轮询状态"后，界面能显示百分比，网络抖动也不丢进度
  * （结果落在后端数据库里）。
  *
+ * 后端按 10 分钟一块转写，每块完成会把累计词表落库（``partial``）。这里在
+ * 词数明显增长时顺手刷新一次 Token，用户就能"边转边看"，不必等全部跑完。
+ *
  * @param {string} projectId
+ * @param {{ onPartial?: (job: object) => Promise<void> }} [options]
  */
-async function runTranscriptionJob(projectId) {
+async function runTranscriptionJob(projectId, { onPartial } = {}) {
   const started = await startTranscription(projectId)
   let job = started
   let lastPaint = 0
+  let lastPartialWords = 0
+  let lastPartialAt = 0
 
   while (job && job.status === 'running') {
     await new Promise((resolve) => setTimeout(resolve, 1500))
@@ -1126,6 +1176,22 @@ async function runTranscriptionJob(projectId) {
           `（${job.device || 'cpu'}/${job.compute_type || 'int8'}）`,
         'busy',
       )
+    }
+
+    // 分段增量：词数涨了 300+ 且距上次刷新超过 10 秒，就把已有结果先渲染出来
+    if (
+      onPartial &&
+      job.partial &&
+      job.words - lastPartialWords >= 300 &&
+      now - lastPartialAt > 10000
+    ) {
+      lastPartialWords = job.words
+      lastPartialAt = now
+      try {
+        await onPartial(job)
+      } catch {
+        /* 增量刷新失败不影响转写主流程 */
+      }
     }
   }
 
@@ -1271,6 +1337,7 @@ async function applyLoadedProject(loaded) {
   )
   await loadAudioParams()
   await loadAudioInfo()
+  await loadWaveformPeaks()
 }
 
 /** 直接读取工程文件内容并加载（无需绝对路径）。 */
@@ -2016,7 +2083,12 @@ onBeforeUnmount(() => {
       <main class="main-column">
         <!-- L2：波形吸顶固定 180px，不随文本滚动 -->
         <div v-show="waveformVisible" class="wave-dock">
-          <WaveformView :audio-url="audioUrl" :deletes="deletes" />
+          <WaveformView
+            :audio-url="audioUrl"
+            :deletes="deletes"
+            :peaks="waveformPeaks"
+            :duration="waveformDuration"
+          />
         </div>
 
         <!-- I1 / I2：分段文本流，独立滚动 -->

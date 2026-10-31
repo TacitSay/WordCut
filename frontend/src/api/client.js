@@ -218,6 +218,21 @@ export function fetchTranscriptionStatus(projectId) {
 }
 
 /**
+ * GET /api/projects/{pid}/waveform-peaks -> { duration, peaks: [[float...]] }
+ *
+ * 预计算波形峰值：前端直接按峰值绘制，不需要 decodeAudioData 整段解码。
+ * 2 小时音频解码到 48kHz 要 ~1.3GB，浏览器会报 "Unable to decode audio data"。
+ *
+ * @param {string} projectId
+ * @param {number} [buckets] 峰值点数量
+ */
+export function fetchWaveformPeaks(projectId, buckets = 4000) {
+  return request(
+    projectPath(projectId, `/waveform-peaks?buckets=${encodeURIComponent(buckets)}`),
+  )
+}
+
+/**
  * GET /api/projects/{pid}/tokens -> TokenListResponse
  * @param {string} projectId
  */
@@ -440,6 +455,7 @@ export default {
   transcribeProject,
   startTranscription,
   fetchTranscriptionStatus,
+  fetchWaveformPeaks,
   fetchTokens,
   deleteTokens,
   restoreTokens,
