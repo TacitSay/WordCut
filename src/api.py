@@ -1713,6 +1713,12 @@ def _run_transcription(
         else:
             skip = 0
 
+        # 每块内 faster-whisper 的 segment id 都从 0/1 重新开始，
+        # 直接拼起来会出现 seg id 回落（实测 12 块回落 11 次）。
+        # 段落切分依赖"seg 变化 = 换句"，编号冲突会让不同块的同号段被当成同一句，
+        # 因此这里给每块的 seg id 加一个递增基数。
+        seg_base = 0 if not words else max(int(w.get("seg") or 0) for w in words) + 1
+
         with sf.SoundFile(str(audio_path)) as handle:
             if skip > 0:
                 handle.seek(min(skip, len(handle)))
@@ -1723,9 +1729,13 @@ def _run_transcription(
                     break
                 offset = index * _TRANSCRIBE_CHUNK_SECONDS
                 part = transcribe_once(np.asarray(block), audio_duration, offset)
+                chunk_max_seg = 0
                 for item in part:
                     item["start"] += offset
                     item["end"] += offset
+                    item["seg"] = int(item.get("seg") or 0) + seg_base
+                    chunk_max_seg = max(chunk_max_seg, int(item["seg"]))
+                seg_base = chunk_max_seg + 1
                 # 续转起点落在块中间：丢掉已转写过的部分，避免重复词
                 if index == start_index and resume_from > 0.0:
                     part = [w for w in part if w["start"] >= resume_from]
