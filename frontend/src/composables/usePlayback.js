@@ -152,6 +152,40 @@ export function zoomToFit() {
   return zoomTo(0)
 }
 
+/**
+ * 读取当前横向滚动位置（像素）。
+ *
+ * 为什么不用 `container.scrollLeft`：WaveSurfer v7/v8 把波形渲染在 **shadow DOM**
+ * 里，真正的滚动容器是它内部的 `.scroll` 元素，外层容器永远 scrollLeft=0、
+ * scrollWidth=clientWidth。读外层会得到"一直是全宽"，表现就是缩放条不变化。
+ */
+export function getScroll() {
+  if (!wave) return 0
+  try {
+    return Number(wave.getScroll()) || 0
+  } catch {
+    return 0
+  }
+}
+
+/** 设置横向滚动位置（像素）。 */
+export function setScroll(pixels) {
+  if (!wave) return
+  try {
+    wave.setScroll(Math.max(0, Number(pixels) || 0))
+  } catch {
+    /* 忽略滚动异常 */
+  }
+}
+
+/** 波形内容的像素总宽（= 时长 × 每秒像素）。 */
+export function getScrollWidth() {
+  const duration = playbackState.duration
+  const perSec = playbackState.pxPerSec
+  if (!(duration > 0) || !(perSec > 0)) return 0
+  return duration * perSec
+}
+
 /** 按当前删除区间重绘红色区域（未 ready 时跳过，ready 事件里会再调）。 */
 function renderRegions() {
   const plugin = regions
@@ -487,6 +521,9 @@ let sharedApi = null
  * @returns {{
  *   state: object,
  *   attach: (container: HTMLElement|null, url: string, options?: object) => object|null,
+ *   getScroll: () => number,
+ *   setScroll: (pixels: number) => void,
+ *   getScrollWidth: () => number,
  *   detach: () => void,
  *   play: () => boolean,
  *   pause: () => boolean,
@@ -528,6 +565,9 @@ export function usePlayback() {
       zoomTo,
       zoomBy,
       zoomToFit,
+      getScroll,
+      setScroll,
+      getScrollWidth,
       setDeletes,
       isPlaying,
       getCurrentTime,

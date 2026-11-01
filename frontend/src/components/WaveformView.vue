@@ -47,6 +47,9 @@ const {
   zoomBy,
   zoomTo,
   zoomToFit,
+  getScroll,
+  setScroll,
+  getScrollWidth,
 } = usePlayback()
 
 /**
@@ -76,23 +79,28 @@ const zoomLabel = computed(() => {
   return `${ratio.toFixed(1)}×`
 })
 
-/** 读取容器的滚动尺寸（scroll 事件、缩放后、resize 时调用）。 */
+/**
+ * 同步缩放条所需的滚动信息。
+ *
+ * 注意数据来源：滚动位置用 WaveSurfer 的 `getScroll()`，总宽用
+ * `时长 × 每秒像素`。**不能**读外层容器的 scrollLeft/scrollWidth——波形渲染在
+ * shadow DOM 里，外层永远 scrollLeft=0、scrollWidth=clientWidth，
+ * 那样缩放条就永远显示"全宽"，拖动也不会有反应。
+ */
 function syncScroll() {
   const element = container.value
   if (!element) return
+  const total = getScrollWidth() || element.clientWidth
   scroll.value = {
-    left: element.scrollLeft,
+    left: getScroll(),
     width: element.clientWidth,
-    total: element.scrollWidth,
+    total,
   }
 }
 
 /** 把视野窗滚到指定时间区间。 */
 function scrollToTime(startSeconds, pxPerSec) {
-  const element = container.value
-  if (!element) return
-  const target = Math.max(0, startSeconds * pxPerSec)
-  element.scrollLeft = target
+  setScroll(Math.max(0, startSeconds * pxPerSec))
   // 下一帧再同步一次：WaveSurfer 的滚动是异步落位的
   requestAnimationFrame(syncScroll)
   syncScroll()
@@ -112,14 +120,13 @@ let dragMoved = false
 /** 当前视野对应的时间区间（秒）。 */
 function visibleRange() {
   const element = container.value
-  if (!element || !state.duration || element.scrollWidth <= 0) {
+  const total = getScrollWidth()
+  if (!element || !state.duration || total <= 0) {
     return { start: 0, end: state.duration || 0 }
   }
-  const perPx = state.duration / element.scrollWidth
-  return {
-    start: element.scrollLeft * perPx,
-    end: (element.scrollLeft + element.clientWidth) * perPx,
-  }
+  const perPx = element.clientWidth / total // 可见宽度（像素）对应的时长比例
+  const start = (getScroll() / total) * state.duration
+  return { start, end: Math.min(state.duration, start + perPx * state.duration) }
 }
 
 function beginDrag(event, mode) {
@@ -153,15 +160,15 @@ function onBarPointerMove(event) {
   if (duration <= 0) return
 
   if (dragMode === 'window') {
-    // 平移：窗口左移多少秒，就滚多少秒
+    // 平移：窗口移动多少秒，视野就跟着走多少秒（不改变缩放）
     const shift = pixelsToSeconds(dx)
     const range = dragStartRange.end - dragStartRange.start
     const start = Math.min(
       Math.max(0, dragStartRange.start + shift),
       Math.max(0, duration - range),
     )
-    const pxPerSec = containerEl.clientWidth / Math.max(1e-6, range)
-    scrollToTime(start, pxPerSec)
+    const perSec = range > 0 ? containerEl.clientWidth / range : 1
+    scrollToTime(start, perSec)
     return
   }
 
@@ -238,9 +245,18 @@ function mount(url) {
   if (instance) {
     instance.on('ready', () => {
       emit('ready', state.duration)
-      // 峰值模式下按容器宽度先"适应"，之后交给用户的缩放操作
-      if (hasPeaks) zoomToFit()
+      // 先"适应宽度"，把每秒像素（pxPerSec）确定下来——缩放条要按它算视野窗，
+      // 否则 pxPerSec=0 时缩放条永远显示"全宽"。
+      zoomToFit()
+      requestAnimationFrame(syncScroll)
     })
+    // 横向滚动（拖缩放条、autoScroll 跟随播放、滚轮）都同步到缩放条。
+    // WaveSurfer 会给出 (可见起点, 可见终点, scrollLeft, scrollRight)，
+    // 这里只用它触发重算，具体数值统一由 syncScroll 从 API 读，避免两套口径。
+    instance.on('scroll', () => syncScroll())
+    instance.on('zoom', () => requestAnimationFrame(syncScroll))
+    instance.on('resize', () => requestAnimationFrame(syncScroll))
+    instance.on('redrawcomplete', () => syncScroll())
   }
 }
 
@@ -275,23 +291,21 @@ function onWheel(event) {
 
   if (event.ctrlKey || event.altKey) {
     event.preventDefault()
-    // 记录指针位置对应的比例，缩放后把同一位置滚回视野
+    // 记录指针位置对应的时间点，缩放后把同一时间点滚回指针下方
     const rect = element.getBoundingClientRect()
     const ratio = rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0.5
-    const before = element.scrollLeft + element.clientWidth * ratio
-    const timeAtPointer =
-      state.duration > 0 && element.scrollWidth > 0
-        ? ((element.scrollLeft + element.clientWidth * ratio) / element.scrollWidth) *
-          state.duration
-        : 0
+    const { start, end } = visibleRange()
+    const timeAtPointer = start + (end - start) * ratio
+    const anchorOffset = element.clientWidth * ratio
 
     zoomBy(event.deltaY < 0 ? 1.25 : 0.8)
 
     requestAnimationFrame(() => {
-      if (!element.scrollWidth) return
-      const targetLeft =
-        state.duration > 0 ? (timeAtPointer / state.duration) * element.scrollWidth : before
-      element.scrollLeft = Math.max(0, targetLeft - element.clientWidth * ratio)
+      const total = getScrollWidth()
+      if (!total || state.duration <= 0) return
+      const targetLeft = (timeAtPointer / state.duration) * total - anchorOffset
+      setScroll(Math.max(0, targetLeft))
+      syncScroll()
     })
     return
   }
@@ -299,7 +313,8 @@ function onWheel(event) {
   if (!state.zoomed) return // 未放大时没有可滚动内容
   if (event.deltaY === 0 && event.deltaX === 0) return
   event.preventDefault()
-  element.scrollLeft += event.deltaY !== 0 ? event.deltaY : event.deltaX
+  const delta = event.deltaY !== 0 ? event.deltaY : event.deltaX
+  setScroll(getScroll() + delta)
 }
 
 onMounted(() => {
@@ -537,9 +552,8 @@ defineExpose({
   border: 1px solid var(--border);
   border-radius: 4px;
   box-sizing: border-box;
-  /* 放大后可横向滚动；未放大时没有滚动内容，行为不变 */
-  overflow-x: auto;
-  overflow-y: hidden;
+  /* 横向滚动由 WaveSurfer 内部滚动层负责，外层不要再滚，否则双滚动条 */
+  overflow: hidden;
 }
 
 /* ---------------- Audition 式缩放条 ---------------- */
