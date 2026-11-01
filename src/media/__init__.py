@@ -23,7 +23,7 @@ from .ffmpeg_bin import (
 )
 from .probe import MediaInfo, MediaStream, probe
 from .separator import separate_vocals
-from .video import concat_av, cut_video
+from .video import concat_av, cut_video, encode_audio_aac, mux_av
 
 __all__ = [
     "probe",
@@ -35,6 +35,8 @@ __all__ = [
     "separate_vocals",
     "cut_video",
     "concat_av",
+    "mux_av",
+    "encode_audio_aac",
     "MediaToolError",
     "resolve_ffmpeg",
     "resolve_ffprobe",

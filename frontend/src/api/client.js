@@ -364,6 +364,31 @@ export function exportProject(projectId, options = {}) {
 }
 
 /**
+ * POST /api/projects/{pid}/export/start -> ExportJobResponse
+ *
+ * 启动异步导出（长视频必需），返回任务 id 供轮询。
+ * @param {string} projectId
+ * @param {object} [options]
+ */
+export function startExport(projectId, options = {}) {
+  const body = {
+    audio_format: options.audio_format ?? 'wav',
+    export_video: Boolean(options.export_video),
+    video_mode: options.video_mode ?? 'precise',
+  }
+  if (options.audio_params) body.audio_params = options.audio_params
+  return request(projectPath(projectId, '/export/start'), { method: 'POST', body })
+}
+
+/**
+ * GET /api/projects/{pid}/export/status -> ExportJobResponse
+ * @param {string} projectId
+ */
+export function fetchExportStatus(projectId) {
+  return request(projectPath(projectId, '/export/status'))
+}
+
+/**
  * GET /api/projects/{pid}/audio-params -> AudioParamsResponse
  *
  * 读取项目已保存的音频后处理参数（增益 / 标准化 / 淡入淡出）。
@@ -460,6 +485,8 @@ export default {
   deleteTokens,
   restoreTokens,
   exportProject,
+  startExport,
+  fetchExportStatus,
   previewSubtitle,
   fetchAudioParams,
   saveAudioParams,

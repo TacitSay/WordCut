@@ -39,7 +39,8 @@ import {
   deleteTokens,
   detectSilences,
   exportFileUrl,
-  exportProject,
+  startExport,
+  fetchExportStatus,
   fetchAudioInfo,
   fetchAudioParams,
   fetchAudition,
@@ -1459,7 +1460,9 @@ async function handleExportConfirm(options) {
     'busy',
   )
   try {
-    const result = await exportProject(project.value.id, options)
+    // 异步导出：先启动任务，再轮询阶段/进度，避免长视频导出时界面像卡死
+    const result = await runExportJob(project.value.id, options)
+    if (!result) return
     exportInfo.value = result
     const total = Number(result?.total_deleted)
     if (Number.isFinite(total)) totalDeleted.value = total
@@ -1488,9 +1491,50 @@ async function handleExportConfirm(options) {
   }
 }
 
+/**
+ * 跑一次异步导出并轮询进度，返回导出结果；失败返回 null。
+ *
+ * 2 小时视频导出要重编码上千个片段（实测 2–4 分钟）。同步等待时界面完全没有
+ * 反馈，容易被当成卡死；改成"启动 + 轮询"后，状态栏能显示当前阶段与百分比。
+ *
+ * @param {string} projectId
+ * @param {object} options 导出选项
+ */
+async function runExportJob(projectId, options) {
+  const started = await startExport(projectId, options)
+  let job = started
+  const stageNames = {
+    audio: '渲染/编码音频',
+    video: '裁剪视频',
+    mux: '合流音视频',
+    done: '完成',
+  }
+
+  while (job && job.status === 'running') {
+    await new Promise((resolve) => setTimeout(resolve, 700))
+    try {
+      job = await fetchExportStatus(projectId)
+    } catch (error) {
+      if (error?.status === 404) throw error
+      continue
+    }
+    const stage = stageNames[job.stage] || job.stage
+    const pct = Math.round(Number(job.progress || 0) * 100)
+    setStatus(
+      `正在导出：${stage} ${pct}% · ${Number(job.elapsed_seconds).toFixed(0)}s（可继续操作，完成后会自动保存）`,
+      'busy',
+    )
+  }
+
+  if (job?.status === 'error') {
+    setStatus(`导出失败：${job.error || '未知错误'}`, 'error')
+    return null
+  }
+  return job?.result || null
+}
+
 /** 把服务端产出的文件取回浏览器，让用户选择保存目录后写入本地。 */
-async function saveExportFilesToUser(result) {
-  const paths = result?.paths || {}
+async function saveExportFilesToUser(result) {  const paths = result?.paths || {}
   const order = ['audio_path', 'srt_path', 'edl_path', 'video_path']
 
   // 支持选择目录的浏览器（Chrome / Edge）：一次选目录，全部写入

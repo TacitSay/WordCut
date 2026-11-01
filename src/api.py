@@ -1031,6 +1031,7 @@ def _export_video(
     mode: str,
     output_dir: Path,
     basename: str,
+    on_stage: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """按 EDL 剪视频并与剪辑后音频合流，返回性能数据与输出路径。
 
@@ -1062,8 +1063,43 @@ def _export_video(
         final_path = output_dir / f"{basename}.mp4"
 
         try:
-            cut_info = media.cut_video(source_path, list(deletes), cut_path, mode=mode)
-            media.concat_av(cut_path, target_audio, final_path)
+            # 音频 AAC 编码与视频裁剪并行：视频走 GPU 编码、音频走 CPU，
+            # 2 小时素材能省掉约 100 秒的串行等待。
+            aac_path = workdir / "audio.m4a"
+            audio_error: List[Any] = []
+
+            def _encode_audio() -> None:
+                try:
+                    media.encode_audio_aac(target_audio, aac_path)
+                except Exception as exc:  # noqa: BLE001 - 失败就走串行兜底
+                    audio_error.append(exc)
+
+            audio_thread = threading.Thread(target=_encode_audio, daemon=True)
+            audio_thread.start()
+
+            cut_info = media.cut_video(
+                source_path,
+                list(deletes),
+                cut_path,
+                mode=mode,
+                on_progress=(
+                    (lambda done, total, kept: on_stage("video", 0.4 + 0.5 * (done / max(1, total))))
+                    if on_stage is not None
+                    else None
+                ),
+            )
+            audio_thread.join()
+            if on_stage is not None:
+                try:
+                    on_stage("mux", 0.9)
+                except Exception:  # noqa: BLE001
+                    pass
+            if aac_path.is_file() and not audio_error:
+                # 音频已编码好：合流只做流复制，几秒完成
+                media.mux_av(cut_path, aac_path, final_path)
+            else:
+                # 兜底：现场编码 AAC（会慢约 100 秒，但保证能出片）
+                media.concat_av(cut_path, target_audio, final_path)
         except ValueError as exc:
             raise HTTPException(
                 status_code=400, detail=f"视频导出失败：{exc}"
@@ -1988,22 +2024,30 @@ def restore_tokens(pid: str, payload: TokenIdsRequest) -> EditStateResponse:
     summary="导出剪辑结果",
 )
 def export_project(pid: str, payload: Optional[ExportRequest] = None) -> ExportResponse:
-    """调用 :func:`pipeline.run_pipeline` 导出音频 / 字幕 / EDL 三件套。
+    """同步导出（保留给脚本/测试；前端用异步任务版以显示进度）。"""
+    return _execute_export(pid, payload or ExportRequest())
 
-    输出写入 ``outputs/{project_id}/``（不变量 1：源音频只读，剪辑结果是新副本）。
+
+def _execute_export(
+    pid: str,
+    options: ExportRequest,
+    on_stage: Optional[Any] = None,
+) -> ExportResponse:
+    """真正执行导出：音频渲染/编码 → （可选）视频裁剪 → 合流。
 
     参数:
-        pid: 项目 id。
-
-    返回:
-        ``{project_id, output_duration, paths, token_count, deleted_count,
-        total_deleted}``，``paths`` 为绝对路径字符串映射。
-
-    异常:
-        400：尚未转写，或删除后没有任何保留区间；
-        404：项目不存在；500：读写 / 渲染失败。
+        on_stage: 可选回调 ``(stage: str, fraction: float) -> None``，
+            ``stage`` ∈ ``{"audio", "video", "mux"}``，供异步任务上报进度。
     """
-    options = payload or ExportRequest()
+
+    def report(stage: str, fraction: float) -> None:
+        if on_stage is None:
+            return
+        try:
+            on_stage(stage, max(0.0, min(1.0, float(fraction))))
+        except Exception:  # noqa: BLE001 - 进度回调绝不影响导出
+            pass
+
     audio_format = (options.audio_format or "wav").lower().lstrip(".")
     if audio_format not in _EXPORT_AUDIO_FORMATS:
         raise HTTPException(
@@ -2014,6 +2058,7 @@ def export_project(pid: str, payload: Optional[ExportRequest] = None) -> ExportR
             ),
         )
 
+    report("audio", 0.02)
     project = _get_project(pid)
     words = _require_words(project)
     deleted_ids = _snapshot_deleted_ids(project)
@@ -2049,6 +2094,7 @@ def export_project(pid: str, payload: Optional[ExportRequest] = None) -> ExportR
         raise HTTPException(
             status_code=500, detail=f"导出落盘失败：{exc}"
         ) from exc
+    report("audio", 0.4)
 
     raw_paths = result.get("paths") or {}
     paths: Dict[str, str] = {
@@ -2075,8 +2121,10 @@ def export_project(pid: str, payload: Optional[ExportRequest] = None) -> ExportR
             mode=options.video_mode,
             output_dir=output_dir,
             basename=f"{pid}_cut",
+            on_stage=on_stage,
         )
         paths["video_path"] = video_info.pop("path")
+    report("done", 1.0)
 
     return ExportResponse(
         project_id=pid,
@@ -2091,9 +2139,156 @@ def export_project(pid: str, payload: Optional[ExportRequest] = None) -> ExportR
     )
 
 
+class ExportJobResponse(BaseModel):
+    """异步导出任务的状态。"""
+
+    job_id: str = Field(..., description="任务 id")
+    project_id: str = Field(..., description="项目 id")
+    status: str = Field(..., description="running / done / error")
+    stage: str = Field("audio", description="当前阶段：audio / video / mux / done")
+    progress: float = Field(0.0, description="进度 0–1")
+    elapsed_seconds: float = Field(0.0, description="已运行秒数")
+    result: Optional[ExportResponse] = Field(None, description="完成后的导出结果")
+    error: str = Field("", description="失败原因")
+
+
+#: 异步导出任务：job_id -> 状态；以及每个项目最近一次任务。
+_export_jobs: Dict[str, Dict[str, Any]] = {}
+_export_latest: Dict[str, str] = {}
+_EXPORT_JOBS_LOCK: threading.Lock = threading.Lock()
+
+#: 导出串行化：同时跑两个导出会抢 CPU/GPU，且会互相覆盖同目录产物。
+_EXPORT_EXEC_LOCK: threading.Lock = threading.Lock()
+
+
+def _export_job_snapshot(job: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "job_id": job["job_id"],
+        "project_id": job["project_id"],
+        "status": job["status"],
+        "stage": job["stage"],
+        "progress": round(float(job["progress"]), 4),
+        "elapsed_seconds": round(float(job["elapsed_seconds"]), 2),
+        "result": job.get("result"),
+        "error": str(job["error"]),
+    }
+
+
+def _run_export_job(job_id: str, pid: str, options: ExportRequest) -> None:
+    """后台线程：执行导出并持续更新阶段/进度。"""
+    started = time.perf_counter()
+
+    def on_stage(stage: str, fraction: float) -> None:
+        with _EXPORT_JOBS_LOCK:
+            job = _export_jobs.get(job_id)
+            if job is None:
+                return
+            # 阶段只能前进：audio → video → mux → done
+            order = {"audio": 0, "video": 1, "mux": 2, "done": 3}
+            if order.get(stage, 0) >= order.get(job["stage"], 0):
+                job["stage"] = stage
+            job["progress"] = max(float(job["progress"]), float(fraction))
+            job["elapsed_seconds"] = time.perf_counter() - started
+
+    try:
+        with _EXPORT_EXEC_LOCK:
+            result = _execute_export(pid, options, on_stage)
+        with _EXPORT_JOBS_LOCK:
+            job = _export_jobs.get(job_id)
+            if job is not None:
+                job.update(
+                    status="done",
+                    stage="done",
+                    progress=1.0,
+                    result=result,
+                    elapsed_seconds=time.perf_counter() - started,
+                )
+    except HTTPException as exc:
+        with _EXPORT_JOBS_LOCK:
+            job = _export_jobs.get(job_id)
+            if job is not None:
+                job.update(
+                    status="error",
+                    error=str(exc.detail),
+                    elapsed_seconds=time.perf_counter() - started,
+                )
+    except Exception as exc:  # noqa: BLE001 - 后台线程不能抛
+        with _EXPORT_JOBS_LOCK:
+            job = _export_jobs.get(job_id)
+            if job is not None:
+                job.update(
+                    status="error",
+                    error=f"导出失败：{exc}",
+                    elapsed_seconds=time.perf_counter() - started,
+                )
+
+
+@app.post(
+    "/api/projects/{pid}/export/start",
+    response_model=ExportJobResponse,
+    summary="启动异步导出（长视频必需，返回任务 id 供轮询）",
+)
+def start_export(pid: str, payload: Optional[ExportRequest] = None) -> ExportJobResponse:
+    """启动后台导出并立刻返回任务 id。
+
+    为什么需要异步：2 小时视频导出要重编码上千个片段，实测 2–4 分钟；同步请求
+    期间前端完全没有反馈，看起来像卡死。异步任务把阶段（音频/视频/合流）与
+    进度暴露出来，断开页面也能在状态接口里查到结果。
+
+    异常:
+        404: 项目不存在；409: 该项目已有导出任务在跑。
+    """
+    _get_project(pid)
+    options = payload or ExportRequest()
+
+    with _EXPORT_JOBS_LOCK:
+        latest = _export_latest.get(pid)
+        if latest:
+            running = _export_jobs.get(latest)
+            if running is not None and running["status"] == "running":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"项目 {pid} 已有导出任务在进行（job {latest}）",
+                )
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "job_id": job_id,
+            "project_id": pid,
+            "status": "running",
+            "stage": "audio",
+            "progress": 0.0,
+            "elapsed_seconds": 0.0,
+            "result": None,
+            "error": "",
+        }
+        _export_jobs[job_id] = job
+        _export_latest[pid] = job_id
+        snapshot = _export_job_snapshot(job)
+
+    threading.Thread(
+        target=_run_export_job, args=(job_id, pid, options), daemon=True
+    ).start()
+    return ExportJobResponse(**snapshot)
+
+
+@app.get(
+    "/api/projects/{pid}/export/status",
+    response_model=ExportJobResponse,
+    summary="查询异步导出进度",
+)
+def get_export_status(pid: str) -> ExportJobResponse:
+    """返回该项目最近一次导出任务的状态；没有任务时 404。"""
+    _get_project(pid)
+    with _EXPORT_JOBS_LOCK:
+        job_id = _export_latest.get(pid)
+        job = _export_jobs.get(job_id) if job_id else None
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"项目 {pid} 没有导出任务记录")
+        return ExportJobResponse(**_export_job_snapshot(job))
+
+
 class ProjectFileResponse(BaseModel):
     """POST /api/projects/{pid}/project-file 的响应：可直接写盘的工程文档。"""
-
     document: Dict[str, Any] = Field(
         ..., description="完整工程文档（与 .wcproj 内容一致）"
     )

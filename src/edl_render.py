@@ -192,23 +192,67 @@ def render(
         # 全部删光：输出与源等长的静音，保持时长语义不退化。
         return np.zeros(total_samples, dtype=np.float32)
 
-    result: np.ndarray = np.zeros(0, dtype=np.float32)
-    for piece_index, (start_idx, end_idx) in enumerate(pieces):
+    # ------------------------------------------------------------------
+    # 预分配 + 原地写入
+    #
+    # 旧实现是循环里 `np.concatenate((result, piece))`：每一步都整段复制一次
+    # 已累积结果，N 个剪辑点就是 O(N × 总样本数)。实测 30 分钟 / 2000 段要
+    # 91.6 秒，2 小时素材很容易超过 5 分钟。
+    #
+    # 现在先算出总长度、一次性分配，再按位置写入；交叉淡化只在重叠的那几百个
+    # 样本上做向量运算。整体复杂度回到 O(总样本数)。
+    # ------------------------------------------------------------------
+    # 先模拟一遍，求出每处连接的实际淡化长度与最终总长
+    fade_lengths: List[int] = []
+    total_len = pieces[0][1] - pieces[0][0]
+    for piece_index in range(1, len(pieces)):
+        start_idx, end_idx = pieces[piece_index]
+        piece_len = end_idx - start_idx
+        prev_end = pieces[piece_index - 1][1]
+        if joins[piece_index - 1] or start_idx <= prev_end or fade <= 0:
+            fade_lengths.append(0)
+            total_len += piece_len
+        else:
+            current = min(fade, total_len, piece_len)
+            fade_lengths.append(current)
+            total_len += piece_len - current
+
+    result = np.empty(total_len, dtype=np.float32)
+    write_at = 0
+    first_start, first_end = pieces[0]
+    first_piece = np.asarray(source[first_start:first_end], dtype=np.float32)
+    result[: first_piece.size] = first_piece
+    write_at = first_piece.size
+
+    for piece_index in range(1, len(pieces)):
+        start_idx, end_idx = pieces[piece_index]
         piece = np.asarray(source[start_idx:end_idx], dtype=np.float32)
-        if piece_index == 0:
-            result = piece.copy()
+        fade_len = fade_lengths[piece_index - 1]
+
+        if fade_len <= 0:
+            result[write_at : write_at + piece.size] = piece
+            write_at += piece.size
             continue
 
-        prev_end = pieces[piece_index - 1][1]
-        if joins[piece_index - 1] or start_idx <= prev_end:
-            # 源轴上连续（只是被取整切开了），直接接回去。
-            result = np.concatenate((result, piece))
-        else:
-            result = np.asarray(
-                crossfade(result, piece, fade_samples=fade), dtype=np.float32
-            )
+        # 等功率交叉淡化：与 cut_refine.crossfade 完全一致的权重
+        # t 取 [0,1) 上 fade_len 个等分点；w_a=cos，w_b=sin，满足 w_a²+w_b²=1
+        t = np.arange(fade_len, dtype=np.float64) / float(fade_len)
+        weight_a = np.cos(t * np.pi / 2.0)
+        weight_b = np.sin(t * np.pi / 2.0)
 
-    return np.ascontiguousarray(result, dtype=np.float32)
+        tail_start = write_at - fade_len
+        blended = (
+            result[tail_start:write_at].astype(np.float64) * weight_a
+            + piece[:fade_len].astype(np.float64) * weight_b
+        )
+        result[tail_start:write_at] = blended.astype(np.float32)
+        # 淡化区之后的剩余部分直接接上
+        rest = piece[fade_len:]
+        if rest.size:
+            result[write_at : write_at + rest.size] = rest
+        write_at += rest.size
+
+    return np.ascontiguousarray(result[:write_at], dtype=np.float32)
 
 
 def render_edl(
