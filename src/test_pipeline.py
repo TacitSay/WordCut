@@ -46,9 +46,25 @@ check(f"单个删除区间({len(spans)})", len(spans) == 1 and spans[0].start ==
 spans2 = build_deletes(tokens, {'t00000','t00001'}, pause_merge=0.5)
 check(f"相邻合并({len(spans2)})", len(spans2) == 1 and spans2[0].start == 0.0 and spans2[0].end == 0.8)
 
-# 4. 不合并(默认 pause_merge=0.0)
+# 4. 连片删除：词序相邻的被删词默认合并成一段（不再留词间空隙）
 spans3 = build_deletes(tokens, {'t00000','t00001'})
-check(f"默认不合并({len(spans3)})", len(spans3) == 2)
+check(f"连片默认合并({len(spans3)})", len(spans3) == 1)
+check(
+    f"连片区间覆盖首尾({spans3[0].start}-{spans3[0].end})",
+    spans3[0].start == 0.0 and abs(spans3[0].end - 0.8) < 1e-9,
+)
+
+# 4b. merge_gaps=0 可退回"逐词各删一段"
+spans3b = build_deletes(tokens, {'t00000','t00001'}, merge_gaps=0.0)
+check(f"merge_gaps=0 不合并({len(spans3b)})", len(spans3b) == 2)
+
+# 4c. 中间夹着保留词时**不能**合并（否则会连没删的词一起剪掉）
+spans4 = build_deletes(tokens, {'t00000','t00002'})
+check(f"跨保留词不合并({len(spans4)})", len(spans4) == 2)
+
+# 4d. 词序相邻但间隔超过阈值（长静默）不合并
+spans5 = build_deletes(tokens, {'t00003','t00004'})
+check(f"超阈值不合并({len(spans5)})", len(spans5) == 2)
 
 tmp = Path(tempfile.mkdtemp(prefix='wordcut_pipe_'))
 try:

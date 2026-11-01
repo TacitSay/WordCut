@@ -40,6 +40,13 @@ __all__ = [
 #: Token id 前缀，后接 5 位以上十进制序号（``t00000``、``t00001``……）。
 TOKEN_ID_PREFIX: str = "t"
 
+#: 连片删除的合并阈值（秒）：词序上连续的两个被删词，间隔不超过它就并成一段。
+#:
+#: 为什么需要：删除整句时若逐词各删一段，词间停顿（常见 0.05–0.3 秒）会留在
+#: 成片里，听感上是一串"碎空隙"。0.6 秒能覆盖正常语流内的停顿，又不会把真正的
+#: 长静默（>0.6s，通常是换段/换人）一并吞掉。
+DEFAULT_MERGE_GAPS: float = 0.6
+
 #: 报错时最多列举的 id 个数，避免几千个 id 撑爆错误信息。
 _MAX_LISTED_IDS: int = 50
 
@@ -128,6 +135,7 @@ def build_deletes(
     tokens: Sequence[Token],
     deleted_ids: Iterable[str],
     pause_merge: float = 0.0,
+    merge_gaps: float = DEFAULT_MERGE_GAPS,
 ) -> List[DeleteSpan]:
     """把被删 Token 转成删除区间，并按需合并被短停顿隔开的相邻删除。
 
@@ -155,6 +163,7 @@ def build_deletes(
         ValueError: ``pause_merge`` 为负、NaN 或无穷大。
     """
     pause = _as_non_negative_float(pause_merge, "pause_merge")
+    merge = _as_non_negative_float(merge_gaps, "merge_gaps")
     ids: Set[str] = set(deleted_ids) if deleted_ids else set()
     if not ids:
         return []
@@ -171,17 +180,36 @@ def build_deletes(
     # 按时间排序后再合并，保证「相邻」指的是时间上的相邻。
     selected.sort(key=lambda item: (item.start, item.end))
 
+    # ------------------------------------------------------------------
+    # 第一遍：连片合并
+    #
+    # 删除一整句话时，逐词生成的区间之间夹着词间停顿（每处几十到几百毫秒）。
+    # 如果只按 token 区间删，成片里会留下一串"碎空隙"，听起来像被剪碎的。
+    # 这里把**词序上连续、且时间间隔 ≤ merge_gaps** 的被删词并成一段
+    # [首个词起点, 末个词终点]，中间停顿一并剪掉。
+    #
+    # 只在"中间没有被保留的词"时合并——否则会把没删的词连声一起剪掉。
+    # ------------------------------------------------------------------
+    ordered = sorted(tokens, key=lambda item: (item.start, item.end))
     spans: List[DeleteSpan] = []
-    for token in selected:
-        if spans and token.start - spans[-1].end < pause:
+    previous_deleted = False
+    for token in ordered:
+        if token.id not in ids:
+            previous_deleted = False
+            continue
+        if (
+            previous_deleted
+            and spans
+            and merge > 0.0
+            and token.start - spans[-1].end <= merge
+        ):
             last = spans[-1]
-            if token.end > last.end:
-                spans[-1] = DeleteSpan(
-                    start=last.start,
-                    end=token.end,
-                    token_id=last.token_id,
-                    cause="word",
-                )
+            spans[-1] = DeleteSpan(
+                start=last.start,
+                end=max(last.end, token.end),
+                token_id=last.token_id,
+                cause="word",
+            )
         else:
             spans.append(
                 DeleteSpan(
@@ -191,6 +219,28 @@ def build_deletes(
                     cause="word",
                 )
             )
+        previous_deleted = True
+
+    # ------------------------------------------------------------------
+    # 第二遍：可选的"按时间间隔合并"（pause_merge）
+    #
+    # 与第一遍的区别：这里**不要求词序相邻**，只要两段间隔小于阈值就合并。
+    # 用于"把删掉内容后面那段短停顿也一起剪掉"这类更强硬的清理；默认关闭。
+    # ------------------------------------------------------------------
+    if pause > 0.0 and len(spans) > 1:
+        merged: List[DeleteSpan] = [spans[0]]
+        for span in spans[1:]:
+            last = merged[-1]
+            if span.start - last.end < pause:
+                merged[-1] = DeleteSpan(
+                    start=last.start,
+                    end=max(last.end, span.end),
+                    token_id=last.token_id,
+                    cause="word",
+                )
+            else:
+                merged.append(span)
+        spans = merged
 
     spans.sort(key=lambda span: (span.start, span.end))
     return spans

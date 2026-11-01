@@ -63,6 +63,12 @@ import {
 /** 播放头前进/后退步长（秒）。 */
 const SEEK_STEP = 2
 
+/**
+ * 连片删除的合并阈值（秒），与后端 `pipeline.DEFAULT_MERGE_GAPS` 保持一致。
+ * 词序上连续的被删词间隔不超过它，就并成一段，词间停顿一并剪掉。
+ */
+const MERGE_GAPS = 0.6
+
 // ----------------------------------------------------------------------
 // 状态
 // ----------------------------------------------------------------------
@@ -567,15 +573,44 @@ async function loadAudioInfo() {
  * 由 Token 列表 + 被删 id 反推删除区间（本地近似，仅用于首屏重绘）。
  * 之后每次删除 / 恢复都以后端 EditStateResponse.deletes 为准。
  */
+/**
+ * 由"被删 id 集合"算出删除区间（与后端 pipeline.build_deletes 保持同样的合并规则）。
+ *
+ * 关键点：**连片删除要合并成一段**。删除一整句话时，如果每个词各删一段，
+ * 词间那几十毫秒的停顿会留在成片里，听起来像被剪成碎块。这里的规则是：
+ * 词序上连续、且时间间隔 ≤ MERGE_GAPS 的被删词并成 [首词起点, 末词终点]；
+ * 中间隔着保留词则绝不合并（否则会把没删的词连声音一起剪掉）。
+ *
+ * @param {Array} list Token 列表（按词序）
+ * @param {Array<string>} ids 被删 Token id
+ */
 function buildDeletesFromTokens(list, ids) {
   const set = new Set(ids)
   const spans = []
+  let previousDeleted = false
+
   for (const token of list) {
-    if (!set.has(token.id)) continue
+    if (!set.has(token.id)) {
+      previousDeleted = false
+      continue
+    }
     const start = Number(token.start)
     const end = Number(token.end)
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue
-    spans.push({ start, end, token_id: token.id, cause: 'word' })
+
+    const last = spans[spans.length - 1]
+    if (
+      previousDeleted &&
+      last &&
+      start - last.end <= MERGE_GAPS &&
+      start >= last.start
+    ) {
+      // 连片：把停顿一起吞掉，区间终点取两者较大者
+      last.end = Math.max(last.end, end)
+    } else {
+      spans.push({ start, end, token_id: token.id, cause: 'word' })
+    }
+    previousDeleted = true
   }
   return mergeSpans(spans)
 }

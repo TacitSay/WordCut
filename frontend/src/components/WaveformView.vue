@@ -32,6 +32,8 @@ const props = defineProps({
 const emit = defineEmits(['ready'])
 
 const container = ref(null)
+/** 缩放条（Audition 风格）：整段音频的缩略条 + 可拖动/可拉伸的视野窗 */
+const zoomBar = ref(null)
 const {
   state,
   attach,
@@ -43,8 +45,28 @@ const {
   seekTo,
   seekBy,
   zoomBy,
+  zoomTo,
   zoomToFit,
 } = usePlayback()
+
+/**
+ * 波形容器的滚动状态（缩放条要按它画视野窗）。
+ *
+ * 用响应式对象而不是 computed，是因为 scrollLeft 变化不会触发 Vue 更新，
+ * 需要在 scroll 事件里手动同步。
+ */
+const scroll = ref({ left: 0, width: 0, total: 0 })
+
+/** 视野窗在缩放条上的位置与宽度（百分比）。 */
+const windowStyle = computed(() => {
+  const { left, width, total } = scroll.value
+  if (!total || !width) return { left: '0%', width: '100%' }
+  const ratio = Math.min(1, width / total)
+  return {
+    left: `${(left / total) * 100}%`,
+    width: `${Math.max(1.5, ratio * 100)}%`,
+  }
+})
 
 /** 当前缩放倍率（相对"适应宽度"）。 */
 const zoomLabel = computed(() => {
@@ -53,6 +75,152 @@ const zoomLabel = computed(() => {
   const ratio = fit > 0 ? state.pxPerSec / fit : 1
   return `${ratio.toFixed(1)}×`
 })
+
+/** 读取容器的滚动尺寸（scroll 事件、缩放后、resize 时调用）。 */
+function syncScroll() {
+  const element = container.value
+  if (!element) return
+  scroll.value = {
+    left: element.scrollLeft,
+    width: element.clientWidth,
+    total: element.scrollWidth,
+  }
+}
+
+/** 把视野窗滚到指定时间区间。 */
+function scrollToTime(startSeconds, pxPerSec) {
+  const element = container.value
+  if (!element) return
+  const target = Math.max(0, startSeconds * pxPerSec)
+  element.scrollLeft = target
+  // 下一帧再同步一次：WaveSurfer 的滚动是异步落位的
+  requestAnimationFrame(syncScroll)
+  syncScroll()
+}
+
+// ----------------------------------------------------------------------
+// 缩放条交互（Audition 式：拖窗移动、拖两端改范围、点击居中）
+// ----------------------------------------------------------------------
+/** 正在拖拽的类型：'window' | 'left' | 'right' | null */
+let dragMode = null
+let dragStartX = 0
+let dragStartLeft = 0
+let dragStartRange = { start: 0, end: 0 }
+/** 本次拖拽是否真的移动过（用于抑制拖拽末尾的 click） */
+let dragMoved = false
+
+/** 当前视野对应的时间区间（秒）。 */
+function visibleRange() {
+  const element = container.value
+  if (!element || !state.duration || element.scrollWidth <= 0) {
+    return { start: 0, end: state.duration || 0 }
+  }
+  const perPx = state.duration / element.scrollWidth
+  return {
+    start: element.scrollLeft * perPx,
+    end: (element.scrollLeft + element.clientWidth) * perPx,
+  }
+}
+
+function beginDrag(event, mode) {
+  if (!state.ready) return
+  const bar = zoomBar.value
+  if (!bar) return
+  event.preventDefault()
+  dragMode = mode
+  dragMoved = false
+  dragStartX = event.clientX
+  dragStartLeft = container.value?.scrollLeft || 0
+  dragStartRange = visibleRange()
+  bar.setPointerCapture?.(event.pointerId)
+}
+
+/** 把像素位移换算成时间位移。 */
+function pixelsToSeconds(dx) {
+  const bar = zoomBar.value
+  const duration = state.duration || 0
+  if (!bar || bar.clientWidth <= 0) return 0
+  return (dx / bar.clientWidth) * duration
+}
+
+function onBarPointerMove(event) {
+  if (!dragMode) return
+  const containerEl = container.value
+  if (!containerEl) return
+  const dx = event.clientX - dragStartX
+  if (Math.abs(dx) > 1) dragMoved = true
+  const duration = state.duration || 0
+  if (duration <= 0) return
+
+  if (dragMode === 'window') {
+    // 平移：窗口左移多少秒，就滚多少秒
+    const shift = pixelsToSeconds(dx)
+    const range = dragStartRange.end - dragStartRange.start
+    const start = Math.min(
+      Math.max(0, dragStartRange.start + shift),
+      Math.max(0, duration - range),
+    )
+    const pxPerSec = containerEl.clientWidth / Math.max(1e-6, range)
+    scrollToTime(start, pxPerSec)
+    return
+  }
+
+  // 拉伸边缘：改变可见时长，即改变缩放
+  const deltaSeconds = pixelsToSeconds(dx)
+  const minRange = 0.5 // 最短显示 0.5 秒，避免无限放大
+  if (dragMode === 'right') {
+    const end = Math.min(
+      duration,
+      Math.max(dragStartRange.start + minRange, dragStartRange.end + deltaSeconds),
+    )
+    applyRange(dragStartRange.start, end)
+  } else {
+    const start = Math.max(
+      0,
+      Math.min(dragStartRange.end - minRange, dragStartRange.start + deltaSeconds),
+    )
+    applyRange(start, dragStartRange.end)
+  }
+}
+
+/** 让 [start, end] 正好铺满可视宽度。 */
+function applyRange(start, end) {
+  const containerEl = container.value
+  if (!containerEl) return
+  const range = Math.max(1e-3, end - start)
+  const pxPerSec = containerEl.clientWidth / range
+  if (!zoomTo(pxPerSec)) return
+  // 用生效后的实际密度：zoomTo 会把倍率夹到 [适应宽度, 400px/s]，
+  // 若用请求值换算滚动位置，拖到极限时视野窗会跑偏。
+  scrollToTime(start, state.pxPerSec || pxPerSec)
+  syncScroll()
+}
+
+function endDrag(event) {
+  if (!dragMode) return
+  dragMode = null
+  zoomBar.value?.releasePointerCapture?.(event.pointerId)
+}
+
+/** 点在空白处：把该时间点居中。 */
+function onBarClick(event) {
+  if (dragMoved) {
+    dragMoved = false
+    return
+  }
+  if (!state.ready || state.duration <= 0) return
+  const bar = zoomBar.value
+  if (!bar) return
+  const rect = bar.getBoundingClientRect()
+  const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width))
+  const { start, end } = visibleRange()
+  const range = end - start
+  const target = Math.min(
+    Math.max(0, ratio * state.duration - range / 2),
+    Math.max(0, state.duration - range),
+  )
+  scrollToTime(target, range > 0 ? (container.value?.clientWidth || 1) / range : 1)
+}
 
 /** 播放/暂停按钮（也可由父组件通过 ref 调用 expose 出来的方法）。 */
 function togglePlay() {
@@ -75,6 +243,12 @@ function mount(url) {
     })
   }
 }
+
+// 缩放变化（按钮 / Ctrl+滚轮 / 缩放条）后，重算视野窗位置
+watch(
+  () => [state.pxPerSec, state.ready, state.duration],
+  () => requestAnimationFrame(syncScroll),
+)
 
 watch(
   // flush: 'post' —— 等 v-show 生效、容器有真实高度后再挂载波形
@@ -132,10 +306,15 @@ onMounted(() => {
   setDeletes(props.deletes)
   mount(props.audioUrl)
   container.value?.addEventListener('wheel', onWheel, { passive: false })
+  container.value?.addEventListener('scroll', syncScroll, { passive: true })
+  window.addEventListener('resize', syncScroll)
+  syncScroll()
 })
 
 onBeforeUnmount(() => {
   container.value?.removeEventListener('wheel', onWheel)
+  container.value?.removeEventListener('scroll', syncScroll)
+  window.removeEventListener('resize', syncScroll)
   detach()
 })
 
@@ -203,6 +382,39 @@ defineExpose({
         音频加载失败：{{ state.errorText }}
       </p>
       <p v-else-if="!state.ready" class="wave-empty">正在解码音频…</p>
+    </div>
+
+    <!--
+      Audition 式缩放条：整条代表全片时长，其中的亮框是当前可见范围。
+      拖框体 = 平移；拖左右边缘 = 缩放；点空白 = 该处居中。
+    -->
+    <div
+      v-show="audioUrl && state.ready"
+      ref="zoomBar"
+      class="wave-zoombar"
+      title="拖动中间的框平移视野，拖两端缩放，点击空白处居中"
+      @pointerdown.self="beginDrag($event, 'window')"
+      @pointermove="onBarPointerMove"
+      @pointerup="endDrag"
+      @pointercancel="endDrag"
+      @click.self="onBarClick"
+    >
+      <div
+        class="wave-zoombar-window"
+        :style="windowStyle"
+        @pointerdown.stop="beginDrag($event, 'window')"
+      >
+        <span
+          class="zoombar-handle zoombar-handle-left"
+          title="拖动缩放左边界"
+          @pointerdown.stop="beginDrag($event, 'left')"
+        />
+        <span
+          class="zoombar-handle zoombar-handle-right"
+          title="拖动缩放右边界"
+          @pointerdown.stop="beginDrag($event, 'right')"
+        />
+      </div>
     </div>
   </section>
 </template>
@@ -328,6 +540,71 @@ defineExpose({
   /* 放大后可横向滚动；未放大时没有滚动内容，行为不变 */
   overflow-x: auto;
   overflow-y: hidden;
+}
+
+/* ---------------- Audition 式缩放条 ---------------- */
+.wave-zoombar {
+  position: relative;
+  flex: 0 0 auto;
+  height: 14px;
+  margin: 4px 12px 6px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+  user-select: none;
+  touch-action: none;
+}
+
+.wave-zoombar-window {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 8px;
+  background: rgba(59, 130, 246, 0.22);
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  box-sizing: border-box;
+  cursor: grab;
+}
+
+.wave-zoombar-window:active {
+  cursor: grabbing;
+}
+
+/* 两端的拉伸把手：做出"可抓"的视觉提示 */
+.zoombar-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 7px;
+  cursor: ew-resize;
+}
+
+.zoombar-handle::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  width: 1px;
+  background: var(--accent);
+  opacity: 0.85;
+}
+
+.zoombar-handle-left {
+  left: 0;
+}
+
+.zoombar-handle-left::after {
+  left: 3px;
+}
+
+.zoombar-handle-right {
+  right: 0;
+}
+
+.zoombar-handle-right::after {
+  right: 3px;
 }
 
 .wave-zoom {
