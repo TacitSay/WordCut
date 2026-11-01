@@ -451,6 +451,47 @@ def _snapshot_words(project: Dict[str, Any]) -> List[Dict[str, Any]]:
         return list(project["words"])
 
 
+def _resume_offset(
+    words: Sequence[Dict[str, Any]], duration: float
+) -> Tuple[float, List[Dict[str, Any]]]:
+    """判断能否断点续转，返回 ``(起点秒, 复用的词表)``。
+
+    场景：长素材按 10 分钟分块转写，中途服务被重启（或用户关了启动窗口），
+    已完成的块已经落库，但内存里的任务状态没了。再次点击"转写"时如果从头
+    重跑，既浪费已完成的部分，也会把用户在被截断文本上做的删除标记冲掉。
+
+    判断规则：
+    * 没有词表 → 从头转（``(0, [])``）；
+    * 最后一个词的结束时间已经贴近总时长（差 < 60 秒）→ 视为已转完，从头重转；
+    * 否则从"最后一个词结束处"接着转，并复用已有词表。
+
+    参数:
+        words: 项目当前已落库的词表（按时间升序）。
+        duration: 音频总时长（秒）。
+
+    返回:
+        ``(resume_from, kept_words)``。
+    """
+    if not words:
+        return 0.0, []
+    try:
+        last_end = float(words[-1].get("end") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0, []
+    if duration <= 0.0 or last_end <= 0.0:
+        return 0.0, []
+    if duration - last_end < 60.0:
+        # 基本转完了：从头重转，避免"半截词表 + 新词表"拼接出重复内容
+        return 0.0, []
+    # 严格从断点续：**不回退、不重叠**。
+    #
+    # 词 id 是按位置编号的（TOKEN_ID_PREFIX + 序号），如果回退半块重转，
+    # 重转区域产出的词数一旦与原结果不同，后面所有 id 都会位移，
+    # 用户之前在那段文本上做的删除标记就会指到别的词上。
+    # 代价是分块边界处可能有一个被切断的词，但保住了编辑结果。
+    return last_end, list(words)
+
+
 def _require_words(project: Dict[str, Any]) -> List[Dict[str, Any]]:
     """取出已转写的词表；尚未转写时抛 ``400``。"""
     words = _snapshot_words(project)
@@ -1577,21 +1618,27 @@ def _run_transcription(
     model: Any,
     on_progress: Optional[Any] = None,
     on_partial: Optional[Any] = None,
+    resume_from: float = 0.0,
+    resume_words: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], float]:
     """跑一次词级转写，返回 ``(words, audio_duration)``。
 
-    两个提升长素材体验的机制：
+    三个提升长素材体验的机制：
 
     * **批处理**：GPU 上用 ``BatchedInferencePipeline``（3.7× 实测）；
     * **分段增量**：超过 ``_TRANSCRIBE_CHUNK_SECONDS`` 的音频按块转写，每块完成
       就通过 ``on_partial`` 把累计词表落库，前端能"先看到一部分"，不必等 2 小时
-      全部跑完。分段边界会切断个别词，属于已知取舍（见 docs）。
+      全部跑完。分段边界会切断个别词，属于已知取舍（见 docs）；
+    * **断点续转**：``resume_from`` > 0 时跳过前面已完成的块，把 ``resume_words``
+      当作已有结果继续往后接——服务重启后重新点"转写"不必从头再跑。
 
     参数:
         project: 项目字典（需要 ``audio_path``）。
         model: 已加载的 faster-whisper 模型。
         on_progress: 可选回调 ``(fraction: float, word_count: int) -> None``。
         on_partial: 可选回调 ``(words_so_far: list) -> None``，每块完成后调用。
+        resume_from: 续转起点（秒）；0 表示从头转。
+        resume_words: 续转时沿用的已有词表。
 
     返回:
         ``(words, audio_duration)``；``words`` 已按时间排序。
@@ -1653,11 +1700,23 @@ def _run_transcription(
         words = transcribe_once(str(audio_path), audio_duration)
     else:
         # ---- 长素材：按块转写，块内用相对时间，写回时加偏移 ----
-        words: List[Dict[str, Any]] = []  # type: ignore[no-redef]
+        # 断点续转：沿用已完成部分的词表，从 resume_from 对应的块开始。
+        words: List[Dict[str, Any]] = list(resume_words or [])  # type: ignore[no-redef]
         rate = int(info.samplerate or SAMPLE_RATE)
         chunk = int(_TRANSCRIBE_CHUNK_SECONDS * rate)
+        start_index = int(max(0.0, resume_from) // _TRANSCRIBE_CHUNK_SECONDS)
+        if start_index > 0:
+            # 往后多退一块：续转起点落在"已转完的最后一块"之内，
+            # 这样不会漏掉断点附近的内容（多转的部分会按时间被后续去重）
+            start_index = max(0, start_index)
+            skip = start_index * chunk
+        else:
+            skip = 0
+
         with sf.SoundFile(str(audio_path)) as handle:
-            index = 0
+            if skip > 0:
+                handle.seek(min(skip, len(handle)))
+            index = start_index
             while True:
                 block = handle.read(chunk, dtype="float32", always_2d=False)
                 if block is None or len(block) == 0:
@@ -1667,11 +1726,15 @@ def _run_transcription(
                 for item in part:
                     item["start"] += offset
                     item["end"] += offset
+                # 续转起点落在块中间：丢掉已转写过的部分，避免重复词
+                if index == start_index and resume_from > 0.0:
+                    part = [w for w in part if w["start"] >= resume_from]
                 words.extend(part)
                 index += 1
                 if on_progress is not None and audio_duration > 0.0:
                     try:
-                        on_progress(min(1.0, offset / audio_duration), len(words))
+                        done = min(1.0, (offset + _TRANSCRIBE_CHUNK_SECONDS) / audio_duration)
+                        on_progress(done, len(words))
                     except Exception:  # noqa: BLE001
                         pass
                 if on_partial is not None:
@@ -1720,6 +1783,9 @@ class TranscribeJobResponse(BaseModel):
     partial: bool = Field(
         False, description="是否已有分段增量结果落库（前端可提前刷新 Token）"
     )
+    resumed_from: float = Field(
+        0.0, description="断点续转的起点（秒）；0 表示从头转"
+    )
     error: str = Field("", description="失败原因（status=error 时有值）")
 
 
@@ -1747,6 +1813,7 @@ def _job_snapshot(job: Dict[str, Any]) -> Dict[str, Any]:
         "device": str(job["device"]),
         "compute_type": str(job["compute_type"]),
         "partial": bool(job.get("partial")),
+        "resumed_from": round(float(job.get("resumed_from") or 0.0), 2),
         "error": str(job["error"]),
     }
 
@@ -1791,7 +1858,24 @@ def _run_transcribe_job(job_id: str, pid: str) -> None:
                     job["partial"] = True
 
         with _TRANSCRIBE_EXEC_LOCK:
-            words, duration = _run_transcription(project, model, on_progress, on_partial)
+            # 断点续转：项目里已有部分词表（上次跑到一半服务被重启 / 用户关了窗口）
+            # 就从中断处接着转，已完成的删除标记也不会丢。
+            existing = list(_project_words(project) or [])
+            resume_from, resume_words = _resume_offset(existing, _duration_of(project))
+            if resume_from > 0.0:
+                with _TRANSCRIBE_JOBS_LOCK:
+                    job = _transcribe_jobs.get(job_id)
+                    if job is not None:
+                        job["resumed_from"] = resume_from
+                        job["words"] = len(resume_words)
+            words, duration = _run_transcription(
+                project,
+                model,
+                on_progress,
+                on_partial,
+                resume_from=resume_from,
+                resume_words=resume_words,
+            )
         _apply_transcription(pid, project, words)
         with _TRANSCRIBE_JOBS_LOCK:
             job = _transcribe_jobs.get(job_id)

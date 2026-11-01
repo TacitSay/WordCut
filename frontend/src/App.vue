@@ -1163,8 +1163,13 @@ async function runTranscriptionJob(projectId, { onPartial } = {}) {
     try {
       job = await fetchTranscriptionStatus(projectId)
     } catch (error) {
-      // 轮询偶发失败不终止：只要后端还在跑，下一次就能拿到
-      if (error?.status === 404) throw error
+      // 404 = 后端没有这个任务的记录：通常是服务被重启（任务状态在内存里）。
+      // 已完成的块已经落库，再次点击"转写"会从断点续转，所以这里给出可操作提示。
+      if (error?.status === 404) {
+        throw new Error(
+          '转写任务已中断（后端可能重启过）。已完成的进度已保存，再点一次「转写」会从中断处继续',
+        )
+      }
       continue
     }
 
@@ -1172,9 +1177,10 @@ async function runTranscriptionJob(projectId, { onPartial } = {}) {
     if (now - lastPaint > 900) {
       lastPaint = now
       const pct = Math.round(Number(job.progress || 0) * 100)
+      const resumeNote = job.resumed_from > 0 ? `（续转自 ${formatClock(job.resumed_from)}）` : ''
       setStatus(
         `转写中 ${pct}% · 已出 ${job.words} 词 · ${Number(job.elapsed_seconds).toFixed(0)}s` +
-          `（${job.device || 'cpu'}/${job.compute_type || 'int8'}）`,
+          `（${job.device || 'cpu'}/${job.compute_type || 'int8'}）${resumeNote}`,
         'busy',
       )
     }
