@@ -14,7 +14,7 @@
 ``frontend/public/icon-192.png``       192px，PWA / manifest
 ``frontend/public/icon-512.png``       512px，PWA / manifest
 ``assets/brand/wordcut-icon-1024.png`` 1024px 母版（保留透明圆角）
-``assets/wordcut.ico``                 256px，Windows 快捷方式 / 控制台窗口图标
+``assets/brand/wordcut.ico``          256px，Windows 快捷方式 / 控制台窗口图标
 ==========================  ================================================
 
 用法::
@@ -126,7 +126,7 @@ def main() -> int:
     resize(original, 512).save(PUBLIC_DIR / "icon-512.png", optimize=True)
 
     # Windows 快捷方式 / 控制台图标
-    ico_base.save(ASSETS_DIR / "wordcut.ico", sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)])
+    ico_base.save(BRAND_DIR / "wordcut.ico", sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)])
 
     for path in (
         BRAND_DIR / "wordcut-icon-1024.png",
@@ -136,7 +136,7 @@ def main() -> int:
         PUBLIC_DIR / "apple-touch-icon.png",
         PUBLIC_DIR / "icon-192.png",
         PUBLIC_DIR / "icon-512.png",
-        ASSETS_DIR / "wordcut.ico",
+        BRAND_DIR / "wordcut.ico",
     ):
         print(f"  {path.relative_to(ROOT)}  {path.stat().st_size / 1024:.1f} KB")
     return 0

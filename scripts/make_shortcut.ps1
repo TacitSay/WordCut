@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 <#
-  在桌面（或指定位置）创建 WordCut 快捷方式，并套用 assets\wordcut.ico 图标。
+  在桌面（或指定位置）创建 WordCut 快捷方式，并套用 assets\brand\wordcut.ico 图标。
 
   为什么需要：`start.bat` 是批处理文件，Windows 只能给它显示一个通用的齿轮图标；
   快捷方式可以把图标写进 .lnk，双击后依然是"单窗口启动"的体验。
@@ -21,7 +21,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
-$icon = Join-Path $root 'assets\wordcut.ico'
+$icon = Join-Path $root 'assets\brand\wordcut.ico'
 $launcher = Join-Path $root 'start.bat'
 
 if (-not (Test-Path $launcher)) { Write-Error "找不到启动脚本：$launcher"; exit 1 }
