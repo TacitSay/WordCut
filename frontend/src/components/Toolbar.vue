@@ -61,7 +61,8 @@ defineExpose({ pickFile })
 <template>
   <header class="toolbar">
     <div class="toolbar-brand">
-      <span class="brand-mark">WC</span>
+      <!-- 品牌图标：与站点 favicon 同源（assets/brand/wc-source.png → scripts/make_icons.py） -->
+      <img class="brand-mark" src="/favicon-32.png" alt="WordCut" width="20" height="20" />
       <span class="brand-name">WordCut</span>
     </div>
 
@@ -187,17 +188,13 @@ defineExpose({ pickFile })
 }
 
 .brand-mark {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  display: block;
   width: 20px;
   height: 20px;
   border-radius: 4px;
-  background: var(--accent);
-  color: #ffffff;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.3px;
+  /* 图标自带深色底与透明圆角，不需要再加背景色 */
+  object-fit: contain;
+  flex: 0 0 auto;
 }
 
 .brand-name {
