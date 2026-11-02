@@ -18,7 +18,9 @@ WordCut 一键启动（单窗口版）
 param(
     [switch]$NoBrowser,
     [switch]$Restart,
-    [switch]$Quiet
+    [switch]$Quiet,
+    # 生产模式：不启前端 dev server，由后端在同一端口托管 frontend/dist（免 Node）
+    [switch]$Prod
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,7 +28,7 @@ $ErrorActionPreference = 'Stop'
 $Root         = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BackendPort  = 8000
 $FrontendPort = 5173
-$FrontendUrl  = "http://localhost:$FrontendPort"
+$FrontendUrl  = if ($Prod) { "http://localhost:$BackendPort" } else { "http://localhost:$FrontendPort" }
 $HealthUrl    = "http://127.0.0.1:$BackendPort/api/health"
 $RuntimeDir   = Join-Path $Root '.runtime'
 $BackendLog   = Join-Path $RuntimeDir 'backend.log'
@@ -181,18 +183,28 @@ if (-not $PythonExe) {
 if (-not $PythonExe) { Write-Err2 '找不到 Python，请安装 Python 3.10 或修改脚本里的路径。'; exit 1 }
 Write-Ok "Python: $PythonExe"
 
-if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
-    Write-Err2 '找不到 npm，请安装 Node.js 20+ 并加入 PATH。'
-    exit 1
-}
 $FrontendDir = Join-Path $Root 'frontend'
-if (-not (Test-Path (Join-Path $FrontendDir 'index.html'))) { Write-Err2 "找不到前端目录：$FrontendDir"; exit 1 }
 
-if (-not (Test-Path (Join-Path $FrontendDir 'node_modules\vite'))) {
-    Write-Warn2 '前端依赖未安装，先执行 npm install（可能需要几分钟）…'
-    & cmd.exe /c "npm install" | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Err2 'npm install 失败，请手动在 frontend 目录执行。'; exit 1 }
-    Write-Ok '前端依赖安装完成'
+if ($Prod) {
+    # 生产模式：直接托管构建产物，不需要 Node / npm
+    if (-not (Test-Path (Join-Path $FrontendDir 'dist\index.html'))) {
+        Write-Err2 "找不到前端构建产物：$FrontendDir\dist（先执行 npm run build，或改用不带 -Prod 的开发模式）"
+        exit 1
+    }
+    Write-Ok "生产模式：后端 :$BackendPort 同时托管界面（免 Node）"
+} else {
+    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+        Write-Err2 '找不到 npm，请安装 Node.js 20+ 并加入 PATH。'
+        exit 1
+    }
+    if (-not (Test-Path (Join-Path $FrontendDir 'index.html'))) { Write-Err2 "找不到前端目录：$FrontendDir"; exit 1 }
+
+    if (-not (Test-Path (Join-Path $FrontendDir 'node_modules\vite'))) {
+        Write-Warn2 '前端依赖未安装，先执行 npm install（可能需要几分钟）…'
+        & cmd.exe /c "npm install" | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Err2 'npm install 失败，请手动在 frontend 目录执行。'; exit 1 }
+        Write-Ok '前端依赖安装完成'
+    }
 }
 
 # ----------------------------------------------------------------------
@@ -213,7 +225,9 @@ if (Test-PortInUse $BackendPort) {
     $started += (Start-BackgroundProcess $backendCmd (Join-Path $Root 'src'))
 }
 
-if (Test-PortInUse $FrontendPort) {
+if ($Prod) {
+    Write-Info '生产模式：跳过前端 dev server'
+} elseif (Test-PortInUse $FrontendPort) {
     Write-Warn2 "端口 $FrontendPort 已被占用，复用现有前端"
 } else {
     Write-Info "启动前端 :$FrontendPort"

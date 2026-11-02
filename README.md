@@ -19,7 +19,15 @@
 3. 轮询 `/api/health` 与前端口
 4. 打开浏览器到 <http://localhost:5173>。
 
-### 方式二：命令行
+### 方式二：发行版（免 Node）
+
+从 [Releases](https://github.com/TacitSay/WordCut/releases) 下载 `WordCut-<版本>-win64.zip`，
+解压后双击 **`start-prod.bat`**：后端在 `http://127.0.0.1:8000` 同时托管界面与 API，
+**不需要 Node、不需要 npm install**，只要求 Python 3.10 + ffmpeg。
+
+包内不含模型（首次转写自动下载）与 CUDA 运行库（`scripts\fetch_cuda_libs.py` 按需补齐）。
+
+### 方式三：命令行
 
 ```powershell
 # 1) 后端

@@ -3335,6 +3335,46 @@ def preview_subtitle(
 
 
 # ----------------------------------------------------------------------
+# 生产模式：同一个端口托管前端产物（免 Node）
+# ----------------------------------------------------------------------
+#: 前端构建产物目录（``npm run build`` 的输出）。
+DIST_DIR: Path = BASE_DIR / "frontend" / "dist"
+
+#: 是否托管前端：``WORDCUT_SERVE_UI=0`` 可关闭（前端另起 dev server 时不需要）。
+_SERVE_UI: bool = (os.environ.get("WORDCUT_SERVE_UI") or "1").strip() != "0"
+
+
+def _dist_ready() -> bool:
+    """前端产物是否可用（有 index.html 才算）。"""
+    return _SERVE_UI and (DIST_DIR / "index.html").is_file()
+
+
+if _dist_ready():
+    # 注意：这个兜底路由必须**最后**注册——FastAPI 按注册顺序匹配，
+    # 前面的 /api/* 会先命中，只有剩下的路径才会落到这里。
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def serve_ui(full_path: str) -> Any:
+        """托管前端静态文件；未知路径回落到 index.html（SPA 路由）。
+
+        为什么要它：打包给用户的发行版里带的是 `frontend/dist`，
+        没有 Node 也就没有 Vite 代理。让后端在 8000 端口同时提供 UI 与 API，
+        同源、免 CORS、少一个进程。
+        """
+        from fastapi.responses import FileResponse
+
+        # 只服务真实存在的文件，其余（含前端路由）都交给 index.html
+        candidate = (DIST_DIR / full_path).resolve()
+        try:
+            candidate.relative_to(DIST_DIR.resolve())
+        except ValueError:
+            # 越界路径（../ 之类）一律当 SPA 路由处理
+            return FileResponse(DIST_DIR / "index.html")
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(DIST_DIR / "index.html")
+
+
+# ----------------------------------------------------------------------
 # 本地调试入口
 # ----------------------------------------------------------------------
 if __name__ == "__main__":  # pragma: no cover - 仅本地调试
