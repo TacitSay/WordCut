@@ -42,10 +42,6 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 
-# 设计文档只在本地保留，不推到远端（README.md 是唯一对外文档）
-docs/*.md
-
-# 会话导出（体积大，可用 docs/export_openclaw_session.py 重新生成）
-docs/openclaw-transcript-v4.jsonl
-docs/openclaw-dialogue-numbered.json
-docs/openclaw-dialogue-numbered.md
+# docs/ 只在本地保留，不推到远端：
+# 设计文档、临时脚本、Release 说明都放这里（README.md 是唯一对外文档）
+docs/
