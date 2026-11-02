@@ -1,0 +1,32 @@
+# WordCut 词剪 —— Python 依赖
+#
+# 版本按本机实测可用的组合锁定；ctranslate2 必须 4.4.0（更新的版本与当前
+# faster-whisper 的 CUDA 运行库不匹配，会在 GPU 上硬崩）。
+#
+# 安装：
+#   python -m pip install -r requirements.txt
+#
+# 如果 pip 走代理失败（Windows 常见），可换国内源：
+#   python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# --- Web 服务 ---
+fastapi==0.139.2
+uvicorn==0.35.0
+pydantic==2.11.7
+python-multipart==0.0.20
+
+# --- 音频 ---
+numpy==2.2.6
+soundfile==0.13.1
+
+# --- 语音识别 ---
+faster-whisper==1.2.1
+ctranslate2==4.4.0
+huggingface-hub==0.34.3
+
+# --- 批处理转写（可选但强烈建议：GPU 上约 3.7 倍）---
+# 需要 >= 1.19 才能在 numpy 2.x 下正常导入；1.23 在部分机器上 DLL 初始化失败
+onnxruntime==1.19.2
+
+# --- 图标生成脚本（scripts/make_icons.py）---
+Pillow==11.0.0

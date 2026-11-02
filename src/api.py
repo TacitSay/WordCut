@@ -58,6 +58,7 @@ import segmenter  # noqa: E402
 import store as store_mod  # noqa: E402
 import silence  # noqa: E402
 import subtitle  # noqa: E402
+import model_fetch  # noqa: E402
 from model import DeleteSpan, TimeMap, Token  # noqa: E402
 
 __all__ = [
@@ -89,15 +90,11 @@ UPLOAD_DIR: Path = BASE_DIR / "uploads"
 #: 导出目录：``outputs/{project_id}/``。
 OUTPUT_DIR: Path = BASE_DIR / "outputs"
 
-#: faster-whisper 模型的绝对路径候选（按顺序探测）。
-MODEL_DIR: Path = BASE_DIR / "models" / "faster-whisper-small"
+#: 模型根目录（可用 ``WORDCUT_MODELS_DIR`` 覆盖）。
+MODELS_ROOT: Path = BASE_DIR / "models"
 
-#: 模型路径候选：优先绝对路径，其次相对项目根目录的相对路径。
-_MODEL_CANDIDATES: Sequence[Path] = (
-    Path(r"E:\WordCut\models\faster-whisper-small"),
-    MODEL_DIR,
-    Path("models/faster-whisper-small"),
-)
+#: 默认模型目录（``WORDCUT_WHISPER_MODEL`` 可换成 tiny/base/medium/large-v3 等）。
+MODEL_DIR: Path = MODELS_ROOT / f"faster-whisper-{model_fetch.model_name()}"
 
 #: 转写时若某个词的时间戳非法（``end <= start``）时为其补的最小间隔（秒）。
 _MIN_WORD_DURATION: float = 0.02
@@ -631,32 +628,48 @@ def _validate_token_ids(token_ids: Sequence[str], known_ids: Set[str]) -> List[s
 
 
 def _model_candidates() -> List[Path]:
-    """模型路径候选（已去重、相对路径按项目根目录解析、保持声明顺序）。"""
-    resolved: List[Path] = []
-    seen: Set[str] = set()
-    for candidate in _MODEL_CANDIDATES:
-        path = candidate if candidate.is_absolute() else BASE_DIR / candidate
-        key = str(path).lower()
-        if key not in seen:
-            seen.add(key)
-            resolved.append(path)
-    return resolved
+    """模型路径候选（已去重、保持声明顺序）。"""
+    return model_fetch.search_paths()
 
 
 def _resolve_model_path() -> Path:
-    """探测 faster-whisper 模型目录；全部不存在时抛 ``503``。"""
-    candidates = _model_candidates()
-    for candidate in candidates:
-        if candidate.is_dir():
-            return candidate.resolve()
-    tried = "、".join(str(path) for path in candidates)
-    raise HTTPException(
-        status_code=503,
-        detail=(
-            "未找到 faster-whisper-small 模型目录，已尝试：" f"{tried}；"
-            "请把模型放到 models/faster-whisper-small 下"
-        ),
-    )
+    """找可用的 faster-whisper 模型目录；本地没有就**自动下载**。
+
+    仓库不收录模型（`small` 约 460MB）。第一次转写时如果本地没有，就按
+    HuggingFace 官方源下载，失败自动改用国内镜像，落到
+    ``models/faster-whisper-<名字>/``——与官方目录结构一致，后续直接复用。
+
+    环境变量:
+        * ``WORDCUT_WHISPER_MODEL``：模型名（tiny/base/small/medium/large-v3…）；
+        * ``WORDCUT_WHISPER_MODEL_PATH``：直接指定已有模型目录；
+        * ``WORDCUT_MODELS_DIR``：模型根目录；
+        * ``WORDCUT_NO_MODEL_DOWNLOAD=1``：禁止自动下载（离线环境）。
+
+    异常:
+        HTTPException: 503，本地没有且下载失败 / 被禁用。
+    """
+    found = model_fetch.find_local()
+    if found is not None:
+        return found
+
+    try:
+        path = model_fetch.ensure_model(log=_log_model_download)
+    except model_fetch.ModelNotAvailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"{exc}。也可以放一个现成模型到 {MODEL_DIR}，"
+                "或用 WORDCUT_WHISPER_MODEL_PATH 指向它。"
+            ),
+        ) from exc
+
+    _whisper_runtime["model_path"] = str(path)
+    return path
+
+
+def _log_model_download(message: str) -> None:
+    """把下载进度打到后端日志（启动窗口里能看到）。"""
+    print(f"[模型] {message}", flush=True)
 
 
 def _cuda_device_count() -> int:
