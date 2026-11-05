@@ -91,6 +91,7 @@ set WORDCUT_WHISPER_MODEL_PATH=D:\models\faster-whisper-small
 | `WORDCUT_SEMANTIC_API_KEY` | 空 | 语义分段 API 的 key |
 | `WORDCUT_SEMANTIC_API_MODEL` | 空 | 语义分段 API 的模型名 |
 | `WORDCUT_SEMANTIC_IDLE_SECONDS` | `600` | 语义模型空闲多久自动卸载 |
+| `WORDCUT_SETTINGS_PATH` | `data/settings.json` | 设置文件位置（界面里改的分段配置存在这里） |
 | `WORDCUT_WHISPER_IDLE_SECONDS` | `900` | 转写模型空闲多久自动卸载 |
 
 ---
@@ -132,7 +133,7 @@ npm run build
 
 1. **选择文件**（音频或视频）→ 自动转 16kHz 单声道 WAV 并创建项目
 2. **转写** → 词级时间戳；长素材按 10 分钟分块，边转边出，可断点续转
-3. **分段** → 右侧面板可选「规则 / 语义（本地模型）/ 语义（API）」重新切段，不改变任何词与时间戳
+3. **分段** → 「工具 → 设置 · 语义分段」里选规则 / 本地小模型 / API；本地模型可换仓库、可指定已有目录，API 直接填 Base/模型/Key。切换后可点「重新分段」立即看到效果（不改变任何词与时间戳）
 4. **删改** → 选中文本按 `Delete` 删除；连片删除自动合并成一段（词间停顿一并剪掉）
 5. **试听** → 空格播放；波形上红色块 = 已删除区间
 6. **导出** → 音频（wav/mp3/m4a）+ 字幕（SRT）+ EDL（JSON）；可选导出成品 MP4

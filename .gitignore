@@ -38,6 +38,9 @@ outputs/
 *.wcproj
 src/00*
 
+# 用户设置（界面可改，不入库）
+data/settings.json
+
 # SQLite 数据库
 data/*.db
 data/*.db-wal

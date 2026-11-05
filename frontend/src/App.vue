@@ -29,6 +29,7 @@ import MenuBar from './components/MenuBar.vue'
 import Toolbar from './components/Toolbar.vue'
 import ExportDialog from './components/ExportDialog.vue'
 import ProjectDialog from './components/ProjectDialog.vue'
+import SettingsDialog from './components/SettingsDialog.vue'
 
 import TextEditor from './components/TextEditor.vue'
 import WaveformView from './components/WaveformView.vue'
@@ -60,6 +61,8 @@ import {
   fetchWaveformPeaks,
   resegment,
   fetchSegmentStrategies,
+  fetchSegmentSettings,
+  saveSegmentSettings,
   fetchModelStatus,
   unloadModels,
 } from './api/client.js'
@@ -1142,6 +1145,29 @@ function syncStrategyFromProject() {
   loadModelStatus()
 }
 
+/** 打开设置对话框。 */
+function handleOpenSettings() {
+  settingsOpen.value = true
+  stopAudition()
+}
+
+/**
+ * 设置保存后：刷新策略清单，并把"设置里的模式"同步到当前选择。
+ * 立即按新设置重新分段一次，用户能直接看到效果。
+ */
+async function handleSettingsSaved() {
+  await loadSegmentStrategies()
+  try {
+    const data = await fetchSegmentSettings()
+    const mode = String(data?.mode || 'rule')
+    segmentStrategy.value =
+      mode === 'local' ? 'semantic_local' : mode === 'api' ? 'semantic_api' : 'rule'
+  } catch {
+    /* 读不到就沿用当前选择 */
+  }
+  if (hasTokens.value) await handleResegment()
+}
+
 // ----------------------------------------------------------------------
 // 分段策略 / 模型内存
 // ----------------------------------------------------------------------
@@ -1155,6 +1181,8 @@ const segmenting = ref(false)
 const segmentNote = ref('')
 /** 模型内存状态。 */
 const modelStatus = ref({ rss_mb: 0, cuda_allocated_mb: 0, models: [] })
+/** 设置对话框是否打开（设置 → 语义分段）。 */
+const settingsOpen = ref(false)
 
 /** 拉取策略清单（启动时一次即可）。 */
 async function loadSegmentStrategies() {
@@ -2042,6 +2070,13 @@ registerCommands([
     shortcut: 'Ctrl+R',
     handler: () => handleTranscribe(),
   },
+  {
+    id: 'settings.segment',
+    title: '设置 · 语义分段…',
+    menu: 'tools',
+    handler: () => handleOpenSettings(),
+    enabled: () => true,
+  },
 ])
 
 function handleMenuRun(commandId) {
@@ -2580,6 +2615,14 @@ onBeforeUnmount(() => {
                 </button>
               </dd>
             </div>
+            <div class="panel-row">
+              <dt>设置</dt>
+              <dd>
+                <button class="btn btn-small" type="button" title="选择规则 / 本地模型 / API 分段" @click="handleOpenSettings">
+                  语义分段设置…
+                </button>
+              </dd>
+            </div>
             <p v-if="segmentNote" class="panel-placeholder">{{ segmentNote }}</p>
           </section>
 
@@ -2667,6 +2710,13 @@ onBeforeUnmount(() => {
         WordCut v{{ apiVersion || '0.1.0' }}
       </span>
     </footer>
+
+    <!-- 设置：语义分段 -->
+    <SettingsDialog
+      :open="settingsOpen"
+      @close="settingsOpen = false"
+      @saved="handleSettingsSaved"
+    />
 
     <!-- 导出对话框 -->
     <ExportDialog

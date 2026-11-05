@@ -59,6 +59,7 @@ import segmenter  # noqa: E402
 import store as store_mod  # noqa: E402
 import silence  # noqa: E402
 import subtitle  # noqa: E402
+import app_settings  # noqa: E402
 import model_fetch  # noqa: E402
 import semantic  # noqa: E402
 from model import DeleteSpan, TimeMap, Token  # noqa: E402
@@ -535,13 +536,30 @@ def _require_words(project: Dict[str, Any]) -> List[Dict[str, Any]]:
 DEFAULT_SEGMENT_STRATEGY: str = os.environ.get("WORDCUT_SEGMENT_STRATEGY", "").strip() or semantic.STRATEGY_RULE
 
 
+#: 设置里的分段模式 -> 实际策略。
+_MODE_TO_STRATEGY: Dict[str, str] = {
+    "rule": semantic.STRATEGY_RULE,
+    "local": semantic.STRATEGY_SEMANTIC_LOCAL,
+    "api": semantic.STRATEGY_SEMANTIC_API,
+}
+
+
+def _settings_strategy() -> str:
+    """从设置文件里的 ``segment.mode`` 推出策略；读不到就用环境变量默认。"""
+    try:
+        mode = str(app_settings.get_section("segment").get("mode") or "").strip()
+    except Exception:  # noqa: BLE001
+        mode = ""
+    return _MODE_TO_STRATEGY.get(mode, DEFAULT_SEGMENT_STRATEGY)
+
+
 def _segment_strategy_for(project: Optional[Dict[str, Any]] = None) -> str:
-    """取该项目当前的分段策略（项目设置 > 环境变量 > 规则）。"""
+    """取该项目当前的分段策略（项目设置 > 设置文件/环境变量 > 规则）。"""
     if project:
         saved = str(project.get("segment_strategy") or "").strip()
         if saved:
             return saved
-    return DEFAULT_SEGMENT_STRATEGY
+    return _settings_strategy()
 
 
 def _segments_for(
@@ -1954,7 +1972,7 @@ def _run_transcribe_job(job_id: str, pid: str) -> None:
         with _TRANSCRIBE_EXEC_LOCK:
             # 断点续转：项目里已有部分词表（上次跑到一半服务被重启 / 用户关了窗口）
             # 就从中断处接着转，已完成的删除标记也不会丢。
-            existing = list(_project_words(project) or [])
+            existing = list(_snapshot_words(project) or [])
             resume_from, resume_words = _resume_offset(existing, _duration_of(project))
             if resume_from > 0.0:
                 with _TRANSCRIBE_JOBS_LOCK:
@@ -3404,6 +3422,182 @@ def preview_subtitle(
     return PreviewResponse(
         project_id=pid, format="plain", content=_srt_to_plain(srt_text)
     )
+
+
+# ----------------------------------------------------------------------
+# 接口：设置（语义分段）
+# ----------------------------------------------------------------------
+class SegmentSettingsResponse(BaseModel):
+    """语义分段设置（密钥只回传"是否已设置"）。"""
+
+    mode: str = Field("rule", description="rule / local / api")
+    local_model: str = Field("", description="本地模型仓库名")
+    local_model_dir: str = Field("", description="已有的本地模型目录（可空）")
+    models_dir: str = Field("", description="模型根目录（可空 = <项目>/models）")
+    api_base: str = Field("", description="API base（OpenAI 兼容）")
+    api_model: str = Field("", description="API 模型名")
+    api_timeout: int = Field(60, description="API 超时（秒）")
+    api_key_set: bool = Field(False, description="是否已保存 API key（不回传明文）")
+    models: List[Dict[str, Any]] = Field(default_factory=list, description="可选本地模型")
+    settings_path: str = Field("", description="设置文件路径（便于排查）")
+    api_configured: bool = Field(False, description="API 是否配置完整")
+
+
+class SegmentSettingsPatch(BaseModel):
+    """更新语义分段设置（只传要改的字段）。"""
+
+    mode: Optional[str] = None
+    local_model: Optional[str] = None
+    local_model_dir: Optional[str] = None
+    models_dir: Optional[str] = None
+    api_base: Optional[str] = None
+    api_key: Optional[str] = None
+    api_model: Optional[str] = None
+    api_timeout: Optional[int] = None
+
+
+class SegmentTestRequest(BaseModel):
+    """测试语义后端是否可用。"""
+
+    target: str = Field("local", description="local / api")
+
+
+class SegmentTestResponse(BaseModel):
+    """测试结果。"""
+
+    ok: bool = Field(False, description="是否可用")
+    detail: str = Field("", description="成功时的摘要或失败原因")
+    elapsed_ms: float = Field(0.0, description="耗时（毫秒）")
+
+
+def _segment_settings_payload() -> SegmentSettingsResponse:
+    """组装设置响应（隐藏密钥明文）。"""
+    section = app_settings.public_section("segment", secret_keys=("api_key",))
+    try:
+        models = semantic.describe_local_models()
+    except Exception:  # noqa: BLE001 - 列举失败不影响返回设置
+        models = []
+    return SegmentSettingsResponse(
+        mode=str(section.get("mode") or "rule"),
+        local_model=str(section.get("local_model") or ""),
+        local_model_dir=str(section.get("local_model_dir") or ""),
+        models_dir=str(section.get("models_dir") or ""),
+        api_base=str(section.get("api_base") or ""),
+        api_model=str(section.get("api_model") or ""),
+        api_timeout=int(section.get("api_timeout") or 60),
+        api_key_set=bool(section.get("api_key_set")),
+        models=models,
+        settings_path=str(app_settings.settings_path()),
+        api_configured=bool(semantic.api_config()),
+    )
+
+
+@app.get(
+    "/api/settings/segment",
+    response_model=SegmentSettingsResponse,
+    summary="读取语义分段设置",
+)
+def get_segment_settings() -> SegmentSettingsResponse:
+    """返回当前语义分段配置（API key 不返回明文，只说是否已设置）。"""
+    return _segment_settings_payload()
+
+
+@app.put(
+    "/api/settings/segment",
+    response_model=SegmentSettingsResponse,
+    summary="更新语义分段设置",
+)
+def put_segment_settings(patch: SegmentSettingsPatch) -> SegmentSettingsResponse:
+    """保存语义分段设置；只更新传入的字段。
+
+    注意 ``api_key``：传空字符串表示"保持原值不变"（界面上不会回显密钥），
+    传 ``"-"`` 表示清除。
+
+    异常:
+        400: 模式或字段非法。
+    """
+    data = patch.dict(exclude_none=True)
+    mode = data.get("mode")
+    if mode is not None and mode not in _MODE_TO_STRATEGY:
+        raise HTTPException(
+            status_code=400, detail=f"mode 必须是 rule/local/api，实际 {mode!r}"
+        )
+
+    key = data.get("api_key")
+    if key is not None:
+        if key.strip() == "-":
+            data["api_key"] = ""
+        elif not key.strip():
+            data.pop("api_key")  # 空串 = 不改
+
+    timeout = data.get("api_timeout")
+    if timeout is not None and not (1 <= int(timeout) <= 600):
+        raise HTTPException(status_code=400, detail="api_timeout 必须在 1–600 秒之间")
+
+    try:
+        app_settings.update_section("segment", data)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=f"保存设置失败：{exc}") from exc
+
+    # 换了模型/目录就把旧的语义模型卸掉，避免继续用错模型
+    if any(field in data for field in ("local_model", "local_model_dir", "models_dir")):
+        semantic.unload_local_model()
+
+    return _segment_settings_payload()
+
+
+@app.post(
+    "/api/settings/segment/test",
+    response_model=SegmentTestResponse,
+    summary="测试语义后端（本地模型 / API）",
+)
+def test_segment_backend(payload: Optional[SegmentTestRequest] = None) -> SegmentTestResponse:
+    """试跑一次最小请求，确认后端真的可用。
+
+    * ``local``：加载模型并对两句话求向量（首次会触发下载）；
+    * ``api``：用配置的接口问一句"请只输出 []"。
+    """
+    target = ((payload.target if payload else "local") or "local").strip().lower()
+    if target not in ("local", "api"):
+        raise HTTPException(status_code=400, detail="target 必须是 local / api")
+
+    started = time.perf_counter()
+    try:
+        if target == "local":
+            vectors = semantic.embed_sentences(["这是一段测试文本。", "这是第二段测试文本。"])
+            detail = f"本地模型可用，向量维度 {len(vectors[0]) if vectors else 0}"
+        else:
+            segmenter = semantic.SemanticSegmenter(
+                strategy=semantic.STRATEGY_SEMANTIC_API, fallback=False
+            )
+            from model import Token as _Token
+
+            # 至少 5 句：语义分段在句子太少的输入上会直接返回规则结果，
+            # 那样就测不到 API 通不通了（之前 3 句时误报"可用"）。
+            probe = [
+                _Token(
+                    id=f"t{index}",
+                    text=f"第{index}句测试文本。",
+                    start=float(index),
+                    end=float(index) + 0.9,
+                    is_deleted=False,
+                    confidence=1.0,
+                )
+                for index in range(1, 6)
+            ]
+            segmenter.segment(probe)
+            if segmenter.last_backend != "api" or segmenter.last_error:
+                raise RuntimeError(segmenter.last_error or "API 未实际生效")
+            detail = f"API 可用（模型 {semantic.api_config().get('model', '')}）"
+        return SegmentTestResponse(
+            ok=True, detail=detail, elapsed_ms=round((time.perf_counter() - started) * 1000, 1)
+        )
+    except Exception as exc:  # noqa: BLE001 - 测试接口要把原因原样返回
+        return SegmentTestResponse(
+            ok=False,
+            detail=str(exc),
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
 
 
 # ----------------------------------------------------------------------

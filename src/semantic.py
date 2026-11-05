@@ -36,6 +36,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import app_settings
 from model import Token
 from segmenter import (
     RuleSegmenter,
@@ -106,9 +107,32 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def segment_settings() -> Dict[str, Any]:
+    """语义分段设置（``data/settings.json`` 的 ``segment`` 节）。"""
+    try:
+        return app_settings.get_section("segment")
+    except Exception:  # noqa: BLE001 - 设置读不出来就用默认
+        return {}
+
+
 def local_model_name() -> str:
-    """本地向量模型名（``WORDCUT_SEMANTIC_MODEL`` 可覆盖）。"""
-    return os.environ.get("WORDCUT_SEMANTIC_MODEL", "").strip() or DEFAULT_LOCAL_MODEL
+    """本地向量模型名：环境变量 > 设置 > 默认。"""
+    env = os.environ.get("WORDCUT_SEMANTIC_MODEL", "").strip()
+    if env:
+        return env
+    return str(segment_settings().get("local_model") or "").strip() or DEFAULT_LOCAL_MODEL
+
+
+def local_model_dir_override() -> Optional[Path]:
+    """设置里指定的"已有的本地模型目录"（填了就不再按仓库名下载）。"""
+    raw = str(segment_settings().get("local_model_dir") or "").strip()
+    if not raw:
+        env = os.environ.get("WORDCUT_SEMANTIC_MODEL_DIR", "").strip()
+        raw = env
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    return path if path.is_dir() else None
 
 
 def idle_seconds() -> float:
@@ -125,9 +149,19 @@ def api_config() -> Dict[str, str]:
         WORDCUT_SEMANTIC_API_KEY    密钥（Bearer）
         WORDCUT_SEMANTIC_API_MODEL  模型名，例如 gpt-4o-mini
     """
-    base = os.environ.get("WORDCUT_SEMANTIC_API_BASE", "").strip().rstrip("/")
-    key = os.environ.get("WORDCUT_SEMANTIC_API_KEY", "").strip()
-    model = os.environ.get("WORDCUT_SEMANTIC_API_MODEL", "").strip()
+    section = segment_settings()
+    base = (
+        os.environ.get("WORDCUT_SEMANTIC_API_BASE", "").strip()
+        or str(section.get("api_base") or "").strip()
+    ).rstrip("/")
+    key = (
+        os.environ.get("WORDCUT_SEMANTIC_API_KEY", "").strip()
+        or str(section.get("api_key") or "").strip()
+    )
+    model = (
+        os.environ.get("WORDCUT_SEMANTIC_API_MODEL", "").strip()
+        or str(section.get("api_model") or "").strip()
+    )
     if base and model:
         return {"base": base, "key": key, "model": model}
     return {}
@@ -274,11 +308,21 @@ print("ok")
 
 
 def semantic_model_dir() -> Path:
-    """本地语义模型目录（``models/semantic-<安全名>/``）。"""
+    """本地语义模型目录。
+
+    优先级：设置的 ``local_model_dir`` > 设置的 ``models_dir`` > ``models/``。
+    """
+    override = local_model_dir_override()
+    if override is not None:
+        return override
+
     from model_fetch import models_root
 
+    section = segment_settings()
+    custom_root = str(section.get("models_dir") or "").strip()
+    root = Path(custom_root).expanduser() if custom_root else models_root()
     safe = local_model_name().replace("/", "__")
-    return models_root() / f"{SEMANTIC_DIR_PREFIX}{safe}"
+    return root / f"{SEMANTIC_DIR_PREFIX}{safe}"
 
 
 def _pick_onnx_file(model_dir: Path) -> Path:
@@ -312,6 +356,13 @@ def ensure_onnx_model(log: Optional[Any] = None) -> Path:
             return target
     except RuntimeError:
         pass
+
+    # 指定了"已有模型目录"却内容不全：直接给出明确错误，不要去下载覆盖用户的目录
+    if local_model_dir_override() is not None:
+        raise RuntimeError(
+            f"指定的模型目录 {target} 里没有可用的 onnx + tokenizer.json，"
+            "请检查设置里的「本地模型目录」"
+        )
 
     if os.environ.get("WORDCUT_NO_MODEL_DOWNLOAD", "").strip() == "1":
         raise RuntimeError(
@@ -764,3 +815,43 @@ def build_segmenter(strategy: Optional[str] = None, **kwargs: Any) -> Segmenter:
     if name == STRATEGY_RULE:
         return RuleSegmenter()
     return SemanticSegmenter(strategy=name, **kwargs)
+
+
+# ----------------------------------------------------------------------
+# 可选的本地模型（界面下拉用）
+# ----------------------------------------------------------------------
+#: 常用中文向量模型：仓库名 -> 说明。都是 Xenova 的 ONNX 版，量化后体积小。
+AVAILABLE_LOCAL_MODELS: Tuple[Dict[str, str], ...] = (
+    {
+        "id": "Xenova/bge-small-zh-v1.5",
+        "name": "BGE-small-zh（默认）",
+        "detail": "约 23MB，速度快，适合日常分段",
+    },
+    {
+        "id": "Xenova/bge-base-zh-v1.5",
+        "name": "BGE-base-zh",
+        "detail": "约 100MB，语义更细，适合长篇稿件",
+    },
+    {
+        "id": "Xenova/bge-large-zh-v1.5",
+        "name": "BGE-large-zh",
+        "detail": "约 330MB，最准但更吃内存",
+    },
+)
+
+
+def describe_local_models() -> List[Dict[str, Any]]:
+    """本地模型清单（含"当前是否已下载"）。"""
+    items: List[Dict[str, Any]] = []
+    current = local_model_name()
+    for item in AVAILABLE_LOCAL_MODELS:
+        target = semantic_model_dir() if item["id"] == current else None
+        ready = False
+        if target is not None:
+            try:
+                _pick_onnx_file(target)
+                ready = (target / "tokenizer.json").is_file()
+            except RuntimeError:
+                ready = False
+        items.append({**item, "current": item["id"] == current, "ready": ready})
+    return items

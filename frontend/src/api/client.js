@@ -473,6 +473,31 @@ export function resegment(projectId, strategy) {
 }
 
 /**
+ * GET /api/settings/segment -> SegmentSettingsResponse
+ *
+ * 语义分段设置（API key 不回传明文，只给 api_key_set）。
+ */
+export function fetchSegmentSettings() {
+  return request('/api/settings/segment')
+}
+
+/**
+ * PUT /api/settings/segment -> SegmentSettingsResponse
+ * @param {object} patch 只传要改的字段；api_key 传 '-' 表示清除
+ */
+export function saveSegmentSettings(patch) {
+  return request('/api/settings/segment', { method: 'PUT', body: patch })
+}
+
+/**
+ * POST /api/settings/segment/test -> { ok, detail, elapsed_ms }
+ * @param {'local'|'api'} target
+ */
+export function testSegmentBackend(target = 'local') {
+  return request('/api/settings/segment/test', { method: 'POST', body: { target } })
+}
+
+/**
  * GET /api/segment/strategies -> { default, strategies: [...] }
  */
 export function fetchSegmentStrategies() {
@@ -519,6 +544,9 @@ export default {
   fetchWaveformPeaks,
   resegment,
   fetchSegmentStrategies,
+  fetchSegmentSettings,
+  saveSegmentSettings,
+  testSegmentBackend,
   fetchModelStatus,
   unloadModels,
   fetchTokens,
