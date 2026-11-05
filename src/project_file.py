@@ -115,6 +115,8 @@ def build_project_doc(project: Dict[str, Any]) -> Dict[str, Any]:
         "words": [dict(item) for item in words],
         "deleted_ids": sorted(str(item) for item in deleted_ids),
         "audio_params": dict(project.get("audio_params") or {}),
+        # 分段策略：工程走到别的机器上也保持同样的段落切法
+        "segment_strategy": str(project.get("segment_strategy") or "rule"),
         "in_out": project.get("in_out"),
         "created_at": str(project.get("created_at", "")),
         "modified_at": _now_iso(),
@@ -209,6 +211,7 @@ def parse_project_doc(doc: Any) -> Dict[str, Any]:
             if isinstance(doc.get("audio_params"), dict)
             else {}
         ),
+        "segment_strategy": str(doc.get("segment_strategy") or "rule"),
         "in_out": doc.get("in_out"),
         "tokens": tokens,
         "integrity": integrity,

@@ -93,7 +93,8 @@ CREATE TABLE IF NOT EXISTS projects (
     updated_at        TEXT NOT NULL,
     words_json        TEXT NOT NULL DEFAULT '[]',
     deleted_ids_json  TEXT NOT NULL DEFAULT '[]',
-    audio_params_json TEXT NOT NULL DEFAULT '{}'
+    audio_params_json TEXT NOT NULL DEFAULT '{}',
+    segment_strategy  TEXT NOT NULL DEFAULT 'rule'
 )
 """
 
@@ -102,6 +103,8 @@ CREATE TABLE IF NOT EXISTS projects (
 #: 键为列名，值为列定义。
 _MIGRATION_COLUMNS: Dict[str, str] = {
     "audio_params_json": "TEXT NOT NULL DEFAULT '{}'",
+    # 分段策略（rule / semantic / semantic_local / semantic_api）
+    "segment_strategy": "TEXT NOT NULL DEFAULT 'rule'",
 }
 
 #: 列表接口按创建时间倒序，建索引避免全表排序。
@@ -116,8 +119,8 @@ _UPSERT_SQL: str = """
 INSERT INTO projects (
     id, name, audio_path, source_path, source_kind,
     sample_rate, created_at, updated_at, words_json, deleted_ids_json,
-    audio_params_json
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    audio_params_json, segment_strategy
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     name              = excluded.name,
     audio_path        = excluded.audio_path,
@@ -128,14 +131,15 @@ ON CONFLICT(id) DO UPDATE SET
     updated_at        = excluded.updated_at,
     words_json        = excluded.words_json,
     deleted_ids_json  = excluded.deleted_ids_json,
-    audio_params_json = excluded.audio_params_json
+    audio_params_json = excluded.audio_params_json,
+    segment_strategy  = excluded.segment_strategy
 """
 
 #: 查询列顺序与 :func:`_row_to_project` 的取值一一对应（写全列名，不用 ``SELECT *``）。
 _SELECT_COLUMNS: str = (
     "id, name, audio_path, source_path, source_kind, "
     "sample_rate, created_at, updated_at, words_json, deleted_ids_json, "
-    "audio_params_json"
+    "audio_params_json, segment_strategy"
 )
 
 
@@ -271,6 +275,7 @@ def _row_to_project(row: sqlite3.Row) -> Dict[str, Any]:
         "words": _loads_words(row["words_json"]),
         "deleted_ids": _loads_ids(row["deleted_ids_json"]),
         "audio_params": _loads_params(row["audio_params_json"]),
+        "segment_strategy": _as_str(row["segment_strategy"], "rule"),
         "created_at": _as_str(row["created_at"]),
         "updated_at": _as_str(row["updated_at"]),
     }
@@ -419,6 +424,7 @@ class Repository:
             _dumps(project.get("words") or []),
             _dumps(sorted(str(item) for item in (project.get("deleted_ids") or ()))),
             _dumps(project.get("audio_params") or {}),
+            _as_str(project.get("segment_strategy"), "rule") or "rule",
         )
 
     def _existing_created_at(self, pid: str) -> Optional[str]:

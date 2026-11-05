@@ -84,6 +84,14 @@ set WORDCUT_WHISPER_MODEL_PATH=D:\models\faster-whisper-small
 | `WORDCUT_WHISPER_BATCHED` | `1` | `0` 关闭批处理转写（退回顺序模式） |
 | `WORDCUT_WHISPER_BATCH_SIZE` | `8` | 批处理并行窗口数 |
 | `WORDCUT_WHISPER_BEAM` | `5` | 顺序模式的 beam size |
+| `WORDCUT_SEGMENT_STRATEGY` | `rule` | 默认分段策略（rule / semantic / semantic_local / semantic_api） |
+| `WORDCUT_SEMANTIC_MODEL` | `Xenova/bge-small-zh-v1.5` | 本地语义模型（ONNX，约 25MB，首次自动下载） |
+| `WORDCUT_SEMANTIC_ON_GPU` | 空 | `1` 时语义模型也用 GPU（默认纯 CPU，省显存） |
+| `WORDCUT_SEMANTIC_API_BASE` | 空 | 语义分段 API 的 base（OpenAI 兼容，如 `https://api.openai.com/v1`） |
+| `WORDCUT_SEMANTIC_API_KEY` | 空 | 语义分段 API 的 key |
+| `WORDCUT_SEMANTIC_API_MODEL` | 空 | 语义分段 API 的模型名 |
+| `WORDCUT_SEMANTIC_IDLE_SECONDS` | `600` | 语义模型空闲多久自动卸载 |
+| `WORDCUT_WHISPER_IDLE_SECONDS` | `900` | 转写模型空闲多久自动卸载 |
 
 ---
 
@@ -124,9 +132,10 @@ npm run build
 
 1. **选择文件**（音频或视频）→ 自动转 16kHz 单声道 WAV 并创建项目
 2. **转写** → 词级时间戳；长素材按 10 分钟分块，边转边出，可断点续转
-3. **删改** → 选中文本按 `Delete` 删除；连片删除自动合并成一段（词间停顿一并剪掉）
-4. **试听** → 空格播放；波形上红色块 = 已删除区间
-5. **导出** → 音频（wav/mp3/m4a）+ 字幕（SRT）+ EDL（JSON）；可选导出成品 MP4
+3. **分段** → 右侧面板可选「规则 / 语义（本地模型）/ 语义（API）」重新切段，不改变任何词与时间戳
+4. **删改** → 选中文本按 `Delete` 删除；连片删除自动合并成一段（词间停顿一并剪掉）
+5. **试听** → 空格播放；波形上红色块 = 已删除区间
+6. **导出** → 音频（wav/mp3/m4a）+ 字幕（SRT）+ EDL（JSON）；可选导出成品 MP4
 
 ---
 

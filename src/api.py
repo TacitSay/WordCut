@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import shutil
@@ -59,6 +60,7 @@ import store as store_mod  # noqa: E402
 import silence  # noqa: E402
 import subtitle  # noqa: E402
 import model_fetch  # noqa: E402
+import semantic  # noqa: E402
 from model import DeleteSpan, TimeMap, Token  # noqa: E402
 
 __all__ = [
@@ -131,6 +133,35 @@ _PROJECTS_LOCK: threading.Lock = threading.Lock()
 
 #: faster-whisper 模型单例（惰性加载）及其锁。
 _whisper_model: Optional[Any] = None
+
+#: 转写模型空闲多久自动卸载（秒）；0 表示不自动卸载。
+_WHISPER_IDLE_SECONDS: float = float(os.environ.get("WORDCUT_WHISPER_IDLE_SECONDS") or 900)
+
+
+def _unload_whisper_model() -> bool:
+    """卸载 faster-whisper 模型并回收内存/显存；未加载时返回 ``False``。
+
+    转写模型 fp16 的 small 约 500MB 显存，长素材转完后常常几十分钟不再使用。
+    这里显式释放，避免"开一次应用就常驻一份显存"。
+    """
+    global _whisper_model, _batched_pipeline, _batched_pipeline_model
+    with _whisper_lock:
+        if _whisper_model is None:
+            return False
+        _whisper_model = None
+        _batched_pipeline = None
+        _batched_pipeline_model = None
+    gc.collect()
+    # 只清理"已经加载过"的 torch 显存；不要为了 empty_cache 去 import torch
+    # （import 本身就要几百 MB，会让卸载变成负优化）
+    torch_module = sys.modules.get("torch")
+    if torch_module is not None:
+        try:
+            if torch_module.cuda.is_available():
+                torch_module.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+    return True
 _whisper_lock: threading.Lock = threading.Lock()
 
 #: 实际生效的转写后端信息（``{"device": "cuda", "compute_type": "float16"}``）。
@@ -500,6 +531,44 @@ def _require_words(project: Dict[str, Any]) -> List[Dict[str, Any]]:
     return words
 
 
+#: 默认分段策略（``WORDCUT_SEGMENT_STRATEGY`` 可覆盖，项目内也可单独指定）。
+DEFAULT_SEGMENT_STRATEGY: str = os.environ.get("WORDCUT_SEGMENT_STRATEGY", "").strip() or semantic.STRATEGY_RULE
+
+
+def _segment_strategy_for(project: Optional[Dict[str, Any]] = None) -> str:
+    """取该项目当前的分段策略（项目设置 > 环境变量 > 规则）。"""
+    if project:
+        saved = str(project.get("segment_strategy") or "").strip()
+        if saved:
+            return saved
+    return DEFAULT_SEGMENT_STRATEGY
+
+
+def _segments_for(
+    tokens: Sequence[Token],
+    project: Optional[Dict[str, Any]] = None,
+    strategy: Optional[str] = None,
+) -> List[Any]:
+    """按策略切段；语义后端不可用或出错时自动回退规则分段。
+
+    参数:
+        tokens: Token 序列。
+        project: 项目字典（用于读项目级策略）。
+        strategy: 显式指定策略，优先于项目设置。
+
+    返回:
+        `segmenter.Segment` 列表。
+    """
+    name = (strategy or _segment_strategy_for(project) or semantic.STRATEGY_RULE).strip()
+    if name != semantic.STRATEGY_RULE:
+        try:
+            active = semantic.build_segmenter(name)
+            return segmenter.segment_tokens(tokens, active)
+        except Exception as exc:  # noqa: BLE001 - 语义失败不该让接口挂掉
+            _whisper_runtime["segment_fallback"] = f"{name} 失败，已回退规则分段：{exc}"
+    return segmenter.segment_tokens(tokens)
+
+
 def _duration_of(project: Dict[str, Any]) -> float:
     """源音频时长（秒）：优先用样本数 / 采样率，读不到时回退到文件头信息。"""
     audio_path = Path(project["audio_path"])
@@ -853,6 +922,7 @@ def _get_whisper_model() -> Any:
     global _whisper_model
     with _whisper_lock:
         if _whisper_model is not None:
+            _whisper_runtime["last_used"] = time.time()
             return _whisper_model
 
         model_path = _resolve_model_path()
@@ -1289,7 +1359,7 @@ def get_project_detail(pid: str) -> ProjectDetailResponse:
     words = [WordOut(**item) for item in (project.get("words") or [])]
     deleted_ids = _snapshot_deleted_ids(project)
     tokens = _tokens_of(project, deleted_ids)
-    segments = segmenter.segment_tokens(tokens)
+    segments = _segments_for(tokens, project)
 
     return ProjectDetailResponse(
         project_id=str(project["id"]),
@@ -1492,6 +1562,7 @@ async def create_project(
         "words": [],
         "deleted_ids": set(),
         "audio_params": {},
+        "segment_strategy": DEFAULT_SEGMENT_STRATEGY,
         "created_at": _now_iso(),
     }
     _store.put(project)
@@ -2038,7 +2109,7 @@ def get_tokens(pid: str) -> TokenListResponse:
     _require_words(project)
     deleted_ids = _snapshot_deleted_ids(project)
     tokens = _tokens_of(project, deleted_ids)
-    segments = segmenter.segment_tokens(tokens)
+    segments = _segments_for(tokens, project)
     return TokenListResponse(
         project_id=pid,
         sample_rate=int(project["sample_rate"]),
@@ -2536,12 +2607,13 @@ def load_project_file(payload: LoadProjectRequest) -> LoadProjectResponse:
         "words": loaded["words"],
         "deleted_ids": set(loaded["deleted_ids"]),
         "audio_params": loaded.get("audio_params") or {},
+        "segment_strategy": loaded.get("segment_strategy") or DEFAULT_SEGMENT_STRATEGY,
         "created_at": loaded["created_at"] or _now_iso(),
     }
     _store.put(project)
 
     tokens = loaded["tokens"]
-    segments = segmenter.segment_tokens(tokens)
+    segments = _segments_for(tokens, loaded)
 
     return LoadProjectResponse(
         project_id=project["id"],
@@ -2594,7 +2666,7 @@ def _restore_project_from_doc(loaded: Dict[str, Any]) -> Dict[str, Any]:
     _store.put(project)
 
     tokens = loaded["tokens"]
-    segments = segmenter.segment_tokens(tokens)
+    segments = _segments_for(tokens, loaded)
     return {
         "project_id": project["id"],
         "name": project["name"],
@@ -3332,6 +3404,263 @@ def preview_subtitle(
     return PreviewResponse(
         project_id=pid, format="plain", content=_srt_to_plain(srt_text)
     )
+
+
+# ----------------------------------------------------------------------
+# 接口：分段策略 / 模型内存
+# ----------------------------------------------------------------------
+class SegmentRequest(BaseModel):
+    """重新分段的请求体。"""
+
+    strategy: Optional[str] = Field(
+        None,
+        description="rule / semantic / semantic_local / semantic_api；留空用项目当前策略",
+    )
+
+
+class SegmentResponse(BaseModel):
+    """重新分段的结果。"""
+
+    project_id: str = Field(..., description="项目 id")
+    strategy: str = Field(..., description="实际使用的策略")
+    segments: List[SegmentOut] = Field(default_factory=list, description="段落")
+    fallback_error: str = Field("", description="语义后端失败并回退时的原因")
+
+
+class StrategyInfo(BaseModel):
+    """一条可用策略的说明。"""
+
+    id: str = Field(..., description="策略 id")
+    name: str = Field(..., description="显示名")
+    detail: str = Field("", description="补充说明")
+    available: bool = Field(True, description="当前是否可用")
+
+
+class SegmentStrategiesResponse(BaseModel):
+    """策略清单。"""
+
+    default: str = Field(..., description="当前默认策略")
+    strategies: List[StrategyInfo] = Field(default_factory=list)
+
+
+class ModelStatus(BaseModel):
+    """单个模型的内存状态。"""
+
+    name: str = Field(..., description="模型标识")
+    loaded: bool = Field(False, description="是否已加载")
+    detail: str = Field("", description="设备 / 精度等")
+    idle_seconds: float = Field(0.0, description="空闲秒数")
+
+
+class ModelsStatusResponse(BaseModel):
+    """内存与模型总览。"""
+
+    rss_mb: float = Field(0.0, description="当前进程常驻内存（MB）")
+    cuda_allocated_mb: float = Field(0.0, description="PyTorch 已分配显存（MB）")
+    models: List[ModelStatus] = Field(default_factory=list)
+    idle_unload_seconds: Dict[str, float] = Field(default_factory=dict)
+
+
+class UnloadRequest(BaseModel):
+    """卸载模型的请求体。"""
+
+    target: str = Field("all", description="whisper / semantic / all")
+
+
+class UnloadResponse(BaseModel):
+    """卸载结果。"""
+
+    unloaded: List[str] = Field(default_factory=list, description="实际卸载的模型")
+
+
+@app.get(
+    "/api/segment/strategies",
+    response_model=SegmentStrategiesResponse,
+    summary="列出可选的分段策略",
+)
+def list_segment_strategies() -> SegmentStrategiesResponse:
+    """返回分段策略及可用性（API 未配置时 semantic_api 会标记不可用）。"""
+    return SegmentStrategiesResponse(
+        default=DEFAULT_SEGMENT_STRATEGY,
+        strategies=[StrategyInfo(**item) for item in semantic.describe_strategies()],
+    )
+
+
+@app.post(
+    "/api/projects/{pid}/segment",
+    response_model=SegmentResponse,
+    summary="用指定策略重新分段",
+)
+def resegment(pid: str, payload: Optional[SegmentRequest] = None) -> SegmentResponse:
+    """按策略重新切段并记住选择。
+
+    语义后端（本地模型 / API）失败时**不会报错**，而是回退规则分段并把原因
+    放进 ``fallback_error``——分段是展示层能力，不该因为模型问题让项目不可用。
+
+    异常:
+        404: 项目不存在；400: 尚未转写。
+    """
+    project = _get_project(pid)
+    _require_words(project)
+    strategy = (payload.strategy if payload else None) or _segment_strategy_for(project)
+    if strategy not in semantic.STRATEGIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未知分段策略 {strategy!r}，可选：{'/'.join(semantic.STRATEGIES)}",
+        )
+
+    tokens = _tokens_of(project, _snapshot_deleted_ids(project))
+    _whisper_runtime.pop("segment_fallback", None)
+    segments = _segments_for(tokens, project, strategy=strategy)
+    fallback = str(_whisper_runtime.get("segment_fallback") or "")
+
+    with _PROJECTS_LOCK:
+        project["segment_strategy"] = strategy
+    _store.put(project)
+
+    return SegmentResponse(
+        project_id=pid,
+        strategy=strategy,
+        segments=[SegmentOut(**seg.to_dict()) for seg in segments],
+        fallback_error=fallback,
+    )
+
+
+@app.get(
+    "/api/system/models",
+    response_model=ModelsStatusResponse,
+    summary="查看模型占用与空闲时长",
+)
+def system_models() -> ModelsStatusResponse:
+    """返回进程内存、显存与各模型的加载状态（供界面显示/手动释放）。"""
+    whisper_loaded = _whisper_model is not None
+    whisper_idle = 0.0
+    if whisper_loaded:
+        whisper_idle = max(0.0, time.time() - float(_whisper_runtime.get("last_used") or 0.0))
+
+    models = [
+        ModelStatus(
+            name="whisper",
+            loaded=whisper_loaded,
+            detail=(
+                f"{_whisper_runtime.get('device', '')}/{_whisper_runtime.get('compute_type', '')}"
+                if whisper_loaded
+                else ""
+            ),
+            idle_seconds=round(whisper_idle, 1),
+        )
+    ]
+    local = semantic.local_model_status()
+    models.append(
+        ModelStatus(
+            name=f"semantic:{local['model']}",
+            loaded=bool(local["loaded"]),
+            detail=str(local["device"] or ""),
+            idle_seconds=float(local["idle_seconds"]),
+        )
+    )
+
+    rss_mb = 0.0
+    try:
+        import psutil  # 可选依赖，没有就跳过
+
+        rss_mb = round(psutil.Process().memory_info().rss / 1048576, 1)
+    except Exception:  # noqa: BLE001
+        try:
+            import resource  # type: ignore[import-not-found]
+
+            rss_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+        except Exception:  # noqa: BLE001
+            rss_mb = 0.0
+
+    cuda_mb = 0.0
+    # 只读"已经加载过"的 torch：为了看一眼显存去 import torch 会多占几百 MB，
+    # 这个接口本来是用来观察内存的，自己先涨一大截就荒谬了。
+    torch_module = sys.modules.get("torch")
+    if torch_module is not None:
+        try:
+            if torch_module.cuda.is_available():
+                cuda_mb = round(torch_module.cuda.memory_allocated() / 1048576, 1)
+        except Exception:  # noqa: BLE001
+            cuda_mb = 0.0
+
+    return ModelsStatusResponse(
+        rss_mb=rss_mb,
+        cuda_allocated_mb=cuda_mb,
+        models=models,
+        idle_unload_seconds={
+            "whisper": float(_WHISPER_IDLE_SECONDS),
+            "semantic": float(semantic.idle_seconds()),
+        },
+    )
+
+
+@app.post(
+    "/api/system/unload",
+    response_model=UnloadResponse,
+    summary="手动释放模型内存",
+)
+def system_unload(payload: Optional[UnloadRequest] = None) -> UnloadResponse:
+    """卸载指定模型（默认全部），释放内存/显存。
+
+    转写模型与语义模型都是"用时加载、闲时释放"——手动释放后下次调用会重新加载，
+    只是要再等几秒。
+    """
+    target = ((payload.target if payload else "all") or "all").strip().lower()
+    if target not in ("whisper", "semantic", "all"):
+        raise HTTPException(
+            status_code=400, detail=f"target 必须是 whisper / semantic / all，实际 {target!r}"
+        )
+
+    unloaded: List[str] = []
+    if target in ("whisper", "all") and _unload_whisper_model():
+        unloaded.append("whisper")
+    if target in ("semantic", "all") and semantic.unload_local_model():
+        unloaded.append("semantic")
+    return UnloadResponse(unloaded=unloaded)
+
+
+# ----------------------------------------------------------------------
+# 空闲卸载：模型用不到就还回去
+# ----------------------------------------------------------------------
+#: 检查间隔（秒）。太短会白跑 CPU，太长则释放不及时。
+_IDLE_CHECK_SECONDS: float = 30.0
+_idle_thread: Optional[threading.Thread] = None
+
+
+def _idle_unload_loop() -> None:
+    """后台线程：定期卸载长时间没用的模型。
+
+    为什么要它：转写模型（fp16 small ≈ 500MB 显存）和语义模型（≈300MB 内存）
+    都是"用时加载"的重货。长素材转完、或只改了文字没再转写，它们会一直占着。
+    这里用"空闲超时"兜底，配合 ``/api/system/unload`` 的手动释放。
+    """
+    while True:
+        try:
+            time.sleep(_IDLE_CHECK_SECONDS)
+            semantic.maybe_unload_local()
+            if _WHISPER_IDLE_SECONDS > 0 and _whisper_model is not None:
+                last_used = float(_whisper_runtime.get("last_used") or 0.0)
+                if last_used and (time.time() - last_used) >= _WHISPER_IDLE_SECONDS:
+                    _unload_whisper_model()
+        except Exception:  # noqa: BLE001 - 后台线程不能死
+            continue
+
+
+def _start_idle_unloader() -> None:
+    """启动空闲卸载线程（只启一次；测试里可用环境变量关掉）。"""
+    global _idle_thread
+    if os.environ.get("WORDCUT_DISABLE_IDLE_UNLOAD", "").strip() == "1":
+        return
+    if _idle_thread is not None and _idle_thread.is_alive():
+        return
+    _idle_thread = threading.Thread(
+        target=_idle_unload_loop, name="wordcut-idle-unload", daemon=True
+    )
+    _idle_thread.start()
+
+
+_start_idle_unloader()
 
 
 # ----------------------------------------------------------------------

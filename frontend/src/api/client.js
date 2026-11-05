@@ -459,6 +459,42 @@ export async function fetchAudition(projectId, { source_time, pad = 1.2 } = {}) 
 }
 
 /**
+ * POST /api/projects/{pid}/segment -> SegmentResponse
+ *
+ * 用指定策略（rule / semantic / semantic_local / semantic_api）重新分段。
+ * 语义后端失败时不会报错，而是回退规则分段并把原因放在 fallback_error。
+ *
+ * @param {string} projectId
+ * @param {string} [strategy]
+ */
+export function resegment(projectId, strategy) {
+  const body = strategy ? { strategy } : {}
+  return request(projectPath(projectId, '/segment'), { method: 'POST', body })
+}
+
+/**
+ * GET /api/segment/strategies -> { default, strategies: [...] }
+ */
+export function fetchSegmentStrategies() {
+  return request('/api/segment/strategies')
+}
+
+/**
+ * GET /api/system/models -> { rss_mb, cuda_allocated_mb, models, idle_unload_seconds }
+ */
+export function fetchModelStatus() {
+  return request('/api/system/models')
+}
+
+/**
+ * POST /api/system/unload -> { unloaded: [...] }
+ * @param {'whisper'|'semantic'|'all'} [target]
+ */
+export function unloadModels(target = 'all') {
+  return request('/api/system/unload', { method: 'POST', body: { target } })
+}
+
+/**
  * GET /api/projects/{pid}/preview?srt=true|false -> PreviewResponse
  * @param {string} projectId
  * @param {{ srt?: boolean }} [options]
@@ -481,6 +517,10 @@ export default {
   startTranscription,
   fetchTranscriptionStatus,
   fetchWaveformPeaks,
+  resegment,
+  fetchSegmentStrategies,
+  fetchModelStatus,
+  unloadModels,
   fetchTokens,
   deleteTokens,
   restoreTokens,

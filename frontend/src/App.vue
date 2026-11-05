@@ -58,6 +58,10 @@ import {
   startTranscription,
   fetchTranscriptionStatus,
   fetchWaveformPeaks,
+  resegment,
+  fetchSegmentStrategies,
+  fetchModelStatus,
+  unloadModels,
 } from './api/client.js'
 
 /** 播放头前进/后退步长（秒）。 */
@@ -886,6 +890,7 @@ async function applyProjectDetail(detail) {
   await loadAudioParams()
   await loadAudioInfo()
   await loadWaveformPeaks()
+  syncStrategyFromProject()
 }
 
 /** 从项目管理里打开某个已有项目（不用重新上传）。 */
@@ -1125,6 +1130,90 @@ async function handleUpload() {
     setStatus(`上传失败：${error.message}`, 'error')
   } finally {
     uploading.value = false
+  }
+}
+
+
+/** 把项目里保存的分段策略同步到下拉框（打开/加载工程后调用）。 */
+function syncStrategyFromProject() {
+  const saved = String(project.value?.segment_strategy || '').trim()
+  if (saved) segmentStrategy.value = saved
+  segmentNote.value = ''
+  loadModelStatus()
+}
+
+// ----------------------------------------------------------------------
+// 分段策略 / 模型内存
+// ----------------------------------------------------------------------
+/** 可选分段策略（来自 /api/segment/strategies）。 */
+const segmentStrategies = ref([{ id: 'rule', name: '规则分段', available: true }])
+/** 当前选择的策略。 */
+const segmentStrategy = ref('rule')
+/** 重新分段请求进行中。 */
+const segmenting = ref(false)
+/** 分段结果的提示（含回退原因）。 */
+const segmentNote = ref('')
+/** 模型内存状态。 */
+const modelStatus = ref({ rss_mb: 0, cuda_allocated_mb: 0, models: [] })
+
+/** 拉取策略清单（启动时一次即可）。 */
+async function loadSegmentStrategies() {
+  try {
+    const data = await fetchSegmentStrategies()
+    if (Array.isArray(data?.strategies) && data.strategies.length) {
+      segmentStrategies.value = data.strategies
+    }
+    if (data?.default) segmentStrategy.value = data.default
+  } catch {
+    /* 策略清单拿不到就继续用默认规则分段 */
+  }
+}
+
+/** 拉取内存占用（面板可见时刷新）。 */
+async function loadModelStatus() {
+  try {
+    modelStatus.value = await fetchModelStatus()
+  } catch {
+    /* 内存信息是辅助信息，失败不打断使用 */
+  }
+}
+
+/** 切换策略：立即按新策略重新分段。 */
+async function handleStrategyChange() {
+  await handleResegment()
+}
+
+/** 按当前策略重新分段（不动词与时间戳）。 */
+async function handleResegment() {
+  if (!project.value?.id || !hasTokens.value || segmenting.value) return
+  segmenting.value = true
+  setStatus(`正在按「${segmentStrategy.value}」重新分段…`, 'busy')
+  try {
+    const data = await resegment(project.value.id, segmentStrategy.value)
+    segments.value = Array.isArray(data?.segments) ? [...data.segments] : []
+    const fallback = String(data?.fallback_error || '')
+    segmentNote.value = fallback
+      ? `语义分段失败，已回退规则分段：${fallback.slice(0, 60)}`
+      : `已按 ${data?.strategy || segmentStrategy.value} 分段，共 ${segments.value.length} 段`
+    setStatus(segmentNote.value, fallback ? 'error' : 'success')
+  } catch (error) {
+    setStatus(`重新分段失败：${error.message}`, 'error')
+  } finally {
+    segmenting.value = false
+    await loadModelStatus()
+  }
+}
+
+/** 手动卸载模型，释放内存/显存。 */
+async function handleUnloadModels() {
+  try {
+    const data = await unloadModels('all')
+    const list = Array.isArray(data?.unloaded) ? data.unloaded : []
+    setStatus(list.length ? `已卸载：${list.join('、')}` : '当前没有已加载的模型', 'info')
+  } catch (error) {
+    setStatus(`卸载失败：${error.message}`, 'error')
+  } finally {
+    await loadModelStatus()
   }
 }
 
@@ -1380,6 +1469,7 @@ async function applyLoadedProject(loaded) {
   await loadAudioParams()
   await loadAudioInfo()
   await loadWaveformPeaks()
+  syncStrategyFromProject()
 }
 
 /** 直接读取工程文件内容并加载（无需绝对路径）。 */
@@ -2107,6 +2197,8 @@ async function onDrop(event) {
 }
 
 onMounted(async () => {
+  loadSegmentStrategies()
+  loadModelStatus()
   window.addEventListener('keydown', onKeydown)
   try {
     const info = await health()
@@ -2456,11 +2548,75 @@ onBeforeUnmount(() => {
             </p>
           </section>
 
-          <!-- 预留：参数面板插槽（分段策略 / 剪辑点精修 / 主题等后定） -->
+          <!-- 分段策略 + 模型内存：语义分段可切本地小模型或 API -->
+          <section class="panel-section">
+            <h3 class="panel-section-title">分段</h3>
+            <div class="panel-row">
+              <dt>策略</dt>
+              <dd>
+                <select
+                  v-model="segmentStrategy"
+                  class="input input-small"
+                  :disabled="!hasTokens || segmenting"
+                  @change="handleStrategyChange"
+                >
+                  <option v-for="item in segmentStrategies" :key="item.id" :value="item.id">
+                    {{ item.name }}{{ item.available ? '' : '（未配置）' }}
+                  </option>
+                </select>
+              </dd>
+            </div>
+            <div class="panel-row">
+              <dt>操作</dt>
+              <dd>
+                <button
+                  class="btn btn-small"
+                  type="button"
+                  :disabled="!hasTokens || segmenting"
+                  title="按当前策略重新切段（不会改动词与时间戳）"
+                  @click="handleResegment"
+                >
+                  {{ segmenting ? '分段中…' : '重新分段' }}
+                </button>
+              </dd>
+            </div>
+            <p v-if="segmentNote" class="panel-placeholder">{{ segmentNote }}</p>
+          </section>
+
+          <section class="panel-section">
+            <h3 class="panel-section-title">内存</h3>
+            <dl class="panel-list">
+              <div class="panel-row">
+                <dt>进程占用</dt>
+                <dd class="mono">{{ modelStatus.rss_mb ? modelStatus.rss_mb + ' MB' : '—' }}</dd>
+              </div>
+              <div v-for="m in modelStatus.models" :key="m.name" class="panel-row">
+                <dt class="mono">{{ m.name }}</dt>
+                <dd class="mono">
+                  {{ m.loaded ? '已加载 ' + (m.detail ? '（' + m.detail + '）' : '') : '未加载' }}
+                </dd>
+              </div>
+            </dl>
+            <div class="panel-row">
+              <dt>释放</dt>
+              <dd>
+                <button
+                  class="btn btn-small"
+                  type="button"
+                  title="卸载转写与语义模型，释放内存/显存（下次用到会重新加载）"
+                  @click="handleUnloadModels"
+                >
+                  卸载模型
+                </button>
+              </dd>
+            </div>
+          </section>
+
+          <!-- 预留：参数面板插槽（剪辑点精修 / 主题等后定） -->
           <section class="panel-section">
             <h3 class="panel-section-title">预留</h3>
             <p class="panel-placeholder">
-              预留区域：分段策略、剪辑点精修、主题等后续在此挂载。
+              预留区域：剪辑点精修、主题等后续在此挂载。
             </p>
           </section>
         </div>
