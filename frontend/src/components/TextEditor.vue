@@ -42,6 +42,8 @@ const props = defineProps({
   disabled: { type: Boolean, default: false },
   /** 正在播放的 Token 下标（-1 表示没有）；用于播放头跟随高亮 */
   activeIndex: { type: Number, default: -1 },
+  /** 段落内一句一行（句末标点后换行）。 */
+  sentencePerLine: { type: Boolean, default: true },
 })
 
 const emit = defineEmits(['cursor-change', 'restore', 'seek'])
@@ -77,6 +79,14 @@ function toItem(token, index) {
   }
 }
 
+/** 句末标点（含收尾引号），用于"一句一行"换行判断。 */
+const SENTENCE_END_RE = /[。！？；…]|[.!?;]["'”’）)]?$/
+
+function endsSentence(glyph) {
+  if (!glyph) return false
+  return SENTENCE_END_RE.test(glyph.trim())
+}
+
 /** 段落列表：[{ key, index, items, isLast }]。 */
 const paragraphs = computed(() => {
   if (!props.tokens.length) return []
@@ -95,7 +105,7 @@ const paragraphs = computed(() => {
       items.push(toItem(props.tokens[index], index))
     }
     if (items.length) {
-      groups.push({ key: `seg-${segment?.index ?? groups.length}`, index: segment?.index ?? groups.length, items })
+      groups.push({ key: `seg-${segment?.index ?? groups.length}`, index: segment?.index ?? groups.length, items, title: String(segment?.title || '') })
     }
   }
 
@@ -462,6 +472,7 @@ onBeforeUnmount(() => {
           @mousedown="beginDragAt($event)"
           @click="onParagraphClick(para, $event)"
         >
+          <span v-if="para.title" class="segment-title">{{ para.title }}</span>
           <template v-for="item in para.items" :key="item.id">
             <span v-if="showCaretBefore(item.index)" class="caret" aria-hidden="true" />
             <span v-if="item.gap" class="token-gap">{{ ' ' }}</span>
@@ -475,6 +486,7 @@ onBeforeUnmount(() => {
               :title="`${item.id} · ${item.start.toFixed(2)}s–${item.end.toFixed(2)}s · 置信度 ${item.confidence.toFixed(2)}`"
               >{{ item.glyph }}</span
             >
+            <br v-if="sentencePerLine && endsSentence(item.glyph)" aria-hidden="true" />
           </template>
           <span v-if="showCaretAfter(para)" class="caret" aria-hidden="true" />
         </p>
@@ -527,7 +539,8 @@ onBeforeUnmount(() => {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  padding: 16px 22px 48px;
+  /* 正文不再贴左：左右留出呼吸边距，内容限宽后居中 */
+  padding: 18px 40px 56px;
 }
 
 .editor-body.is-disabled {
@@ -536,7 +549,8 @@ onBeforeUnmount(() => {
 
 /* 分段显示（I2）：段间距 12px，行高 1.9。 */
 .segment {
-  margin: 0 0 12px;
+  margin: 0 auto 14px;
+  max-width: 880px;
   font-size: 16px;
   line-height: 1.9;
   letter-spacing: 0;
@@ -549,6 +563,23 @@ onBeforeUnmount(() => {
 
 .segment:last-child {
   margin-bottom: 0;
+}
+
+/* 段落小标题：语义分段生成，浅色小字，不参与点击编辑 */
+.segment-title {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--accent);
+  opacity: 0.85;
+  margin: 0 0 4px;
+  user-select: none;
+}
+
+.segment-title::before {
+  content: '§ ';
+  opacity: 0.6;
 }
 
 .token {

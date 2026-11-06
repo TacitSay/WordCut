@@ -60,6 +60,9 @@ const form = ref({
   api_model: '',
   api_timeout: 60,
   api_key: '',
+  sentence_per_line: true,
+  titles_enabled: false,
+  title_max_chars: 16,
 })
 
 const models = ref([])
@@ -99,6 +102,9 @@ async function load() {
       api_model: data.api_model || '',
       api_timeout: Number(data.api_timeout) || 60,
       api_key: '',
+      sentence_per_line: data.sentence_per_line !== false,
+      titles_enabled: Boolean(data.titles_enabled),
+      title_max_chars: Number(data.title_max_chars) || 16,
     }
     models.value = Array.isArray(data.models) ? data.models : []
     apiKeySet.value = Boolean(data.api_key_set)
@@ -165,6 +171,9 @@ function collect(includeKey = true) {
   if (includeKey && form.value.api_key.trim()) {
     payload.api_key = form.value.api_key.trim()
   }
+  payload.sentence_per_line = form.value.sentence_per_line
+  payload.titles_enabled = form.value.titles_enabled
+  payload.title_max_chars = Number(form.value.title_max_chars) || 16
   return payload
 }
 
@@ -210,13 +219,18 @@ async function clearKey() {
         <template v-else>
           <fieldset class="field-group">
             <legend>分段方式</legend>
-            <label v-for="mode in MODES" :key="mode.id" class="radio-row">
-              <input v-model="form.mode" type="radio" :value="mode.id" />
-              <span>
-                <strong>{{ mode.name }}</strong>
-                <small class="radio-detail">{{ mode.detail }}</small>
-              </span>
-            </label>
+            <div class="mode-grid">
+              <label
+                v-for="mode in MODES"
+                :key="mode.id"
+                class="mode-card"
+                :class="{ active: form.mode === mode.id }"
+              >
+                <input v-model="form.mode" type="radio" :value="mode.id" name="segment-mode" />
+                <span class="mode-name">{{ mode.name }}</span>
+                <span class="mode-detail">{{ mode.detail }}</span>
+              </label>
+            </div>
           </fieldset>
 
           <!-- 本地小模型 -->
@@ -300,6 +314,28 @@ async function clearKey() {
             </div>
           </fieldset>
 
+          <fieldset class="field-group">
+            <legend>段落显示</legend>
+            <label class="check-row">
+              <input v-model="form.sentence_per_line" type="checkbox" />
+              <span>一句一行（句末标点后换行，阅读更接近逐句稿）</span>
+            </label>
+            <label class="check-row">
+              <input v-model="form.titles_enabled" type="checkbox" />
+              <span>生成分段小标题</span>
+            </label>
+            <label v-if="form.titles_enabled" class="field-row">
+              <span>标题字数</span>
+              <input
+                v-model.number="form.title_max_chars"
+                class="input input-small"
+                type="number"
+                min="4"
+                max="40"
+              />
+            </label>
+          </fieldset>
+
           <p v-if="modeDetail" class="dialog-hint">{{ modeDetail }}</p>
           <p v-if="message" class="dialog-message" :class="`is-${messageType}`">{{ message }}</p>
           <p v-if="settingsPath" class="dialog-hint mono">配置文件：{{ settingsPath }}</p>
@@ -321,40 +357,91 @@ async function clearKey() {
 
 <style scoped>
 .dialog-settings {
-  width: min(680px, 92vw);
+  width: min(720px, 94vw);
 }
 
-.radio-row {
-  display: flex;
-  gap: 8px;
-  align-items: flex-start;
-  padding: 6px 0;
-  cursor: pointer;
+.field-group {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 14px 12px;
+  margin: 0 0 14px;
 }
 
-.radio-row input {
-  margin-top: 3px;
-}
-
-.radio-detail {
-  display: block;
-  color: var(--text-dim);
+.field-group legend {
+  padding: 0 6px;
   font-size: 12px;
-  line-height: 1.5;
-  margin-top: 2px;
+  color: var(--text-dim);
+  letter-spacing: 1px;
 }
 
+/* 分段方式：三张卡片，选中高亮 */
+.mode-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.mode-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  cursor: pointer;
+  transition:
+    border-color 0.12s ease,
+    background-color 0.12s ease;
+}
+
+.mode-card:hover {
+  border-color: var(--accent);
+}
+
+.mode-card.active {
+  border-color: var(--accent);
+  background: rgba(59, 130, 246, 0.08);
+}
+
+.mode-card input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.mode-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.mode-detail {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+
+/* 字段行：统一左标签宽，输入框对齐 */
 .field-row {
   display: grid;
-  grid-template-columns: 96px 1fr;
-  gap: 8px;
+  grid-template-columns: 92px 1fr;
+  gap: 10px;
   align-items: center;
-  margin: 6px 0;
+  margin: 8px 0;
 }
 
 .field-row > span:first-child {
   color: var(--text-dim);
   font-size: 12px;
+  text-align: right;
+}
+
+.check-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 4px 0;
+  cursor: pointer;
+  font-size: 13px;
 }
 
 .dialog-hint {

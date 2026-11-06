@@ -1181,6 +1181,8 @@ const segmenting = ref(false)
 const segmentNote = ref('')
 /** 模型内存状态。 */
 const modelStatus = ref({ rss_mb: 0, cuda_allocated_mb: 0, models: [] })
+/** 段落显示设置（一句一行 / 分段标题）。 */
+const displaySettings = ref({ sentence_per_line: true, titles_enabled: false })
 /** 设置对话框是否打开（设置 → 语义分段）。 */
 const settingsOpen = ref(false)
 
@@ -1194,6 +1196,15 @@ async function loadSegmentStrategies() {
     if (data?.default) segmentStrategy.value = data.default
   } catch {
     /* 策略清单拿不到就继续用默认规则分段 */
+  }
+  try {
+    const settings = await fetchSegmentSettings()
+    displaySettings.value = {
+      sentence_per_line: settings?.sentence_per_line !== false,
+      titles_enabled: Boolean(settings?.titles_enabled),
+    }
+  } catch {
+    /* 显示设置拿不到就沿用默认 */
   }
 }
 
@@ -1940,6 +1951,13 @@ registerCommands([
     },
   },
   {
+    id: 'file.settings',
+    title: '设置…',
+    menu: 'file',
+    handler: () => handleOpenSettings(),
+    enabled: () => true,
+  },
+  {
     id: 'edit.delete',
     title: '删除选中 Token',
     menu: 'edit',
@@ -2069,13 +2087,6 @@ registerCommands([
     menu: 'tools',
     shortcut: 'Ctrl+R',
     handler: () => handleTranscribe(),
-  },
-  {
-    id: 'settings.segment',
-    title: '设置 · 语义分段…',
-    menu: 'tools',
-    handler: () => handleOpenSettings(),
-    enabled: () => true,
   },
 ])
 
@@ -2346,6 +2357,7 @@ onBeforeUnmount(() => {
             :selection-anchor="selectionAnchor"
             :active-index="activeTokenIndex"
             :disabled="transcribing || exporting"
+            :sentence-per-line="displaySettings.sentence_per_line"
             @cursor-change="handleCursorChange"
             @restore="handleRestoreToken"
             @seek="handleEditorSeek"

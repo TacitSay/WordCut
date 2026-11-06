@@ -54,6 +54,8 @@ class Segment:
     end: float
     text: str
     token_ids: tuple[str, ...]
+    #: 段落小标题（语义分段可生成；空串表示没有）
+    title: str = ""
 
     @property
     def duration(self) -> float:
@@ -68,6 +70,7 @@ class Segment:
             "duration": self.duration,
             "text": self.text,
             "token_ids": list(self.token_ids),
+            "title": self.title,
         }
 
 

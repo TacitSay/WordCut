@@ -55,6 +55,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "api_key": "",
         "api_model": "",
         "api_timeout": 60,
+        # 段落显示：一句一行 / 分段小标题
+        "sentence_per_line": True,
+        "titles_enabled": False,
+        "title_max_chars": 16,
     }
 }
 

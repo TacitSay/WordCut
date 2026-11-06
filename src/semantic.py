@@ -855,3 +855,125 @@ def describe_local_models() -> List[Dict[str, Any]]:
                 ready = False
         items.append({**item, "current": item["id"] == current, "ready": ready})
     return items
+
+
+# ----------------------------------------------------------------------
+# 段落小标题
+# ----------------------------------------------------------------------
+def _clean_title(text: str, max_chars: int = 16) -> str:
+    """把一句话整理成短标题：去标点、截断到 max_chars。"""
+    cleaned = text.strip()
+    for punct in "。！？；…，,、\n":
+        cleaned = cleaned.replace(punct, " ")
+    cleaned = " ".join(cleaned.split())
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars].rstrip()
+    return cleaned
+
+
+def _heuristic_title(paragraph_text: str, max_chars: int) -> str:
+    """规则兜底标题：取第一句去掉标点。"""
+    first = paragraph_text.strip()
+    for index, char in enumerate(first):
+        if char in "。！？；…":
+            first = first[: index + 1]
+            break
+    return _clean_title(first, max_chars)
+
+
+def generate_titles(
+    texts: Sequence[str],
+    mode: str = "local",
+    max_chars: int = 16,
+    log: Optional[Any] = None,
+) -> List[str]:
+    """为每个段落生成一个小标题。
+
+    参数:
+        texts: 段落全文列表（与分段结果一一对应）。
+        mode: ``api``（调 API 生成）/ ``local``（向量法：挑段内最接近
+            "段落中心"的那句话当标题）/ 其他值走启发式（第一句截断）。
+
+    返回:
+        与 ``texts`` 等长的标题列表；生成失败的段落标题为空串，**绝不抛异常**
+        ——标题是锦上添花，不该让分段结果不可用。
+    """
+    say = log or (lambda *_a, **_k: None)
+    result = [""] * len(texts)
+    if not texts:
+        return result
+
+    if mode == "api" and api_config():
+        try:
+            numbered = "\n".join(
+                f"{index + 1}. {text[:200]}" for index, text in enumerate(texts)
+            )
+            prompt = (
+                f"下面是 {len(texts)} 个段落，请给每段起一个不超过 {max_chars} 字的小标题。\n"
+                f"{numbered}\n\n"
+                '只输出 JSON 数组，元素是标题字符串，顺序与段落一致。'
+            )
+            payload = {
+                "model": api_config()["model"],
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": "你是中文编辑，只输出 JSON。"},
+                    {"role": "user", "content": prompt},
+                ],
+            }
+            request = urllib.request.Request(
+                f"{api_config()['base']}/chat/completions",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    **(
+                        {"Authorization": f"Bearer {api_config()['key']}"}
+                        if api_config()["key"]
+                        else {}
+                    ),
+                },
+                method="POST",
+            )
+            timeout = _env_int("WORDCUT_SEMANTIC_API_TIMEOUT", 60)
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = json.loads(response.read().decode("utf-8", "replace"))
+            content = body["choices"][0]["message"]["content"]
+            start, end = content.find("["), content.rfind("]")
+            raw = json.loads(content[start : end + 1]) if 0 <= start < end else []
+            for index, title in enumerate(raw[: len(texts)]):
+                result[index] = _clean_title(str(title), max_chars)
+            say(f"标题生成（API）：{sum(1 for item in result if item)}/{len(texts)}")
+            return result
+        except Exception as exc:  # noqa: BLE001 - 失败落到启发式
+            say(f"API 标题生成失败，改用启发式：{exc}")
+
+    if mode == "local":
+        try:
+            sentences: List[str] = []
+            spans: List[Tuple[int, int]] = []
+            for paragraph_index, text in enumerate(texts):
+                parts = [part for part in text.replace("。", "。\n").split("\n") if part.strip()]
+                spans.append((len(sentences), len(sentences) + len(parts) - 1))
+                sentences.extend(part.strip() for part in parts if part.strip())
+            vectors = embed_sentences(sentences)
+            for paragraph_index, (start, end) in enumerate(spans):
+                chunk = vectors[start : end + 1]
+                if not chunk:
+                    continue
+                size = len(chunk[0])
+                centroid = [sum(row[dim] for row in chunk) / len(chunk) for dim in range(size)]
+                best = max(
+                    range(len(chunk)),
+                    key=lambda row: _cosine(chunk[row], centroid),
+                )
+                result[paragraph_index] = _clean_title(
+                    sentences[start + best], max_chars
+                )
+            say(f"标题生成（向量法）：{sum(1 for item in result if item)}/{len(texts)}")
+            return result
+        except Exception as exc:  # noqa: BLE001 - 失败落到启发式
+            say(f"向量标题生成失败，改用启发式：{exc}")
+
+    for index, text in enumerate(texts):
+        result[index] = _heuristic_title(text, max_chars)
+    return result

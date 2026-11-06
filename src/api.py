@@ -236,6 +236,7 @@ class SegmentOut(BaseModel):
     """段落的 HTTP 形态（由 segmenter.segment_tokens 生成）。"""
 
     index: int = Field(..., description="段落序号（0 起）")
+    title: str = Field("", description="段落小标题（设置开启时生成，可能为空）")
     start: float = Field(..., description="段落起始时间（秒，源时间轴）")
     end: float = Field(..., description="段落结束时间（秒，源时间轴）")
     duration: float = Field(..., description="段落时长（秒）")
@@ -578,13 +579,50 @@ def _segments_for(
         `segmenter.Segment` 列表。
     """
     name = (strategy or _segment_strategy_for(project) or semantic.STRATEGY_RULE).strip()
+    segments: List[Any]
     if name != semantic.STRATEGY_RULE:
         try:
             active = semantic.build_segmenter(name)
-            return segmenter.segment_tokens(tokens, active)
+            segments = segmenter.segment_tokens(tokens, active)
         except Exception as exc:  # noqa: BLE001 - 语义失败不该让接口挂掉
             _whisper_runtime["segment_fallback"] = f"{name} 失败，已回退规则分段：{exc}"
-    return segmenter.segment_tokens(tokens)
+            segments = segmenter.segment_tokens(tokens)
+    else:
+        segments = segmenter.segment_tokens(tokens)
+
+    return _attach_titles(segments)
+
+
+def _attach_titles(segments: Sequence[Any]) -> List[Any]:
+    """按设置给段落挂小标题；未开启或生成失败时保持原样。"""
+    try:
+        section = app_settings.get_section("segment")
+    except Exception:  # noqa: BLE001
+        return list(segments)
+
+    if not section.get("titles_enabled"):
+        return list(segments)
+
+    max_chars = int(section.get("title_max_chars") or 16)
+    mode = str(section.get("mode") or "rule")
+    try:
+        titles = semantic.generate_titles(
+            [seg.text for seg in segments], mode=mode, max_chars=max_chars
+        )
+        # Segment 是 frozen dataclass（不可变是分段结果的可信来源），
+        # 挂标题用 dataclasses.replace 重建对象，而不是原地赋值。
+        import dataclasses
+
+        titled: List[Any] = []
+        for seg, title in zip(segments, titles):
+            if title:
+                titled.append(dataclasses.replace(seg, title=title))
+            else:
+                titled.append(seg)
+        return titled
+    except Exception as exc:  # noqa: BLE001 - 标题失败不影响分段
+        _whisper_runtime["title_error"] = str(exc)
+    return list(segments)
 
 
 def _duration_of(project: Dict[str, Any]) -> float:
@@ -3438,6 +3476,9 @@ class SegmentSettingsResponse(BaseModel):
     api_model: str = Field("", description="API 模型名")
     api_timeout: int = Field(60, description="API 超时（秒）")
     api_key_set: bool = Field(False, description="是否已保存 API key（不回传明文）")
+    sentence_per_line: bool = Field(True, description="段落内一句一行")
+    titles_enabled: bool = Field(False, description="是否生成分段小标题")
+    title_max_chars: int = Field(16, description="小标题最大字数")
     models: List[Dict[str, Any]] = Field(default_factory=list, description="可选本地模型")
     settings_path: str = Field("", description="设置文件路径（便于排查）")
     api_configured: bool = Field(False, description="API 是否配置完整")
@@ -3454,6 +3495,9 @@ class SegmentSettingsPatch(BaseModel):
     api_key: Optional[str] = None
     api_model: Optional[str] = None
     api_timeout: Optional[int] = None
+    sentence_per_line: Optional[bool] = None
+    titles_enabled: Optional[bool] = None
+    title_max_chars: Optional[int] = None
 
 
 class SegmentTestRequest(BaseModel):
@@ -3486,6 +3530,9 @@ def _segment_settings_payload() -> SegmentSettingsResponse:
         api_model=str(section.get("api_model") or ""),
         api_timeout=int(section.get("api_timeout") or 60),
         api_key_set=bool(section.get("api_key_set")),
+        sentence_per_line=bool(section.get("sentence_per_line")),
+        titles_enabled=bool(section.get("titles_enabled")),
+        title_max_chars=int(section.get("title_max_chars") or 16),
         models=models,
         settings_path=str(app_settings.settings_path()),
         api_configured=bool(semantic.api_config()),
@@ -3533,6 +3580,9 @@ def put_segment_settings(patch: SegmentSettingsPatch) -> SegmentSettingsResponse
     timeout = data.get("api_timeout")
     if timeout is not None and not (1 <= int(timeout) <= 600):
         raise HTTPException(status_code=400, detail="api_timeout 必须在 1–600 秒之间")
+    title_chars = data.get("title_max_chars")
+    if title_chars is not None and not (4 <= int(title_chars) <= 40):
+        raise HTTPException(status_code=400, detail="title_max_chars 必须在 4–40 字之间")
 
     try:
         app_settings.update_section("segment", data)
