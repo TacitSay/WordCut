@@ -498,6 +498,20 @@ export function testSegmentBackend(target = 'local') {
 }
 
 /**
+ * GET /api/settings/memory -> { whisper_idle_seconds, semantic_idle_seconds }
+ */
+export function fetchMemorySettings() {
+  return request('/api/settings/memory')
+}
+
+/**
+ * PUT /api/settings/memory -> 同上
+ */
+export function saveMemorySettings(patch) {
+  return request('/api/settings/memory', { method: 'PUT', body: patch })
+}
+
+/**
  * GET /api/segment/strategies -> { default, strategies: [...] }
  */
 export function fetchSegmentStrategies() {
@@ -547,6 +561,8 @@ export default {
   fetchSegmentSettings,
   saveSegmentSettings,
   testSegmentBackend,
+  fetchMemorySettings,
+  saveMemorySettings,
   fetchModelStatus,
   unloadModels,
   fetchTokens,

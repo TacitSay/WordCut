@@ -135,8 +135,21 @@ _PROJECTS_LOCK: threading.Lock = threading.Lock()
 #: faster-whisper 模型单例（惰性加载）及其锁。
 _whisper_model: Optional[Any] = None
 
-#: 转写模型空闲多久自动卸载（秒）；0 表示不自动卸载。
-_WHISPER_IDLE_SECONDS: float = float(os.environ.get("WORDCUT_WHISPER_IDLE_SECONDS") or 900)
+def _whisper_idle_seconds() -> float:
+    """转写模型空闲卸载阈值（秒）：环境变量 > 设置文件 > 默认 900。"""
+    env = os.environ.get("WORDCUT_WHISPER_IDLE_SECONDS", "").strip()
+    if env:
+        try:
+            return max(0.0, float(env))
+        except ValueError:
+            pass
+    try:
+        value = float(
+            app_settings.get_section("memory").get("whisper_idle_seconds") or 900
+        )
+        return max(0.0, value)
+    except Exception:  # noqa: BLE001
+        return 900.0
 
 
 def _unload_whisper_model() -> bool:
@@ -3539,6 +3552,60 @@ def _segment_settings_payload() -> SegmentSettingsResponse:
     )
 
 
+class MemorySettingsResponse(BaseModel):
+    """模型内存设置。"""
+
+    whisper_idle_seconds: float = Field(900, description="转写模型空闲卸载阈值（秒）")
+    semantic_idle_seconds: float = Field(600, description="语义模型空闲卸载阈值（秒）")
+
+
+class MemorySettingsPatch(BaseModel):
+    """更新模型内存设置（0 = 关闭自动卸载）。"""
+
+    whisper_idle_seconds: Optional[float] = None
+    semantic_idle_seconds: Optional[float] = None
+
+
+@app.get(
+    "/api/settings/memory",
+    response_model=MemorySettingsResponse,
+    summary="读取模型内存设置",
+)
+def get_memory_settings() -> MemorySettingsResponse:
+    """空闲卸载阈值；0 表示关闭自动卸载（只能手动释放）。"""
+    section = app_settings.get_section("memory")
+    return MemorySettingsResponse(
+        whisper_idle_seconds=float(
+            section.get("whisper_idle_seconds") or _whisper_idle_seconds()
+        ),
+        semantic_idle_seconds=float(
+            section.get("semantic_idle_seconds") or semantic.idle_seconds()
+        ),
+    )
+
+
+@app.put(
+    "/api/settings/memory",
+    response_model=MemorySettingsResponse,
+    summary="更新模型内存设置",
+)
+def put_memory_settings(patch: MemorySettingsPatch) -> MemorySettingsResponse:
+    """保存空闲卸载阈值；改完立即生效（空闲检查线程每 30 秒读一次）。"""
+    data = patch.dict(exclude_none=True)
+    for key in ("whisper_idle_seconds", "semantic_idle_seconds"):
+        if key in data and not (0 <= float(data[key]) <= 86400):
+            raise HTTPException(status_code=400, detail=f"{key} 必须在 0–86400 秒之间")
+    try:
+        app_settings.update_section("memory", data)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=f"保存设置失败：{exc}") from exc
+    section = app_settings.get_section("memory")
+    return MemorySettingsResponse(
+        whisper_idle_seconds=float(section.get("whisper_idle_seconds") or 900),
+        semantic_idle_seconds=float(section.get("semantic_idle_seconds") or 600),
+    )
+
+
 @app.get(
     "/api/settings/segment",
     response_model=SegmentSettingsResponse,
@@ -3833,7 +3900,7 @@ def system_models() -> ModelsStatusResponse:
         cuda_allocated_mb=cuda_mb,
         models=models,
         idle_unload_seconds={
-            "whisper": float(_WHISPER_IDLE_SECONDS),
+            "whisper": float(_whisper_idle_seconds()),
             "semantic": float(semantic.idle_seconds()),
         },
     )
@@ -3883,9 +3950,10 @@ def _idle_unload_loop() -> None:
         try:
             time.sleep(_IDLE_CHECK_SECONDS)
             semantic.maybe_unload_local()
-            if _WHISPER_IDLE_SECONDS > 0 and _whisper_model is not None:
+            idle_limit = _whisper_idle_seconds()
+            if idle_limit > 0 and _whisper_model is not None:
                 last_used = float(_whisper_runtime.get("last_used") or 0.0)
-                if last_used and (time.time() - last_used) >= _WHISPER_IDLE_SECONDS:
+                if last_used and (time.time() - last_used) >= idle_limit:
                     _unload_whisper_model()
         except Exception:  # noqa: BLE001 - 后台线程不能死
             continue

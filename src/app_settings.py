@@ -59,7 +59,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "sentence_per_line": True,
         "titles_enabled": False,
         "title_max_chars": 16,
-    }
+    },
+    # 模型内存：空闲多久自动卸载（秒，0 = 不自动）
+    "memory": {
+        "whisper_idle_seconds": 900,
+        "semantic_idle_seconds": 600,
+    },
 }
 
 _lock = threading.Lock()

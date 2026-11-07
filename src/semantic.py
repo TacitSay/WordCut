@@ -136,8 +136,15 @@ def local_model_dir_override() -> Optional[Path]:
 
 
 def idle_seconds() -> float:
-    """本地模型空闲卸载阈值（秒），``WORDCUT_SEMANTIC_IDLE_SECONDS``。"""
-    return max(0.0, _env_float("WORDCUT_SEMANTIC_IDLE_SECONDS", DEFAULT_IDLE_SECONDS))
+    """本地模型空闲卸载阈值（秒）：环境变量 > 设置文件 > 默认 600。"""
+    env = os.environ.get("WORDCUT_SEMANTIC_IDLE_SECONDS", "").strip()
+    if env:
+        return max(0.0, _env_float("WORDCUT_SEMANTIC_IDLE_SECONDS", DEFAULT_IDLE_SECONDS))
+    try:
+        value = float(app_settings.get_section("memory").get("semantic_idle_seconds") or 0)
+        return max(0.0, value)
+    except Exception:  # noqa: BLE001
+        return max(0.0, _env_float("WORDCUT_SEMANTIC_IDLE_SECONDS", DEFAULT_IDLE_SECONDS))
 
 
 def api_config() -> Dict[str, str]:

@@ -90,6 +90,13 @@ except ValueError:
 _TMP.write_text("{ 这不是 JSON", encoding="utf-8")
 check("坏 JSON 回退默认", app_settings.load_settings()["segment"]["mode"] == "rule")
 
+# 8b. memory 节（空闲卸载阈值）
+mem = app_settings.get_section("memory")
+check("memory 默认 whisper=900", mem.get("whisper_idle_seconds") == 900)
+check("memory 默认 semantic=600", mem.get("semantic_idle_seconds") == 600)
+app_settings.update_section("memory", {"whisper_idle_seconds": 120})
+check("memory 更新生效", app_settings.get_section("memory")["whisper_idle_seconds"] == 120)
+
 # 9. 目录不存在时自动创建
 _TMP.unlink(missing_ok=True)
 nested = Path(tempfile.mkdtemp(prefix="wordcut_settings2_")) / "deep" / "dir" / "s.json"
