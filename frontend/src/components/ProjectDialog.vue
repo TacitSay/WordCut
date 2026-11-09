@@ -239,7 +239,8 @@ onMounted(load)
   display: flex;
   flex-direction: column;
   background: var(--bg-panel, #1f242c);
-  border: 1px solid var(--border-strong, #3a4150);
+  border: none;
+  box-shadow: var(--nm-raised-sm);
   border-radius: 8px;
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
 }
@@ -249,7 +250,8 @@ onMounted(load)
   align-items: center;
   justify-content: space-between;
   padding: 12px 16px;
-  border-bottom: 1px solid var(--border, #2c3340);
+  border-bottom: none;
+  box-shadow: 0 1px 2px var(--nm-dark);
 }
 
 .modal-title {
@@ -313,7 +315,8 @@ onMounted(load)
 .project-table td {
   padding: 7px 6px;
   text-align: left;
-  border-bottom: 1px solid var(--border, #2c3340);
+  border-bottom: none;
+  box-shadow: 0 1px 2px var(--nm-dark);
 }
 
 .project-table th {
@@ -356,7 +359,8 @@ onMounted(load)
   padding: 0 5px;
   font-size: 10px;
   color: var(--text-faint, #7d8794);
-  border: 1px solid var(--border-strong, #3a4150);
+  border: none;
+  box-shadow: var(--nm-raised-sm);
   border-radius: 3px;
 }
 
@@ -388,7 +392,8 @@ onMounted(load)
   justify-content: flex-end;
   gap: 8px;
   padding: 10px 16px;
-  border-top: 1px solid var(--border, #2c3340);
+  border-top: none;
+  box-shadow: 0 -1px 2px var(--nm-dark);
 }
 
 .btn-danger {

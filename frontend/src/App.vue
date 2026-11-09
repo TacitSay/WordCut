@@ -2799,6 +2799,9 @@ onBeforeUnmount(() => {
   position: relative;
   flex: 1 1 auto;
   display: flex;
+  /* 新拟态的前提：元素之间要有缝，阴影才落得下来，体积才看得出来 */
+  gap: 10px;
+  padding: 8px 10px 10px;
   min-height: 0;
 }
 
@@ -2808,7 +2811,10 @@ onBeforeUnmount(() => {
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
-  background: var(--bg);
+  background: var(--bg-panel);
+  box-shadow: var(--nm-raised);
+  border-radius: 12px;
+  overflow: hidden;
 }
 
 /* 波形吸顶：固定 180px，不参与下方文本滚动。 */
@@ -2819,8 +2825,9 @@ onBeforeUnmount(() => {
   flex: 0 0 180px;
   height: 180px;
   min-height: 180px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: none;
   background: var(--bg-panel);
+  box-shadow: 0 3px 8px var(--nm-dark);
 }
 
 .editor-dock {
@@ -2839,7 +2846,9 @@ onBeforeUnmount(() => {
   gap: 6px;
   padding: 6px 12px;
   background: var(--bg-toolbar);
-  border-bottom: 1px solid var(--border);
+  /* 新拟态：不用描边，用微阴影把顶部条从主体里"抬起来" */
+  border-bottom: none;
+  box-shadow: 0 1px 3px var(--nm-dark);
 }
 
 .search-input {
@@ -2886,7 +2895,10 @@ onBeforeUnmount(() => {
   width: 240px;
   min-height: 0;
   background: var(--bg-panel);
-  border-left: 1px solid var(--border);
+  box-shadow: var(--nm-raised);
+  border-left: none;
+  border-radius: 12px;
+  overflow: hidden;
 }
 
 .panel-header {
@@ -2894,10 +2906,11 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   flex: 0 0 auto;
-  height: 30px;
-  padding: 0 10px;
+  height: 32px;
+  padding: 0 12px;
   background: var(--bg-elevated);
-  border-bottom: 1px solid var(--border);
+  border-bottom: none;
+  box-shadow: 0 2px 5px var(--nm-dark);
 }
 
 .panel-title {
@@ -2921,7 +2934,8 @@ onBeforeUnmount(() => {
 
 .panel-close:hover {
   color: var(--text-strong);
-  background: #3a3a40;
+  background: var(--bg-elevated);
+  box-shadow: var(--nm-inset-sm);
 }
 
 .panel-body {

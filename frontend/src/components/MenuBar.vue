@@ -117,7 +117,8 @@ onBeforeUnmount(() => {
   padding: 0 8px;
   height: 30px;
   background: var(--bg-toolbar);
-  border-bottom: 1px solid var(--border);
+  border-bottom: none;
+  box-shadow: 0 1px 3px var(--nm-dark);
   user-select: none;
 }
 
@@ -142,7 +143,8 @@ onBeforeUnmount(() => {
 
 .menu-title:hover,
 .menu-root.open .menu-title {
-  background: #3a3a40;
+  background: var(--bg-elevated);
+  box-shadow: var(--nm-inset-sm);
   color: var(--text-strong);
 }
 
@@ -163,8 +165,11 @@ onBeforeUnmount(() => {
   min-width: 200px;
   margin-top: 2px;
   padding: 4px;
-  background: #252526;
-  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  border: none;
+  box-shadow:
+    0 12px 28px rgba(0, 0, 0, 0.55),
+    -2px -2px 6px var(--nm-light);
   border-radius: 4px;
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
 }

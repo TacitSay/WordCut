@@ -452,7 +452,8 @@ defineExpose({
   height: 28px;
   padding: 0 12px;
   background: var(--bg-elevated);
-  border-bottom: 1px solid var(--border);
+  border-bottom: none;
+  box-shadow: 0 1px 3px var(--nm-dark);
   white-space: nowrap;
   overflow: hidden;
 }
@@ -465,8 +466,9 @@ defineExpose({
   height: 22px;
   padding: 0;
   color: var(--text);
-  background: #37373d;
-  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  box-shadow: var(--nm-raised-sm);
+  border: none;
   border-radius: 3px;
   cursor: pointer;
 }
@@ -549,8 +551,9 @@ defineExpose({
   height: 100%;
   min-height: 0;
   background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 4px;
+  border: none;
+  border-radius: 6px;
+  box-shadow: var(--nm-inset);
   box-sizing: border-box;
   /* 横向滚动由 WaveSurfer 内部滚动层负责，外层不要再滚，否则双滚动条 */
   overflow: hidden;
@@ -635,8 +638,9 @@ defineExpose({
   font-family: var(--mono);
   color: var(--text-dim);
   background: transparent;
-  border: 1px solid var(--border-strong);
-  border-radius: 3px;
+  border: none;
+  border-radius: 4px;
+  box-shadow: var(--nm-inset-sm);
   cursor: pointer;
 }
 

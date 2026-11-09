@@ -240,7 +240,9 @@ defineExpose({ pickFile })
   font-family: inherit;
   font-size: 12.5px;
   color: var(--text);
-  background: #37373d;
+  background: var(--bg-elevated);
+  border: none;
+  box-shadow: var(--nm-raised-sm);
   border: 1px solid var(--border-strong);
   border-radius: 4px;
   cursor: pointer;
@@ -251,7 +253,9 @@ defineExpose({ pickFile })
 }
 
 .tool-btn:hover:not(:disabled) {
-  background: #45454c;
+  box-shadow:
+    var(--nm-raised-sm),
+    0 0 0 1px var(--accent-dim);
   border-color: var(--accent);
   color: var(--text-strong);
 }
