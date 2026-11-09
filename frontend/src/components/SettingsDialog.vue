@@ -708,10 +708,9 @@ async function handleUnload() {
   gap: 8px;
 }
 
+/* 底栏布局在全局 .dialog-footer 之上微调：路径占左、按钮居右 */
 .dialog-footer {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+  justify-content: space-between;
 }
 
 .dialog-hint {

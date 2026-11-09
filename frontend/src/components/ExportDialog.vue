@@ -156,65 +156,6 @@ function sizeText(path) {
 </template>
 
 <style scoped>
-.dialog-mask {
-  position: fixed;
-  inset: 0;
-  z-index: 500;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.55);
-}
-
-.dialog {
-  width: 520px;
-  max-height: 84vh;
-  display: flex;
-  flex-direction: column;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border-strong);
-  border-radius: 8px;
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
-}
-
-.dialog-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border);
-}
-
-.dialog-header h2 {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-strong);
-}
-
-.dialog-x {
-  width: 24px;
-  height: 24px;
-  font-size: 18px;
-  line-height: 1;
-  color: var(--text-dim);
-  background: transparent;
-  border: none;
-  border-radius: 3px;
-  cursor: pointer;
-}
-
-.dialog-x:hover {
-  background: #3a3a40;
-  color: var(--text-strong);
-}
-
-.dialog-body {
-  flex: 1 1 auto;
-  overflow-y: auto;
-  padding: 14px 16px;
-}
-
 .field-group {
   margin: 0 0 16px;
   padding: 10px 12px;
@@ -322,14 +263,6 @@ function sizeText(path) {
   margin: 8px 0 0;
   font-size: 11.5px;
   color: var(--text-dim);
-}
-
-.dialog-footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 10px 16px;
-  border-top: 1px solid var(--border);
 }
 
 .mono {
