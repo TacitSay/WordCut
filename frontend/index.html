@@ -8,7 +8,24 @@
       name="description"
       content="WordCut 词剪 —— 基于词级对齐的播客访谈文本驱动剪辑工具"
     />
-    <meta name="theme-color" content="#0b0f16" />
+
+    <!--
+      首屏主题：必须在 CSS 之前内联执行，否则会先渲染浅色再切深色（闪一下）。
+      默认浅色；localStorage 里有深色偏好时才切。
+    -->
+    <script>
+      ;(function () {
+        try {
+          var saved = localStorage.getItem('wordcut.theme')
+          document.documentElement.setAttribute(
+            'data-theme',
+            saved === 'dark' ? 'dark' : 'light',
+          )
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'light')
+        }
+      })()
+    </script>
 
     <!-- 图标：ICO 兜底 + PNG（现代浏览器优先用 PNG，标签页更清晰） -->
     <link rel="icon" href="/favicon.ico" sizes="any" />

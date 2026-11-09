@@ -22,9 +22,18 @@ const props = defineProps({
   hasProject: { type: Boolean, default: false },
   /** 是否已有 Token（转写完成） */
   hasTokens: { type: Boolean, default: false },
+  /** 当前主题：light / dark */
+  theme: { type: String, default: 'light' },
 })
 
-const emit = defineEmits(['update-project-name', 'select-file', 'upload', 'transcribe', 'export'])
+const emit = defineEmits([
+  'update-project-name',
+  'select-file',
+  'upload',
+  'transcribe',
+  'export',
+  'toggle-theme',
+])
 
 const fileInput = ref(null)
 const fileName = ref('')
@@ -155,6 +164,29 @@ defineExpose({ pickFile })
     <span class="file-name" :class="{ 'is-empty': !hasFile }" :title="fileName || '尚未选择文件'">
       {{ hasFile ? fileName : '未选择文件' }}
     </span>
+
+    <!-- 主题切换：太阳 = 当前浅色（点它转深色），月亮 = 当前深色 -->
+    <button
+      class="theme-toggle"
+      type="button"
+      :title="theme === 'dark' ? '切换到浅色' : '切换到深色'"
+      :aria-label="theme === 'dark' ? '切换到浅色' : '切换到深色'"
+      @click="emit('toggle-theme')"
+    >
+      <svg v-if="theme === 'dark'" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+        <circle cx="12" cy="12" r="4.2" fill="currentColor" />
+        <g stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+          <path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2" />
+          <path d="M5.4 5.4l1.6 1.6M17 17l1.6 1.6M18.6 5.4L17 7M7 17l-1.6 1.6" />
+        </g>
+      </svg>
+      <svg v-else viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+        <path
+          d="M20.5 14.3A8.6 8.6 0 0 1 9.7 3.5a8.7 8.7 0 1 0 10.8 10.8z"
+          fill="currentColor"
+        />
+      </svg>
+    </button>
 
     <input
       ref="fileInput"
@@ -300,3 +332,37 @@ defineExpose({ pickFile })
   display: none;
 }
 </style>
+
+
+/* 主题切换按钮：独立于业务动作，靠右侧、弱化处理 */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin-left: 4px;
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  background: var(--bg-elevated);
+  border: none;
+  border-radius: 7px;
+  box-shadow: var(--nm-raised-sm);
+  cursor: pointer;
+  transition:
+    color 0.12s ease,
+    box-shadow 0.12s ease;
+}
+
+.theme-toggle:hover {
+  color: var(--accent);
+}
+
+.theme-toggle:active {
+  box-shadow: var(--nm-inset-sm);
+}
+
+.theme-toggle:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}

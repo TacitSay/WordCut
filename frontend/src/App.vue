@@ -35,6 +35,7 @@ import TextEditor from './components/TextEditor.vue'
 import WaveformView from './components/WaveformView.vue'
 import { registerCommands, runCommand, shortcutFromEvent, shortcutMap } from './core/commands.js'
 import { formatClock, usePlayback } from './composables/usePlayback.js'
+import { applyTheme, getTheme, toggleTheme } from './composables/useTheme.js'
 import {
   createProject,
   deleteTokens,
@@ -1145,6 +1146,11 @@ function syncStrategyFromProject() {
   loadModelStatus()
 }
 
+/** 切换浅色 / 深色主题。 */
+function handleToggleTheme() {
+  theme.value = toggleTheme()
+}
+
 /** 打开设置对话框。 */
 function handleOpenSettings() {
   settingsOpen.value = true
@@ -1185,6 +1191,8 @@ const modelStatus = ref({ rss_mb: 0, cuda_allocated_mb: 0, models: [] })
 const displaySettings = ref({ sentence_per_line: true, titles_enabled: false })
 /** 设置对话框是否打开（设置 → 语义分段）。 */
 const settingsOpen = ref(false)
+/** 当前主题：light / dark（默认浅色，见 composables/useTheme.js）。 */
+const theme = ref(getTheme())
 
 /** 拉取策略清单（启动时一次即可）。 */
 async function loadSegmentStrategies() {
@@ -2295,6 +2303,8 @@ onBeforeUnmount(() => {
       :busy-export="exporting"
       :has-project="Boolean(project)"
       :has-tokens="hasTokens"
+      :theme="theme"
+      @toggle-theme="handleToggleTheme"
       @update-project-name="projectName = $event"
       @select-file="handleSelectFile"
       @upload="handleUpload"
