@@ -437,9 +437,6 @@ onBeforeUnmount(() => {
   <section ref="rootRef" class="text-editor">
     <header class="pane-header">
       <h2 class="pane-title">文本</h2>
-      <span class="pane-hint">
-        点击 = 定位光标 · 拖拽 = 选一大片 · Delete/Backspace 删除 · 点击红字恢复
-      </span>
       <span class="pane-count">
         {{ tokens.length }} Token · {{ segments.length }} 段 · 已删 {{ deletedIds.length }}
         <template v-if="selectedCount"> · 选中 {{ selectedCount }}</template>
@@ -461,7 +458,7 @@ onBeforeUnmount(() => {
 
     <div class="editor-body" :class="{ 'is-disabled': disabled }">
       <p v-if="!tokens.length" class="pane-empty">
-        暂无词级单元。请先在工具栏选择音频 → 上传 → 点击「转写」。
+        暂无词级单元。请先在工具栏点击「选择文件」，然后点「转写」。
       </p>
 
       <template v-else>

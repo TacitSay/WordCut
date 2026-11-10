@@ -381,7 +381,6 @@ defineExpose({
           +
         </button>
       </span>
-      <span class="wave-hint">红色 = 删除区间 · 点击移动播放头 · Ctrl+滚轮缩放</span>
 
       <ul class="wave-legend">
         <li><span class="legend-swatch legend-deleted" />删除区间</li>

@@ -10,8 +10,6 @@
 import { computed, ref } from 'vue'
 
 const props = defineProps({
-  /** 项目名（受控） */
-  projectName: { type: String, default: '' },
   /** 正在上传 */
   busyUpload: { type: Boolean, default: false },
   /** 正在转写 */
@@ -27,7 +25,6 @@ const props = defineProps({
 })
 
 const emit = defineEmits([
-  'update-project-name',
   'select-file',
   'upload',
   'transcribe',
@@ -36,12 +33,16 @@ const emit = defineEmits([
 ])
 
 const fileInput = ref(null)
+/** 主题按钮元素：切换动画以它为圆心扩散。 */
+const themeBtn = ref(null)
+
+/** 切换主题，把按钮元素带出去当动画圆心。 */
+function onToggleTheme() {
+  emit('toggle-theme', themeBtn.value)
+}
 const fileName = ref('')
 
 const hasFile = computed(() => Boolean(fileName.value))
-const canUpload = computed(
-  () => hasFile.value && props.projectName.trim().length > 0 && !props.busyUpload,
-)
 const canTranscribe = computed(() => props.hasProject && !props.busyTranscribe)
 const canExport = computed(() => props.hasTokens && !props.busyExport)
 
@@ -60,10 +61,6 @@ function onFileChange(event) {
   input.value = ''
 }
 
-function onNameInput(event) {
-  emit('update-project-name', event.target.value)
-}
-
 defineExpose({ pickFile })
 </script>
 
@@ -75,19 +72,14 @@ defineExpose({ pickFile })
       <span class="brand-name">WordCut</span>
     </div>
 
-    <label class="toolbar-field">
-      <span class="field-label">项目</span>
-      <input
-        class="input input-name"
-        type="text"
-        placeholder="项目名，例如：访谈_第 3 集"
-        :value="projectName"
-        @input="onNameInput"
-      />
-    </label>
-
     <div class="toolbar-actions">
-      <button class="tool-btn" type="button" title="选择音频/视频文件（Ctrl+O）" @click="pickFile">
+      <button
+        class="tool-btn tool-btn-primary"
+        type="button"
+        :disabled="busyUpload"
+        title="选择音频/视频文件并自动创建项目（Ctrl+O）"
+        @click="pickFile"
+      >
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
           <path
             d="M1.6 3.7h4.1l1.3 1.6h7.4v7.5a1 1 0 0 1-1 1H2.6a1 1 0 0 1-1-1z"
@@ -98,26 +90,6 @@ defineExpose({ pickFile })
           />
         </svg>
         <span>选择文件</span>
-      </button>
-
-      <button
-        class="tool-btn tool-btn-primary"
-        type="button"
-        :disabled="!canUpload"
-        title="上传音频并创建项目（后端统一转 16kHz 单声道 WAV）"
-        @click="emit('upload')"
-      >
-        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-          <path
-            d="M8 11V2.8M8 2.8 5 5.8M8 2.8l3 3M2.8 12.4v1.1h10.4v-1.1"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.3"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          />
-        </svg>
-        <span>{{ busyUpload ? '上传中…' : '上传' }}</span>
       </button>
 
       <button
@@ -167,11 +139,12 @@ defineExpose({ pickFile })
 
     <!-- 主题切换：太阳 = 当前浅色（点它转深色），月亮 = 当前深色 -->
     <button
+      ref="themeBtn"
       class="theme-toggle"
       type="button"
       :title="theme === 'dark' ? '切换到浅色' : '切换到深色'"
       :aria-label="theme === 'dark' ? '切换到浅色' : '切换到深色'"
-      @click="emit('toggle-theme')"
+      @click="onToggleTheme"
     >
       <svg v-if="theme === 'dark'" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
         <circle cx="12" cy="12" r="4.2" fill="currentColor" />
@@ -335,6 +308,7 @@ defineExpose({ pickFile })
 
 
 /* 主题切换按钮：独立于业务动作，靠右侧、弱化处理 */
+/* 正方形按钮：切换时圆形动画以它的中心为圆心 */
 .theme-toggle {
   display: inline-flex;
   align-items: center;
@@ -343,10 +317,11 @@ defineExpose({ pickFile })
   height: 28px;
   margin-left: 4px;
   flex: 0 0 auto;
+  padding: 0;
   color: var(--text-dim);
   background: var(--bg-elevated);
   border: none;
-  border-radius: 7px;
+  border-radius: 3px;
   box-shadow: var(--nm-raised-sm);
   cursor: pointer;
   transition:

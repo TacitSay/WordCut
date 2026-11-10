@@ -428,3 +428,25 @@ body {
     0 1px 0 var(--nm-light),
     0 -1px 0 var(--nm-dark);
 }
+
+
+/* ----------------------------------------------------------------------
+   主题切换动画（View Transitions）
+   ----------------------------------------------------------------------
+   默认的交叉淡入会让整屏一起闪，这里把它关掉，只保留我们自己的圆形
+   clip-path 动画（在 useTheme.js 里用 animate() 驱动）。
+   ---------------------------------------------------------------------- */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+/* 新主题在上层，才能"盖"住旧主题 */
+::view-transition-new(root) {
+  z-index: 1;
+}
+
+::view-transition-old(root) {
+  z-index: 0;
+}

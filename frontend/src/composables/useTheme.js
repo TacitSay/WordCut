@@ -62,10 +62,82 @@ export function applyTheme(theme, { persist = true } = {}) {
 
 /**
  * 在另一个主题间切换。
+ *
+ * 带圆形扩散动画（View Transitions API）：从按钮位置向外铺开新主题。
+ * 浏览器不支持、或用户开了"减少动态效果"时退化为瞬时切换——功能不受影响。
+ *
+ * @param {HTMLElement|null} [originEl] 动画圆心元素（通常是按钮本身）
  * @returns {'light'|'dark'} 切换后的主题
  */
-export function toggleTheme() {
-  return applyTheme(getTheme() === 'dark' ? 'light' : 'dark')
+export function toggleTheme(originEl = null) {
+  const next = getTheme() === 'dark' ? 'light' : 'dark'
+  return switchTheme(next, originEl)
+}
+
+/** 是否应播放动画（API 可用且用户未要求减少动效）。 */
+function canAnimate() {
+  if (typeof document === 'undefined') return false
+  if (typeof document.startViewTransition !== 'function') return false
+  try {
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return false
+  } catch {
+    return false
+  }
+  return true
+}
+
+/**
+ * 带过渡地切换到指定主题。
+ *
+ * 方向：切到深色 = 圆形从按钮处扩散到全屏（墨滴落下）；
+ *       切到浅色 = 圆形从全屏收拢回按钮（墨迹退去）。
+ *
+ * @param {'light'|'dark'} theme
+ * @param {HTMLElement|null} [originEl]
+ * @returns {'light'|'dark'}
+ */
+export function switchTheme(theme, originEl = null) {
+  if (!canAnimate()) return applyTheme(theme)
+
+  const toDark = theme === 'dark'
+
+  // 圆心：按钮中心；拿不到元素就退回视口中心
+  let cx = window.innerWidth / 2
+  let cy = window.innerHeight / 2
+  if (originEl && typeof originEl.getBoundingClientRect === 'function') {
+    const rect = originEl.getBoundingClientRect()
+    cx = rect.left + rect.width / 2
+    cy = rect.top + rect.height / 2
+  }
+
+  // 覆盖全屏所需半径：圆心到四角的最远距离
+  const radius = Math.hypot(
+    Math.max(cx, window.innerWidth - cx),
+    Math.max(cy, window.innerHeight - cy),
+  )
+
+  const transition = document.startViewTransition(() => {
+    applyTheme(theme)
+  })
+
+  transition.ready
+    .then(() => {
+      const collapsed = `circle(0px at ${cx}px ${cy}px)`
+      const expanded = `circle(${radius}px at ${cx}px ${cy}px)`
+      document.documentElement.animate(
+        { clipPath: toDark ? [collapsed, expanded] : [expanded, collapsed] },
+        {
+          duration: 520,
+          easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
+          pseudoElement: '::view-transition-new(root)',
+        },
+      )
+    })
+    .catch(() => {
+      /* 动画失败不影响"主题已切换"这个事实 */
+    })
+
+  return theme
 }
 
 /**

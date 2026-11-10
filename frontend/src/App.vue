@@ -1147,8 +1147,9 @@ function syncStrategyFromProject() {
 }
 
 /** 切换浅色 / 深色主题。 */
-function handleToggleTheme() {
-  theme.value = toggleTheme()
+/** 切换主题；origin 是按钮元素，用作圆形扩散的圆心。 */
+function handleToggleTheme(origin) {
+  theme.value = toggleTheme(origin)
 }
 
 /** 打开设置对话框。 */
@@ -1922,7 +1923,7 @@ registerCommands([
   },
   {
     id: 'file.upload',
-    title: '上传并创建项目',
+    title: '上传当前文件',
     menu: 'file',
     handler: () => handleUpload(),
     enabled: () => Boolean(audioFile.value) && !uploading.value,
@@ -2297,7 +2298,6 @@ onBeforeUnmount(() => {
 
     <Toolbar
       ref="toolbarRef"
-      :project-name="projectName"
       :busy-upload="uploading"
       :busy-transcribe="transcribing"
       :busy-export="exporting"
@@ -2305,7 +2305,6 @@ onBeforeUnmount(() => {
       :has-tokens="hasTokens"
       :theme="theme"
       @toggle-theme="handleToggleTheme"
-      @update-project-name="projectName = $event"
       @select-file="handleSelectFile"
       @upload="handleUpload"
       @transcribe="handleTranscribe"
