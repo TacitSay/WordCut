@@ -76,8 +76,11 @@ export function toggleTheme(originEl = null) {
 
 /** 是否应播放动画（API 可用且用户未要求减少动效）。 */
 function canAnimate() {
-  if (typeof document === 'undefined') return false
-  if (typeof document.startViewTransition !== 'function') return false
+  if (typeof document === 'undefined' || typeof window === 'undefined') return false
+  // 依赖 Web Animations API（Element.animate）驱动遮罩的 clip-path
+  if (typeof Element === 'undefined' || typeof Element.prototype.animate !== 'function') {
+    return false
+  }
   try {
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return false
   } catch {
@@ -91,6 +94,47 @@ function canAnimate() {
  *
  * 方向：切到深色 = 圆形从按钮处扩散到全屏（墨滴落下）；
  *       切到浅色 = 圆形从全屏收拢回按钮（墨迹退去）。
+ *
+ * @param {'light'|'dark'} theme
+ * @param {HTMLElement|null} [originEl]
+ * @returns {'light'|'dark'}
+ */
+/**
+ * 读取某个主题的"底色"（用于绘制过渡遮罩）。
+ *
+ * 做法：临时给 `<html>` 打上目标主题、读 CSS 变量、立刻还原。
+ * 因为整个过程不发生布局刷新（同步读、同步还原），浏览器不会绘制中间态。
+ *
+ * @param {'light'|'dark'} theme
+ * @returns {string} 可直接用于 background 的颜色值
+ */
+function surfaceColor(theme) {
+  const root = document.documentElement
+  const prev = root.getAttribute('data-theme')
+  root.setAttribute('data-theme', theme)
+  let color = ''
+  try {
+    color = getComputedStyle(root).getPropertyValue('--bg-reading').trim()
+  } catch {
+    color = ''
+  }
+  if (prev === null) root.removeAttribute('data-theme')
+  else root.setAttribute('data-theme', prev)
+  // CSS 变量读不到时回落到当前两套主题的实际值（与 style.css 保持一致）
+  return color || (theme === 'dark' ? '#282d34' : '#dde2ea')
+}
+
+/**
+ * 带过渡地切换到指定主题。
+ *
+ * 视觉语义（与需求一致）：
+ *   - **变浅**：浅色从按钮处以圆形向外扩散，把深色盖掉；
+ *   - **变深**：浅色层从全屏向按钮处收拢，深色由外向内取代它。
+ *
+ * 为什么不用 View Transitions：它只能拿到"新旧两层的快照"，变浅时让新层
+ * （浅色）收缩，下面露出的却是旧深色快照，于是出现"白色收缩 → 全黑 → 拆
+ * 快照后闪现白"。现在自己盖一层"浅色遮罩"，只移动这一层，底下始终是
+ * 即将生效的那个主题，任何一帧都不会出现错误颜色。
  *
  * @param {'light'|'dark'} theme
  * @param {HTMLElement|null} [originEl]
@@ -116,26 +160,48 @@ export function switchTheme(theme, originEl = null) {
     Math.max(cy, window.innerHeight - cy),
   )
 
-  const transition = document.startViewTransition(() => {
-    applyTheme(theme)
-  })
+  const collapsed = `circle(0px at ${cx}px ${cy}px)`
+  const expanded = `circle(${radius}px at ${cx}px ${cy}px)`
 
-  transition.ready
-    .then(() => {
-      const collapsed = `circle(0px at ${cx}px ${cy}px)`
-      const expanded = `circle(${radius}px at ${cx}px ${cy}px)`
-      document.documentElement.animate(
-        { clipPath: toDark ? [collapsed, expanded] : [expanded, collapsed] },
-        {
-          duration: 520,
-          easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
-          pseudoElement: '::view-transition-new(root)',
-        },
-      )
-    })
-    .catch(() => {
-      /* 动画失败不影响"主题已切换"这个事实 */
-    })
+  // 遮罩永远是"浅色那一层"：变浅时它是即将铺开的新面，
+  // 变深时它是正在退去的旧面。
+  const overlay = document.createElement('div')
+  overlay.className = 'theme-wipe'
+  overlay.setAttribute('aria-hidden', 'true')
+  overlay.style.cssText = [
+    'position:fixed',
+    'inset:0',
+    'z-index:2147483000',
+    'pointer-events:none',
+    `background:${surfaceColor('light')}`,
+    // 变浅：从 0 开始铺开；变深：一开始就铺满，然后再收拢
+    `clip-path:${toDark ? expanded : collapsed}`,
+  ].join(';')
+  document.body.appendChild(overlay)
+
+  // 强制一次样式计算，确保初始 clip 已经生效（否则首帧可能被跳过）
+  void overlay.offsetWidth
+
+  if (toDark) {
+    // 先换主题：此时遮罩铺满全屏，用户看不到底下的深色刚刚生效
+    applyTheme(theme)
+  }
+
+  const animation = overlay.animate(
+    [{ clipPath: toDark ? expanded : collapsed }, { clipPath: toDark ? collapsed : expanded }],
+    {
+      duration: 520,
+      easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
+      fill: 'forwards',
+    },
+  )
+
+  const finish = () => {
+    // 变浅：动画前遮罩已铺满，结束这一刻才换主题，底下就是浅色
+    if (!toDark) applyTheme(theme)
+    overlay.remove()
+  }
+  animation.finished.then(finish).catch(finish)
 
   return theme
 }

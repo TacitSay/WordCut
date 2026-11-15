@@ -99,6 +99,12 @@ theme_js = THEME_JS.read_text(encoding="utf-8") if THEME_JS.is_file() else ""
 check("useTheme.js 存在", THEME_JS.is_file())
 check("存储键与 index.html 一致", "'wordcut.theme'" in theme_js and "wordcut.theme" in html)
 check("导出 toggleTheme", "export function toggleTheme" in theme_js)
+
+# 回归：曾经的实现用 View Transitions 让新层收缩，变浅时会出现
+# “白收缩 → 全黑 → 闪白”。现在改为自绘遮罩，不应再依赖 startViewTransition。
+check("不再依赖 View Transitions", "startViewTransition" not in theme_js)
+check("使用 .theme-wipe 遮罩", "theme-wipe" in theme_js)
+check("遮罩颜色按主题动态取", "surfaceColor" in theme_js)
 check("默认主题常量为 light", "DEFAULT_THEME = 'light'" in theme_js)
 check("只接受 light/dark", "THEMES" in theme_js)
 
