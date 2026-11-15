@@ -143,8 +143,6 @@ function surfaceColor(theme) {
 export function switchTheme(theme, originEl = null) {
   if (!canAnimate()) return applyTheme(theme)
 
-  const toDark = theme === 'dark'
-
   // 圆心：按钮中心；拿不到元素就退回视口中心
   let cx = window.innerWidth / 2
   let cy = window.innerHeight / 2
@@ -163,8 +161,21 @@ export function switchTheme(theme, originEl = null) {
   const collapsed = `circle(0px at ${cx}px ${cy}px)`
   const expanded = `circle(${radius}px at ${cx}px ${cy}px)`
 
-  // 遮罩永远是"浅色那一层"：变浅时它是即将铺开的新面，
-  // 变深时它是正在退去的旧面。
+  // ------------------------------------------------------------------
+  // 两个方向完全对称：遮罩 = 目标色，从按钮处 0 扩到全屏，结束时才换主题
+  //
+  // 三个坑都踩过，这里写清楚，别改回去：
+  //
+  // 1. 用 View Transitions 收缩"新层"（浅色）→ 底下露出旧深色快照，
+  //    出现「白收缩 → 全黑 → 闪白」。
+  // 2. 变深时先铺满浅色遮罩再收缩 → 存在整屏纯白的一帧，加上换主题的
+  //    样式重算压在这一帧上，观感就是"白屏顿一下"。
+  // 3. 遮罩设成目标色、但**先换主题**再扩散 → 页面瞬间跳成深色，深色圆
+  //    在深色上扩散，动画看不见。
+  //
+  // 正确时序：页面保持旧主题 → 目标色圆从按钮铺开 → 动画结束再换主题并
+  // 在同一帧移除遮罩。因为遮罩与即将生效的主题同色，收尾无缝。
+  // ------------------------------------------------------------------
   const overlay = document.createElement('div')
   overlay.className = 'theme-wipe'
   overlay.setAttribute('aria-hidden', 'true')
@@ -173,33 +184,28 @@ export function switchTheme(theme, originEl = null) {
     'inset:0',
     'z-index:2147483000',
     'pointer-events:none',
-    `background:${surfaceColor('light')}`,
-    // 变浅：从 0 开始铺开；变深：一开始就铺满，然后再收拢
-    `clip-path:${toDark ? expanded : collapsed}`,
+    `background:${surfaceColor(theme)}`,
+    `clip-path:${collapsed}`,
   ].join(';')
   document.body.appendChild(overlay)
 
-  // 强制一次样式计算，确保初始 clip 已经生效（否则首帧可能被跳过）
+  // 强制一次样式计算，确保初始 clip（半径 0）已经生效，
+  // 否则首帧可能被跳过，出现"整屏目标色闪一下"
   void overlay.offsetWidth
 
-  if (toDark) {
-    // 先换主题：此时遮罩铺满全屏，用户看不到底下的深色刚刚生效
-    applyTheme(theme)
-  }
-
-  const animation = overlay.animate(
-    [{ clipPath: toDark ? expanded : collapsed }, { clipPath: toDark ? collapsed : expanded }],
-    {
-      duration: 520,
-      easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
-      fill: 'forwards',
-    },
-  )
+  const animation = overlay.animate([{ clipPath: collapsed }, { clipPath: expanded }], {
+    duration: 520,
+    easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
+    fill: 'forwards',
+  })
 
   const finish = () => {
-    // 变浅：动画前遮罩已铺满，结束这一刻才换主题，底下就是浅色
-    if (!toDark) applyTheme(theme)
-    overlay.remove()
+    // 先换主题，等新主题真正绘制出来再摘遮罩：
+    // 若同一 tick 内换主题并移除遮罩，可能出现一帧旧主题。
+    applyTheme(theme)
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => overlay.remove())
+    })
   }
   animation.finished.then(finish).catch(finish)
 
