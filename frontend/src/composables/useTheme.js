@@ -143,6 +143,9 @@ function surfaceColor(theme) {
 export function switchTheme(theme, originEl = null) {
   if (!canAnimate()) return applyTheme(theme)
 
+  // 旧主题必须在 applyTheme 之前取：遮罩要用它的底色
+  const oldTheme = getTheme()
+
   // 圆心：按钮中心；拿不到元素就退回视口中心
   let cx = window.innerWidth / 2
   let cy = window.innerHeight / 2
@@ -162,19 +165,22 @@ export function switchTheme(theme, originEl = null) {
   const expanded = `circle(${radius}px at ${cx}px ${cy}px)`
 
   // ------------------------------------------------------------------
-  // 两个方向完全对称：遮罩 = 目标色，从按钮处 0 扩到全屏，结束时才换主题
+  // 正确模型：**样式立刻切到新主题**，用旧色遮罩挖一个洞，让洞从小扩大。
   //
-  // 三个坑都踩过，这里写清楚，别改回去：
+  // 洞之外是旧色（盖住新样式），洞之内已经是新样式。洞每扩大一点，
+  // 就多显现一点新主题的组件——所以是"边铺开边显现"，不是"铺满后一起显现"。
   //
-  // 1. 用 View Transitions 收缩"新层"（浅色）→ 底下露出旧深色快照，
-  //    出现「白收缩 → 全黑 → 闪白」。
-  // 2. 变深时先铺满浅色遮罩再收缩 → 存在整屏纯白的一帧，加上换主题的
-  //    样式重算压在这一帧上，观感就是"白屏顿一下"。
-  // 3. 遮罩设成目标色、但**先换主题**再扩散 → 页面瞬间跳成深色，深色圆
-  //    在深色上扩散，动画看不见。
+  // 走过的三条弯路（都写在这里，别再改回去）：
   //
-  // 正确时序：页面保持旧主题 → 目标色圆从按钮铺开 → 动画结束再换主题并
-  // 在同一帧移除遮罩。因为遮罩与即将生效的主题同色，收尾无缝。
+  // 1. View Transitions 收缩"新层"（浅色）→ 底下露旧深色快照 →
+  //    「白收缩 → 全黑 → 闪白」。
+  // 2. 变深时先铺满浅色遮罩再收缩 → 整屏纯白的一帧 + 样式重算压在同一帧 →
+  //    「白屏顿一下」。
+  // 3. 遮罩 = 目标色、且**动画结束才换主题** → 铺开期间底下仍是旧主题，
+  //    组件要等遮罩收完才换脸 → 「铺满之后才显现」。
+  //
+  // 关键区别：遮罩颜色必须是**旧主题**色（它演的是"正在被取代的旧面"），
+  // 并且换主题要发生在动画**开始之前**。
   // ------------------------------------------------------------------
   const overlay = document.createElement('div')
   overlay.className = 'theme-wipe'
@@ -184,14 +190,19 @@ export function switchTheme(theme, originEl = null) {
     'inset:0',
     'z-index:2147483000',
     'pointer-events:none',
-    `background:${surfaceColor(theme)}`,
+    // 旧主题底色：洞外面看到的"还没被换掉的部分"
+    `background:${surfaceColor(oldTheme)}`,
     `clip-path:${collapsed}`,
   ].join(';')
   document.body.appendChild(overlay)
 
-  // 强制一次样式计算，确保初始 clip（半径 0）已经生效，
-  // 否则首帧可能被跳过，出现"整屏目标色闪一下"
+  // 强制一次样式计算，确保初始 clip（半径 0，整屏旧色）已经生效，
+  // 否则可能先渲染出一帧"完全新主题"
   void overlay.offsetWidth
+
+  // 先把新主题应用上去：此刻它被整屏旧色遮罩完全盖住，看不到跳变，
+  // 但接下来洞一扩大，露出的就是新样式。
+  applyTheme(theme)
 
   const animation = overlay.animate([{ clipPath: collapsed }, { clipPath: expanded }], {
     duration: 520,
@@ -199,14 +210,8 @@ export function switchTheme(theme, originEl = null) {
     fill: 'forwards',
   })
 
-  const finish = () => {
-    // 先换主题，等新主题真正绘制出来再摘遮罩：
-    // 若同一 tick 内换主题并移除遮罩，可能出现一帧旧主题。
-    applyTheme(theme)
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => overlay.remove())
-    })
-  }
+  // 洞扩到覆盖全屏时遮罩已无意义，直接移除（无需再等一帧换主题）
+  const finish = () => overlay.remove()
   animation.finished.then(finish).catch(finish)
 
   return theme
