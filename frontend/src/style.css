@@ -431,14 +431,24 @@ body {
 
 
 /* ----------------------------------------------------------------------
-   主题切换过渡遮罩
+   主题切换动画（View Transitions）
    ----------------------------------------------------------------------
-   背景色由 useTheme.js 按目标主题的 --bg-reading 动态取，这里只管层级与
-   不拦截交互。不用 View Transitions：它的新旧图层语义会让"变浅"出现
-   "白收缩→全黑→闪白"，改为自己控制单层遮罩。
+   默认的交叉淡入会让整屏一起闪，这里把它关掉，只保留自己的圆形
+   clip-path 动画（在 useTheme.js 里用 animate() 驱动）。
+
+   层级要点：新主题在上层（z-index:1），旧主题在下层，新层的圆形扩散
+   才能一点点"盖"住旧层，形成边铺开边显现的效果。
    ---------------------------------------------------------------------- */
-.theme-wipe {
-  will-change: clip-path;
-  pointer-events: none;
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
 }
 
+::view-transition-new(root) {
+  z-index: 1;
+}
+
+::view-transition-old(root) {
+  z-index: 0;
+}

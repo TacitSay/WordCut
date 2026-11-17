@@ -100,11 +100,28 @@ check("useTheme.js 存在", THEME_JS.is_file())
 check("存储键与 index.html 一致", "'wordcut.theme'" in theme_js and "wordcut.theme" in html)
 check("导出 toggleTheme", "export function toggleTheme" in theme_js)
 
-# 回归：曾经的实现用 View Transitions 让新层收缩，变浅时会出现
-# “白收缩 → 全黑 → 闪白”。现在改为自绘遮罩，不应再依赖 startViewTransition。
-check("不再依赖 View Transitions", "startViewTransition" not in theme_js)
-check("使用 .theme-wipe 遮罩", "theme-wipe" in theme_js)
-check("遮罩颜色按主题动态取", "surfaceColor" in theme_js)
+# 主题过渡用 View Transitions：新主题那一层从按钮处长出并覆盖旧层。
+#
+# 历史教训（别再改回去）：
+#   - 变浅时若让新层**收缩**（[expanded, collapsed]），新层是浅色，一缩就
+#     露出底下旧深色快照 → 「白收缩 → 全黑 → 闪白」。
+#   - 若改成自绘遮罩并"动画结束才换主题"，铺开期间底下仍是旧主题 →
+#     「铺满之后才显现」。
+# 正确做法：两个方向都用 [collapsed, expanded]，即新层 0 → 全屏。
+check("使用 View Transitions", "startViewTransition" in theme_js)
+check("动画作用于 ::view-transition-new(root)", "::view-transition-new(root)" in theme_js)
+check(
+    "clipPath 是固定的 0→全屏（不按方向反转）",
+    "clipPath: [collapsed, expanded]" in theme_js,
+)
+# 只在"非注释行"里检查反转写法：注释中会把它作为反例出现
+_code_lines = [
+    line
+    for line in theme_js.splitlines()
+    if "[expanded, collapsed]" in line and not line.strip().startswith("//")
+]
+check("代码里没有按方向反转的写法", not _code_lines)
+check("不再使用自绘遮罩", "theme-wipe" not in theme_js)
 check("默认主题常量为 light", "DEFAULT_THEME = 'light'" in theme_js)
 check("只接受 light/dark", "THEMES" in theme_js)
 

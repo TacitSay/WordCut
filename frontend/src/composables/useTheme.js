@@ -76,11 +76,9 @@ export function toggleTheme(originEl = null) {
 
 /** 是否应播放动画（API 可用且用户未要求减少动效）。 */
 function canAnimate() {
-  if (typeof document === 'undefined' || typeof window === 'undefined') return false
-  // 依赖 Web Animations API（Element.animate）驱动遮罩的 clip-path
-  if (typeof Element === 'undefined' || typeof Element.prototype.animate !== 'function') {
-    return false
-  }
+  if (typeof document === 'undefined') return false
+  // 第一版动画基于 View Transitions；不支持时直接瞬时切换
+  if (typeof document.startViewTransition !== 'function') return false
   try {
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return false
   } catch {
@@ -100,31 +98,6 @@ function canAnimate() {
  * @returns {'light'|'dark'}
  */
 /**
- * 读取某个主题的"底色"（用于绘制过渡遮罩）。
- *
- * 做法：临时给 `<html>` 打上目标主题、读 CSS 变量、立刻还原。
- * 因为整个过程不发生布局刷新（同步读、同步还原），浏览器不会绘制中间态。
- *
- * @param {'light'|'dark'} theme
- * @returns {string} 可直接用于 background 的颜色值
- */
-function surfaceColor(theme) {
-  const root = document.documentElement
-  const prev = root.getAttribute('data-theme')
-  root.setAttribute('data-theme', theme)
-  let color = ''
-  try {
-    color = getComputedStyle(root).getPropertyValue('--bg-reading').trim()
-  } catch {
-    color = ''
-  }
-  if (prev === null) root.removeAttribute('data-theme')
-  else root.setAttribute('data-theme', prev)
-  // CSS 变量读不到时回落到当前两套主题的实际值（与 style.css 保持一致）
-  return color || (theme === 'dark' ? '#282d34' : '#dde2ea')
-}
-
-/**
  * 带过渡地切换到指定主题。
  *
  * 视觉语义（与需求一致）：
@@ -142,9 +115,6 @@ function surfaceColor(theme) {
  */
 export function switchTheme(theme, originEl = null) {
   if (!canAnimate()) return applyTheme(theme)
-
-  // 旧主题必须在 applyTheme 之前取：遮罩要用它的底色
-  const oldTheme = getTheme()
 
   // 圆心：按钮中心；拿不到元素就退回视口中心
   let cx = window.innerWidth / 2
@@ -165,54 +135,35 @@ export function switchTheme(theme, originEl = null) {
   const expanded = `circle(${radius}px at ${cx}px ${cy}px)`
 
   // ------------------------------------------------------------------
-  // 正确模型：**样式立刻切到新主题**，用旧色遮罩挖一个洞，让洞从小扩大。
+  // 第一版的思路：用 View Transitions 拿到"新主题那一层"，让它从按钮处
+  // 圆形扩散到全屏。新层扩散时，它下面的旧层被一点点盖住 —— 眼睛看到的是
+  // 新主题边扩边显现，没有整屏停顿。
   //
-  // 洞之外是旧色（盖住新样式），洞之内已经是新样式。洞每扩大一点，
-  // 就多显现一点新主题的组件——所以是"边铺开边显现"，不是"铺满后一起显现"。
+  // 第一版唯一的 bug：变浅时写成了 [expanded, collapsed]（让新层收缩）。
+  // 新层是浅色，一缩就露出底下的旧深色快照，于是出现
+  // 「白色收缩 → 全黑 → 拆快照后闪现白」。
   //
-  // 走过的三条弯路（都写在这里，别再改回去）：
-  //
-  // 1. View Transitions 收缩"新层"（浅色）→ 底下露旧深色快照 →
-  //    「白收缩 → 全黑 → 闪白」。
-  // 2. 变深时先铺满浅色遮罩再收缩 → 整屏纯白的一帧 + 样式重算压在同一帧 →
-  //    「白屏顿一下」。
-  // 3. 遮罩 = 目标色、且**动画结束才换主题** → 铺开期间底下仍是旧主题，
-  //    组件要等遮罩收完才换脸 → 「铺满之后才显现」。
-  //
-  // 关键区别：遮罩颜色必须是**旧主题**色（它演的是"正在被取代的旧面"），
-  // 并且换主题要发生在动画**开始之前**。
+  // 修正：**两个方向都让新层从 0 扩到全屏**。方向差异本来就由"新层是什么
+  // 颜色"体现，不需要再反转 clip-path。
   // ------------------------------------------------------------------
-  const overlay = document.createElement('div')
-  overlay.className = 'theme-wipe'
-  overlay.setAttribute('aria-hidden', 'true')
-  overlay.style.cssText = [
-    'position:fixed',
-    'inset:0',
-    'z-index:2147483000',
-    'pointer-events:none',
-    // 旧主题底色：洞外面看到的"还没被换掉的部分"
-    `background:${surfaceColor(oldTheme)}`,
-    `clip-path:${collapsed}`,
-  ].join(';')
-  document.body.appendChild(overlay)
-
-  // 强制一次样式计算，确保初始 clip（半径 0，整屏旧色）已经生效，
-  // 否则可能先渲染出一帧"完全新主题"
-  void overlay.offsetWidth
-
-  // 先把新主题应用上去：此刻它被整屏旧色遮罩完全盖住，看不到跳变，
-  // 但接下来洞一扩大，露出的就是新样式。
-  applyTheme(theme)
-
-  const animation = overlay.animate([{ clipPath: collapsed }, { clipPath: expanded }], {
-    duration: 520,
-    easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
-    fill: 'forwards',
+  const transition = document.startViewTransition(() => {
+    applyTheme(theme)
   })
 
-  // 洞扩到覆盖全屏时遮罩已无意义，直接移除（无需再等一帧换主题）
-  const finish = () => overlay.remove()
-  animation.finished.then(finish).catch(finish)
+  transition.ready
+    .then(() => {
+      document.documentElement.animate(
+        { clipPath: [collapsed, expanded] },
+        {
+          duration: 520,
+          easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
+          pseudoElement: '::view-transition-new(root)',
+        },
+      )
+    })
+    .catch(() => {
+      /* 动画失败不影响"主题已切换"这个事实 */
+    })
 
   return theme
 }
