@@ -44,9 +44,22 @@ const props = defineProps({
   activeIndex: { type: Number, default: -1 },
   /** 段落内一句一行（句末标点后换行）。 */
   sentencePerLine: { type: Boolean, default: true },
+  /**
+   * SentenceOut[]：{ index, start, end, duration, text, token_ids, ends_sentence }
+   *
+   * 句子是**阅读与操作的最小单位**：一句一行、可单击选中、可拖动批量选中。
+   * 为空时退回"按 segments 渲染"的旧行为（兼容未刷新 Token 的旧数据）。
+   */
+  sentences: { type: Array, default: () => [] },
 })
 
-const emit = defineEmits(['cursor-change', 'restore', 'seek'])
+const emit = defineEmits([
+  'cursor-change',
+  'restore',
+  'seek',
+  // 选中一批句子（用于批量删除 / 恢复）
+  'select-sentences',
+])
 
 const rootRef = ref(null)
 
@@ -87,16 +100,31 @@ function endsSentence(glyph) {
   return SENTENCE_END_RE.test(glyph.trim())
 }
 
-/** 段落列表：[{ key, index, items, isLast }]。 */
-const paragraphs = computed(() => {
+/** URL 之外的稳定 key：句子用它自己的 index。 */
+const sentenceById = computed(() => {
+  const map = new Map()
+  props.sentences.forEach((sentence, order) => {
+    const index = Number(sentence?.index ?? order)
+    map.set(index, sentence)
+  })
+  return map
+})
+
+/**
+ * 句子 → 用于渲染的条目列表。
+ *
+ * 每项：{ index, key, items, text, start, end, deletedCount, total }
+ * 其中 `items` 仍是词级 item（保留原有的光标/选区/删除高亮逻辑）。
+ */
+const sentenceItems = computed(() => {
   if (!props.tokens.length) return []
 
+  const list = []
   const covered = new Set()
-  const groups = []
-  const segmentList = Array.isArray(props.segments) ? props.segments : []
+  const source = Array.isArray(props.sentences) ? props.sentences : []
 
-  for (const segment of segmentList) {
-    const ids = Array.isArray(segment?.token_ids) ? segment.token_ids : []
+  for (const sentence of source) {
+    const ids = Array.isArray(sentence?.token_ids) ? sentence.token_ids : []
     const items = []
     for (const id of ids) {
       const index = indexById.value.get(id)
@@ -104,19 +132,90 @@ const paragraphs = computed(() => {
       covered.add(index)
       items.push(toItem(props.tokens[index], index))
     }
-    if (items.length) {
-      groups.push({ key: `seg-${segment?.index ?? groups.length}`, index: segment?.index ?? groups.length, items, title: String(segment?.title || '') })
-    }
+    if (!items.length) continue
+    const deletedCount = items.filter((item) => item.deleted).length
+    list.push({
+      index: Number(sentence?.index ?? list.length),
+      key: `sent-${sentence?.index ?? list.length}`,
+      items,
+      text: String(sentence?.text || ''),
+      start: Number(sentence?.start ?? items[0].start),
+      end: Number(sentence?.end ?? items[items.length - 1].end),
+      deletedCount,
+      total: items.length,
+    })
   }
 
-  // 兜底：segments 缺失或漏掉的 Token 追加成一段，避免文本丢失。
+  // 兜底：没有被任何句子覆盖的词单独成"句"，避免文本丢失
   const rest = []
   props.tokens.forEach((token, index) => {
     if (!covered.has(index)) rest.push(toItem(token, index))
   })
-  if (rest.length) groups.push({ key: 'seg-rest', index: -1, items: rest })
+  if (rest.length) {
+    list.push({
+      index: list.length,
+      key: 'sent-rest',
+      items: rest,
+      text: rest.map((item) => item.glyph).join(''),
+      start: rest[0].start,
+      end: rest[rest.length - 1].end,
+      deletedCount: rest.filter((item) => item.deleted).length,
+      total: rest.length,
+    })
+  }
+  return list
+})
 
-  return groups.map((group, order) => ({ ...group, isLast: order === groups.length - 1 }))
+/** 句子 index → 它属于哪个段落（用于段落分组与标题）。 */
+const sentenceToSegment = computed(() => {
+  const map = new Map()
+  const segmentList = Array.isArray(props.segments) ? props.segments : []
+  segmentList.forEach((segment, order) => {
+    const segIndex = Number(segment?.index ?? order)
+    const ids = Array.isArray(segment?.token_ids) ? segment.token_ids : []
+    for (const id of ids) {
+      map.set(id, segIndex)
+    }
+  })
+  return map
+})
+
+/**
+ * 段落列表：[{ key, index, title, sentences, isLast }]。
+ *
+ * 改造后：段落只负责**分组与标题**，具体内容交给句子渲染。
+ */
+const paragraphs = computed(() => {
+  const list = sentenceItems.value
+  if (!list.length) return []
+
+  const groups = []
+  const bySegment = new Map()
+
+  for (const sentence of list) {
+    const firstTokenId = sentence.items[0]?.id
+    const segIndex = firstTokenId ? sentenceToSegment.value.get(firstTokenId) : undefined
+    const key = segIndex === undefined ? 'seg-rest' : `seg-${segIndex}`
+    if (!bySegment.has(key)) {
+      const segment = (props.segments || []).find(
+        (item, order) => Number(item?.index ?? order) === segIndex,
+      )
+      const group = {
+        key,
+        index: segIndex === undefined ? -1 : segIndex,
+        title: String(segment?.title || ''),
+        sentences: [],
+      }
+      bySegment.set(key, group)
+      groups.push(group)
+    }
+    bySegment.get(key).sentences.push(sentence)
+  }
+
+  return groups.map((group, order) => ({
+    ...group,
+    isLast: order === groups.length - 1,
+  }))
 })
 
 /** 选区区间（half-open：[start, end)）。 */
@@ -273,6 +372,11 @@ function beginDragAt(event) {
 
 /** 拖动中：超过阈值后才生效，坐标变化就把光标移过去（保持锚点 → 形成选区）。 */
 function onDocumentMouseMove(event) {
+  // 句子级拖拽优先：按住句子拖动时选择整批句子，不走词级选区
+  if (sentenceDrag) {
+    updateSentenceDrag(event)
+    return
+  }
   const state = drag.value
   if (!state.active) return
   const dx = event.clientX - (state.startX ?? event.clientX)
@@ -311,11 +415,26 @@ function finishDrag(clicked) {
 }
 
 function onDocumentMouseUp() {
+  if (sentenceDrag) {
+    const wasSentenceDrag = endSentenceDrag()
+    if (wasSentenceDrag) {
+      // 拖过句子就不要再触发词级 click / 段落 click
+      suppressParagraphClick = true
+      queueMicrotask(() => {
+        suppressParagraphClick = false
+      })
+    }
+    return
+  }
   finishDrag(true)
 }
 
 /** 窗口失焦（拖到别的程序后松手）：按拖拽结束处理，避免状态卡住。 */
 function onWindowBlur() {
+  if (sentenceDrag) {
+    sentenceDrag = null
+    return
+  }
   if (!drag.value.active) return
   finishDrag(false)
 }
@@ -422,6 +541,138 @@ onMounted(() => {
   body?.addEventListener('touchmove', onUserScrollIntent, { passive: true })
 })
 
+// ----------------------------------------------------------------------
+// 句子级选择
+// ----------------------------------------------------------------------
+// 句子是阅读与批量操作的最小单位。选择状态放在组件内部，通过
+// `select-sentences` 事件把"选中的句子序号区间"抛给父组件，由父组件决定
+// 是删除、恢复还是导出。这样组件不需要知道业务语义。
+// ----------------------------------------------------------------------
+
+/** 已选中的句子序号集合。 */
+const selectedSentences = ref(new Set())
+
+/** 句子拖拽状态（按句子粒度选择，与词级拖拽并存）。 */
+let sentenceDrag = null
+/** 句子选择是否已通知过父组件（避免拖动中反复 emit）。 */
+let sentenceChanged = false
+
+/** 该句子是否被选中。 */
+function isSentenceSelected(index) {
+  return selectedSentences.value.has(index)
+}
+
+/**
+ * 按下：记录起点句子，准备按句子选择。
+ *
+ * 与词级拖拽的分工：按住时先只记录（还没移动），移动超过阈值才升级为
+ * "按句子批量选择"；否则按点击处理（定位光标/恢复红字）。
+ */
+function beginSentenceDrag(event, sentence) {
+  if (props.disabled || event.button !== 0) return
+  sentenceDrag = {
+    startIndex: sentence.index,
+    startX: event.clientX,
+    startY: event.clientY,
+    active: false,
+  }
+  sentenceChanged = false
+  // 复用组件原有的 document 级监听（onDocumentMouseMove 里会判断 sentenceDrag）
+}
+
+/** 拖动中：按句子区间更新选择。 */
+function updateSentenceDrag(event) {
+  if (!sentenceDrag) return
+  const dx = event.clientX - sentenceDrag.startX
+  const dy = event.clientY - sentenceDrag.startY
+  if (!sentenceDrag.active && Math.hypot(dx, dy) < 4) return
+  sentenceDrag.active = true
+
+  // 用指针下方命中的句子作为另一端
+  const element = document
+    .elementFromPoint(event.clientX, event.clientY)
+    ?.closest?.('.sentence')
+  const raw = element?.getAttribute?.('data-sentence-index')
+  const endIndex = raw === null || raw === undefined ? null : Number(raw)
+  if (endIndex === null || Number.isNaN(endIndex)) return
+
+  const from = Math.min(sentenceDrag.startIndex, endIndex)
+  const to = Math.max(sentenceDrag.startIndex, endIndex)
+  const next = new Set()
+  for (let index = from; index <= to; index += 1) next.add(index)
+  selectedSentences.value = next
+  sentenceChanged = true
+  // 选中句子同时把光标移到句首，便于后续键盘操作
+  const sentence = sentenceItems.value.find((item) => item.index === from)
+  if (sentence?.items?.length) {
+    emit('cursor-change', sentence.items[0].index)
+  }
+}
+
+/** 松开：结束句子拖拽；若没拖动则按点击处理。 */
+function endSentenceDrag() {
+  const wasActive = Boolean(sentenceDrag?.active)
+  sentenceDrag = null
+  if (sentenceChanged) {
+    sentenceChanged = false
+    emitSelectedSentences()
+  }
+  return wasActive
+}
+
+/** 把当前选择抛给父组件。 */
+function emitSelectedSentences() {
+  const indices = [...selectedSentences.value].sort((a, b) => a - b)
+  const tokenIds = []
+  for (const sentence of sentenceItems.value) {
+    if (!selectedSentences.value.has(sentence.index)) continue
+    for (const item of sentence.items) tokenIds.push(item.id)
+  }
+  emit('select-sentences', { indices, tokenIds })
+}
+
+/**
+ * 单击句子：选中它（替换原选择）；按住 Shift 可扩展选择。
+ * 词级的删除/恢复逻辑仍由 token 自己的 click 处理，这里只负责"选择"。
+ */
+function onSentenceClick(sentence, event) {
+  if (props.disabled) return
+  if (sentenceDrag?.active) return // 刚拖完，不要额外处理
+
+  const next = new Set()
+  if (event.shiftKey && selectedSentences.value.size) {
+    const existing = [...selectedSentences.value].sort((a, b) => a - b)
+    const from = Math.min(existing[0], sentence.index)
+    const to = Math.max(existing[existing.length - 1], sentence.index)
+    for (let index = from; index <= to; index += 1) next.add(index)
+  } else {
+    next.add(sentence.index)
+  }
+  selectedSentences.value = next
+  emitSelectedSentences()
+}
+
+/** 清空句子选择（父组件在处理完批量操作后可调用）。 */
+function clearSentenceSelection() {
+  selectedSentences.value = new Set()
+}
+
+/** 光标是否应显示在某句末尾。 */
+function showCaretAfterSentence(sentence) {
+  const last = sentence.items[sentence.items.length - 1]
+  return Boolean(last) && props.cursorIndex === last.index + 1
+}
+
+/** 时间显示（句子悬停提示用）。 */
+function formatClock(seconds) {
+  const total = Math.max(0, Number(seconds) || 0)
+  const m = Math.floor(total / 60)
+  const s = total - m * 60
+  return `${m}:${s.toFixed(1).padStart(4, '0')}`
+}
+
+defineExpose({ clearSentenceSelection })
+
 onBeforeUnmount(() => {
   document.removeEventListener('mousemove', onDocumentMouseMove)
   document.removeEventListener('mouseup', onDocumentMouseUp)
@@ -462,31 +713,49 @@ onBeforeUnmount(() => {
       </p>
 
       <template v-else>
-        <p
-          v-for="para in paragraphs"
-          :key="para.key"
-          class="segment"
-          @mousedown="beginDragAt($event)"
-          @click="onParagraphClick(para, $event)"
-        >
-          <span v-if="para.title" class="segment-title">{{ para.title }}</span>
-          <template v-for="item in para.items" :key="item.id">
-            <span v-if="showCaretBefore(item.index)" class="caret" aria-hidden="true" />
-            <span v-if="item.gap" class="token-gap">{{ ' ' }}</span>
-            <span
-              v-if="item.glyph"
-              class="token"
-              :class="tokenClasses(item)"
-              role="button"
-              tabindex="-1"
-              :data-token-index="item.index"
-              :title="`${item.id} · ${item.start.toFixed(2)}s–${item.end.toFixed(2)}s · 置信度 ${item.confidence.toFixed(2)}`"
-              >{{ item.glyph }}</span
-            >
-            <br v-if="sentencePerLine && endsSentence(item.glyph)" aria-hidden="true" />
-          </template>
-          <span v-if="showCaretAfter(para)" class="caret" aria-hidden="true" />
-        </p>
+        <!--
+          结构：段落 → 句子 → 词
+            · 段落只负责分组与小标题；
+            · 句子是**最小操作单位**：一行一句，可单击选中、可拖动批量选中；
+            · 词仍保留原有的删除/恢复高亮与光标逻辑。
+        -->
+        <section v-for="para in paragraphs" :key="para.key" class="segment-group">
+          <h3 v-if="para.title" class="segment-title" :title="`第 ${para.index + 1} 段`">
+            {{ para.title }}
+          </h3>
+
+          <p
+            v-for="sent in para.sentences"
+            :key="sent.key"
+            class="sentence"
+            :class="{
+              'is-selected': isSentenceSelected(sent.index),
+              'is-fully-deleted': sent.total > 0 && sent.deletedCount === sent.total,
+              'is-partly-deleted': sent.deletedCount > 0 && sent.deletedCount < sent.total,
+            }"
+            :data-sentence-index="sent.index"
+            :title="`${formatClock(sent.start)} – ${formatClock(sent.end)}${
+              sent.deletedCount ? ` · 已删 ${sent.deletedCount}/${sent.total} 词` : ''
+            }`"
+            @mousedown="beginSentenceDrag($event, sent)"
+            @click="onSentenceClick(sent, $event)"
+          >
+            <template v-for="item in sent.items" :key="item.id">
+              <span v-if="showCaretBefore(item.index)" class="caret" aria-hidden="true" />
+              <span
+                v-if="item.glyph"
+                class="token"
+                :class="tokenClasses(item)"
+                role="button"
+                tabindex="-1"
+                :data-token-index="item.index"
+                :title="`${item.id} · ${item.start.toFixed(2)}s–${item.end.toFixed(2)}s · 置信度 ${item.confidence.toFixed(2)}`"
+                >{{ item.glyph }}</span
+              >
+            </template>
+            <span v-if="showCaretAfterSentence(sent)" class="caret" aria-hidden="true" />
+          </p>
+        </section>
       </template>
     </div>
   </section>
@@ -562,15 +831,68 @@ onBeforeUnmount(() => {
   margin-bottom: 0;
 }
 
+/* ---------------- 段落组（标题 + 句子列表） ---------------- */
+.segment-group {
+  max-width: 880px;
+  margin: 0 auto 22px;
+}
+
+.segment-group:last-child {
+  margin-bottom: 0;
+}
+
+/* ---------------- 句子：一句一行，可选中 ---------------- */
+.sentence {
+  margin: 0 0 3px;
+  padding: 3px 8px 3px 10px;
+  font-size: 16px;
+  line-height: 1.85;
+  color: var(--text);
+  border-radius: 5px;
+  cursor: pointer;
+  transition:
+    background-color 0.1s ease,
+    box-shadow 0.1s ease;
+  /* 左侧留一条"选中条"的位置，避免选中时文字跳动 */
+  border-left: 3px solid transparent;
+}
+
+/* 悬停：轻微浮起，提示这是一行可选中的句子 */
+.sentence:hover {
+  background: var(--nm-light);
+}
+
+/* 选中：整行高亮 + 左侧竖条 */
+.sentence.is-selected {
+  background: var(--accent-dim);
+  border-left-color: var(--accent);
+}
+
+/* 整句都被删：整行淡化 */
+.sentence.is-fully-deleted {
+  opacity: 0.55;
+}
+
+/* 部分被删：左侧加一条淡红，提示这句不完整 */
+.sentence.is-partly-deleted {
+  border-left-color: var(--danger);
+}
+
+.sentence.is-selected.is-partly-deleted {
+  border-left-color: var(--accent);
+}
+
 /* 段落小标题：语义分段生成，浅色小字，不参与点击编辑 */
 .segment-title {
   display: block;
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 600;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.6px;
   color: var(--accent);
-  opacity: 0.85;
-  margin: 0 0 4px;
+  opacity: 0.9;
+  margin: 0 0 8px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--border);
   user-select: none;
 }
 

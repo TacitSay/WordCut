@@ -61,6 +61,8 @@ import silence  # noqa: E402
 import subtitle  # noqa: E402
 import app_settings  # noqa: E402
 import model_fetch  # noqa: E402
+import punctuator  # noqa: E402
+import sentencer  # noqa: E402
 import semantic  # noqa: E402
 from model import DeleteSpan, TimeMap, Token  # noqa: E402
 
@@ -257,6 +259,22 @@ class SegmentOut(BaseModel):
     token_ids: List[str] = Field(..., description="段落包含的 Token id（有序）")
 
 
+class SentenceOut(BaseModel):
+    """句子的 HTTP 形态（由 sentencer.build_sentences 生成）。
+
+    句子是**阅读与操作的最小单位**：一句一行展示，可单击选中、
+    可拖动批量选中。它只影响显示与选择粒度，不改词与时间戳。
+    """
+
+    index: int = Field(..., description="句子序号（0 起）")
+    start: float = Field(..., description="句首时间（秒）")
+    end: float = Field(..., description="句末时间（秒）")
+    duration: float = Field(..., description="句子时长（秒）")
+    text: str = Field(..., description="句子文本")
+    token_ids: List[str] = Field(default_factory=list, description="句内 Token id")
+    ends_sentence: bool = Field(False, description="是否以句末标点收尾")
+
+
 class TokenListResponse(BaseModel):
     """``GET /api/projects/{pid}/tokens`` 的响应。"""
 
@@ -267,6 +285,9 @@ class TokenListResponse(BaseModel):
     deleted_ids: List[str] = Field(..., description="被删除的 Token id，升序")
     segments: List[SegmentOut] = Field(
         default_factory=list, description="按分段策略切出的段落（仅影响显示）"
+    )
+    sentences: List[SentenceOut] = Field(
+        default_factory=list, description="句子列表（一句一行的基本单位）"
     )
 
 
@@ -1829,6 +1850,7 @@ def _run_transcription(
                 word_timestamps=True,
                 batch_size=batch_size,
                 vad_filter=True,
+                initial_prompt=punctuator.SENTENCE_PROMPT,
             )
         else:
             segments, _info = model.transcribe(
@@ -1837,6 +1859,7 @@ def _run_transcription(
                 word_timestamps=True,
                 vad_filter=False,
                 beam_size=int(os.environ.get("WORDCUT_WHISPER_BEAM") or 5),
+                initial_prompt=punctuator.SENTENCE_PROMPT,
             )
         result: List[Dict[str, Any]] = []
         for segment in segments:
@@ -1915,10 +1938,55 @@ def _run_transcription(
     return words, audio_duration
 
 
+def _maybe_punctuate(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """按设置决定是否补标点；失败时原样返回（绝不让转写结果丢失）。"""
+    try:
+        section = app_settings.get_section("segment")
+    except Exception:  # noqa: BLE001
+        return words
+    if not section.get("punctuate", True):
+        return words
+    try:
+        return punctuator.restore_punctuation(words)
+    except Exception as exc:  # noqa: BLE001 - 标点是增强，失败不该影响转写
+        _whisper_runtime["punctuate_error"] = str(exc)
+        return words
+
+
+def _sentences_for(
+    tokens: Sequence[Token], project: Optional[Dict[str, Any]] = None
+) -> List[Any]:
+    """按项目设置把 Token 切成句子（供接口返回与前端渲染）。"""
+    try:
+        section = app_settings.get_section("segment")
+    except Exception:  # noqa: BLE001
+        section = {}
+    try:
+        return sentencer.build_sentences(
+            tokens,
+            gap_seconds=float(section.get("sentence_gap") or sentencer.DEFAULT_GAP_SECONDS),
+            max_seconds=float(
+                section.get("sentence_max_seconds") or sentencer.DEFAULT_MAX_SECONDS
+            ),
+            max_chars=int(
+                section.get("sentence_max_chars") or sentencer.DEFAULT_MAX_CHARS
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _whisper_runtime["sentence_error"] = str(exc)
+        return []
+
+
 def _apply_transcription(
     pid: str, project: Dict[str, Any], words: List[Dict[str, Any]]
 ) -> None:
-    """把转写结果写回项目（不变量 4：id 由词序决定，旧删除引用只保留仍存在的）。"""
+    """把转写结果写回项目（不变量 4：id 由词序决定，旧删除引用只保留仍存在的）。
+
+    写回前会按设置做一次**标点恢复**：中文 ASR 几乎不带标点（实测 656 词里
+    只有 11 个，1.7%），不补标点就没法按"句子"阅读与操作。补标点只改
+    ``word`` 文本，``start``/``end`` 完全不动，因此 EDL 与时间轴不受影响。
+    """
+    words = _maybe_punctuate(words)
     known_ids = {
         f"{pipeline.TOKEN_ID_PREFIX}{index:05d}" for index in range(len(words))
     }
@@ -2186,6 +2254,7 @@ def get_tokens(pid: str) -> TokenListResponse:
         tokens=[TokenOut(**token.to_dict()) for token in tokens],
         deleted_ids=sorted(deleted_ids),
         segments=[SegmentOut(**seg.to_dict()) for seg in segments],
+        sentences=[SentenceOut(**item.to_dict()) for item in _sentences_for(tokens, project)],
     )
 
 
@@ -3603,6 +3672,56 @@ def put_memory_settings(patch: MemorySettingsPatch) -> MemorySettingsResponse:
     return MemorySettingsResponse(
         whisper_idle_seconds=float(section.get("whisper_idle_seconds") or 900),
         semantic_idle_seconds=float(section.get("semantic_idle_seconds") or 600),
+    )
+
+
+class RepunctuateResponse(BaseModel):
+    """重新补标点的结果。"""
+
+    project_id: str = Field(..., description="项目 id")
+    total: int = Field(0, description="词总数")
+    with_punct_before: int = Field(0, description="补之前带标点的词数")
+    with_punct_after: int = Field(0, description="补之后带标点的词数")
+    sentences: int = Field(0, description="按新标点切出的句子数")
+
+
+@app.post(
+    "/api/projects/{pid}/repunctuate",
+    response_model=RepunctuateResponse,
+    summary="对已有转写结果重新补标点",
+)
+def repunctuate(pid: str) -> RepunctuateResponse:
+    """给**已有**的词表补标点并重新切句。
+
+    为什么需要：标点恢复是在转写写回时做的，早于该功能建立的项目词表里没有
+    标点。这个接口让老项目不必重新转写（2 小时素材要 2 分钟）也能获得标点。
+
+    只改 ``word`` 文本，不动时间戳与删除状态。
+
+    异常:
+        404: 项目不存在；400: 尚未转写。
+    """
+    project = _get_project(pid)
+    _require_words(project)
+    words = list(_snapshot_words(project))
+
+    before = punctuator.restore_with_prompt_check(words)
+    restored = punctuator.restore_punctuation(words)
+    after = punctuator.restore_with_prompt_check(restored)
+
+    with _PROJECTS_LOCK:
+        project["words"] = restored
+    _store.update_words(pid, restored)
+
+    tokens = _tokens_of(project, _snapshot_deleted_ids(project))
+    sentences = _sentences_for(tokens, project)
+
+    return RepunctuateResponse(
+        project_id=pid,
+        total=before["total"],
+        with_punct_before=before["with_punct"],
+        with_punct_after=after["with_punct"],
+        sentences=len(sentences),
     )
 
 

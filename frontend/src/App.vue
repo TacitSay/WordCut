@@ -98,6 +98,8 @@ const waveformDuration = ref(0)
 const tokens = ref([])
 /** SegmentOut[]：{ index, start, end, duration, text, token_ids } */
 const segments = ref([])
+/** SentenceOut[]：句子（一句一行、可批量选中的最小单位） */
+const sentences = ref([])
 /** 被删 Token id 列表 */
 const deletedIds = ref([])
 /** DeleteSpanOut[]：{ start, end, token_id, cause } */
@@ -1175,6 +1177,40 @@ async function handleSettingsSaved() {
   if (hasTokens.value) await handleResegment()
 }
 
+/** 当前选中的句子（由 TextEditor 抛出）。 */
+const selectedSentenceIds = ref([])
+const selectedSentenceTokenIds = ref([])
+
+/** TextEditor 发出"选中了这些句子"。 */
+function handleSelectSentences(payload) {
+  selectedSentenceIds.value = Array.isArray(payload?.indices) ? payload.indices : []
+  selectedSentenceTokenIds.value = Array.isArray(payload?.tokenIds) ? payload.tokenIds : []
+}
+
+/** 把选中的句子整体删除 / 恢复（批量操作）。 */
+async function handleToggleSelectedSentences() {
+  const ids = selectedSentenceTokenIds.value
+  if (!ids.length || !project.value?.id) return
+
+  // 若选中的词全部已删 → 恢复；否则 → 删除
+  const deletedSet = new Set(deletedIds.value)
+  const allDeleted = ids.every((id) => deletedSet.has(id))
+
+  try {
+    setStatus(allDeleted ? `正在恢复 ${ids.length} 个词…` : `正在删除 ${ids.length} 个词…`, 'busy')
+    const state = allDeleted
+      ? await restoreTokens(project.value.id, ids)
+      : await deleteTokens(project.value.id, ids)
+    applyEditState(state)
+    setStatus(
+      `${allDeleted ? '已恢复' : '已删除'} ${ids.length} 个词（${selectedSentenceIds.value.length} 句）`,
+      'success',
+    )
+  } catch (error) {
+    setStatus(`${allDeleted ? '恢复' : '删除'}失败：${error.message}`, 'error')
+  }
+}
+
 // ----------------------------------------------------------------------
 // 分段策略 / 模型内存
 // ----------------------------------------------------------------------
@@ -1279,6 +1315,7 @@ async function handleTranscribe() {
     const refreshPartial = async () => {
       const list = await fetchTokens(project.value.id)
       tokens.value = Array.isArray(list?.tokens) ? [...list.tokens] : []
+    sentences.value = Array.isArray(list?.sentences) ? [...list.sentences] : []
       segments.value = Array.isArray(list?.segments) ? [...list.segments] : []
       // 注意：增量阶段不改 deletedIds，避免把已保存的删除点冲掉
     }
@@ -1289,6 +1326,7 @@ async function handleTranscribe() {
 
     const list = await fetchTokens(project.value.id)
     tokens.value = Array.isArray(list?.tokens) ? [...list.tokens] : []
+    sentences.value = Array.isArray(list?.sentences) ? [...list.sentences] : []
     segments.value = Array.isArray(list?.segments) ? [...list.segments] : []
     deletedIds.value = Array.isArray(list?.deleted_ids) ? [...list.deleted_ids] : []
     deletes.value = buildDeletesFromTokens(tokens.value, deletedIds.value)
@@ -2325,6 +2363,23 @@ onBeforeUnmount(() => {
 
         <!-- I1 / I2：分段文本流，独立滚动 -->
         <div class="editor-dock">
+          <!-- 句子批量操作条：选中若干句子后出现 -->
+          <div v-if="selectedSentenceIds.length" class="sentence-bar">
+            <span class="sentence-bar-info">
+              已选中 {{ selectedSentenceIds.length }} 句 · {{ selectedSentenceTokenIds.length }} 个词
+            </span>
+            <button class="btn btn-small" type="button" @click="handleToggleSelectedSentences">
+              删除 / 恢复选中句
+            </button>
+            <button
+              class="btn btn-small"
+              type="button"
+              @click="selectedSentenceIds = []; selectedSentenceTokenIds = []"
+            >
+              取消选择
+            </button>
+          </div>
+
           <div v-if="searchOpen" class="search-bar">
             <input
               ref="searchInputRef"
@@ -2367,6 +2422,8 @@ onBeforeUnmount(() => {
             :active-index="activeTokenIndex"
             :disabled="transcribing || exporting"
             :sentence-per-line="displaySettings.sentence_per_line"
+            :sentences="sentences"
+            @select-sentences="handleSelectSentences"
             @cursor-change="handleCursorChange"
             @restore="handleRestoreToken"
             @seek="handleEditorSeek"
@@ -3245,3 +3302,21 @@ onBeforeUnmount(() => {
   }
 }
 </style>
+
+
+/* 句子批量操作条 */
+.sentence-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  flex: 0 0 auto;
+  background: var(--accent-dim);
+  border-bottom: none;
+  box-shadow: 0 1px 3px var(--nm-dark);
+  font-size: 12px;
+}
+
+.sentence-bar-info {
+  color: var(--text-dim);
+}

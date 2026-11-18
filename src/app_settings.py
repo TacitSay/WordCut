@@ -59,6 +59,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "sentence_per_line": True,
         "titles_enabled": False,
         "title_max_chars": 16,
+        # 标点恢复：转写后用规则/模型补标点（中文 ASR 几乎不带标点）
+        "punctuate": True,
+        # 断句参数
+        "sentence_gap": 0.32,
+        "sentence_max_seconds": 10.0,
+        "sentence_max_chars": 42,
     },
     # 模型内存：空闲多久自动卸载（秒，0 = 不自动）
     "memory": {
