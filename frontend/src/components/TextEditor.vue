@@ -883,15 +883,19 @@ onBeforeUnmount(() => {
 }
 
 /* 段落小标题：语义分段生成，浅色小字，不参与点击编辑 */
+/* 段落标题：居中、不限制字数、作为一段内容的概括 */
 .segment-title {
   display: block;
-  font-size: 13px;
+  text-align: center;
+  font-size: 15px;
   font-weight: 600;
-  letter-spacing: 0.6px;
+  letter-spacing: 1px;
   color: var(--accent);
-  opacity: 0.9;
-  margin: 0 0 8px;
-  padding-bottom: 5px;
+  opacity: 0.92;
+  margin: 0 auto 14px;
+  padding: 0 0 8px;
+  max-width: 100%;
+  line-height: 1.5;
   border-bottom: 1px solid var(--border);
   user-select: none;
 }

@@ -637,7 +637,8 @@ def _attach_titles(segments: Sequence[Any]) -> List[Any]:
     if not section.get("titles_enabled"):
         return list(segments)
 
-    max_chars = int(section.get("title_max_chars") or 16)
+    # 0 或缺失 = 不限字数
+    max_chars = int(section.get("title_max_chars") or 0)
     mode = str(section.get("mode") or "rule")
     try:
         titles = semantic.generate_titles(
@@ -3560,7 +3561,7 @@ class SegmentSettingsResponse(BaseModel):
     api_key_set: bool = Field(False, description="是否已保存 API key（不回传明文）")
     sentence_per_line: bool = Field(True, description="段落内一句一行")
     titles_enabled: bool = Field(False, description="是否生成分段小标题")
-    title_max_chars: int = Field(16, description="小标题最大字数")
+    title_max_chars: int = Field(0, description="小标题最大字数（0 = 不限）")
     models: List[Dict[str, Any]] = Field(default_factory=list, description="可选本地模型")
     settings_path: str = Field("", description="设置文件路径（便于排查）")
     api_configured: bool = Field(False, description="API 是否配置完整")
@@ -3614,7 +3615,7 @@ def _segment_settings_payload() -> SegmentSettingsResponse:
         api_key_set=bool(section.get("api_key_set")),
         sentence_per_line=bool(section.get("sentence_per_line")),
         titles_enabled=bool(section.get("titles_enabled")),
-        title_max_chars=int(section.get("title_max_chars") or 16),
+        title_max_chars=int(section.get("title_max_chars") or 0),
         models=models,
         settings_path=str(app_settings.settings_path()),
         api_configured=bool(semantic.api_config()),
@@ -3767,8 +3768,9 @@ def put_segment_settings(patch: SegmentSettingsPatch) -> SegmentSettingsResponse
     if timeout is not None and not (1 <= int(timeout) <= 600):
         raise HTTPException(status_code=400, detail="api_timeout 必须在 1–600 秒之间")
     title_chars = data.get("title_max_chars")
-    if title_chars is not None and not (4 <= int(title_chars) <= 40):
-        raise HTTPException(status_code=400, detail="title_max_chars 必须在 4–40 字之间")
+    # 0 表示不限制；否则限制在 2–60 字之间
+    if title_chars is not None and not (0 <= int(title_chars) <= 60):
+        raise HTTPException(status_code=400, detail="title_max_chars 必须在 0–60 字之间（0 = 不限）")
 
     try:
         app_settings.update_section("segment", data)

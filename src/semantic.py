@@ -85,9 +85,16 @@ SEMANTIC_DIR_PREFIX = "semantic-"
 DEFAULT_IDLE_SECONDS = 600.0
 
 #: 语义分段的段落长度约束（字符数），用于挑选断点。
-DEFAULT_TARGET_CHARS = 180
-DEFAULT_MIN_CHARS = 45
-DEFAULT_MAX_CHARS = 600
+#: 目标段落字数。
+#:
+#: 之前是 180，导致 3 分钟素材就切出 5-6 段、标题跟着变密——用户反馈
+#: "标题过于频繁，应该是一部分内容一个总结"。现在按"章节"粒度取 800 字
+#: （约 4–6 分钟口播），段落数大幅下降，每段才足以承载一个主题。
+DEFAULT_TARGET_CHARS = 800
+#: 段落最短字数。低于它会合并到相邻段，避免出现只有一两句的碎段。
+DEFAULT_MIN_CHARS = 260
+#: 段落最长字数上限（硬约束）。
+DEFAULT_MAX_CHARS = 1600
 
 
 # ----------------------------------------------------------------------
@@ -891,96 +898,83 @@ def _heuristic_title(paragraph_text: str, max_chars: int) -> str:
 def generate_titles(
     texts: Sequence[str],
     mode: str = "local",
-    max_chars: int = 16,
+    max_chars: int = 0,
     log: Optional[Any] = None,
 ) -> List[str]:
-    """为每个段落生成一个小标题。
+    """为每个段落生成一个标题。
+
+    委托给 :mod:`titlemaker`：短语级关键词概括，而不是"照抄首句"。
+    ``max_chars`` 为 0 表示不限制长度。
 
     参数:
-        texts: 段落全文列表（与分段结果一一对应）。
-        mode: ``api``（调 API 生成）/ ``local``（向量法：挑段内最接近
-            "段落中心"的那句话当标题）/ 其他值走启发式（第一句截断）。
+        texts: 段落全文列表。
+        mode: ``api``（大模型概括）/ 其它（本地关键词）。
+        max_chars: 标题字数上限，0 = 不限。
+        log: 调试回调。
 
     返回:
-        与 ``texts`` 等长的标题列表；生成失败的段落标题为空串，**绝不抛异常**
-        ——标题是锦上添花，不该让分段结果不可用。
+        与 ``texts`` 等长的标题列表；失败时该段为空串，**绝不抛异常**。
     """
     say = log or (lambda *_a, **_k: None)
-    result = [""] * len(texts)
-    if not texts:
-        return result
 
+    api_call = None
     if mode == "api" and api_config():
-        try:
-            numbered = "\n".join(
-                f"{index + 1}. {text[:200]}" for index, text in enumerate(texts)
-            )
-            prompt = (
-                f"下面是 {len(texts)} 个段落，请给每段起一个不超过 {max_chars} 字的小标题。\n"
-                f"{numbered}\n\n"
-                '只输出 JSON 数组，元素是标题字符串，顺序与段落一致。'
-            )
-            payload = {
-                "model": api_config()["model"],
-                "temperature": 0,
-                "messages": [
-                    {"role": "system", "content": "你是中文编辑，只输出 JSON。"},
-                    {"role": "user", "content": prompt},
-                ],
-            }
-            request = urllib.request.Request(
-                f"{api_config()['base']}/chat/completions",
-                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    **(
-                        {"Authorization": f"Bearer {api_config()['key']}"}
-                        if api_config()["key"]
-                        else {}
-                    ),
-                },
-                method="POST",
-            )
-            timeout = _env_int("WORDCUT_SEMANTIC_API_TIMEOUT", 60)
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                body = json.loads(response.read().decode("utf-8", "replace"))
-            content = body["choices"][0]["message"]["content"]
-            start, end = content.find("["), content.rfind("]")
-            raw = json.loads(content[start : end + 1]) if 0 <= start < end else []
-            for index, title in enumerate(raw[: len(texts)]):
-                result[index] = _clean_title(str(title), max_chars)
-            say(f"标题生成（API）：{sum(1 for item in result if item)}/{len(texts)}")
-            return result
-        except Exception as exc:  # noqa: BLE001 - 失败落到启发式
-            say(f"API 标题生成失败，改用启发式：{exc}")
+        import titlemaker
 
-    if mode == "local":
-        try:
-            sentences: List[str] = []
-            spans: List[Tuple[int, int]] = []
-            for paragraph_index, text in enumerate(texts):
-                parts = [part for part in text.replace("。", "。\n").split("\n") if part.strip()]
-                spans.append((len(sentences), len(sentences) + len(parts) - 1))
-                sentences.extend(part.strip() for part in parts if part.strip())
-            vectors = embed_sentences(sentences)
-            for paragraph_index, (start, end) in enumerate(spans):
-                chunk = vectors[start : end + 1]
-                if not chunk:
-                    continue
-                size = len(chunk[0])
-                centroid = [sum(row[dim] for row in chunk) / len(chunk) for dim in range(size)]
-                best = max(
-                    range(len(chunk)),
-                    key=lambda row: _cosine(chunk[row], centroid),
-                )
-                result[paragraph_index] = _clean_title(
-                    sentences[start + best], max_chars
-                )
-            say(f"标题生成（向量法）：{sum(1 for item in result if item)}/{len(texts)}")
-            return result
-        except Exception as exc:  # noqa: BLE001 - 失败落到启发式
-            say(f"向量标题生成失败，改用启发式：{exc}")
+        def api_call(items, limit):  # noqa: ANN001 - 内部闭包
+            return _titles_via_api(items, limit, say)
 
-    for index, text in enumerate(texts):
-        result[index] = _heuristic_title(text, max_chars)
-    return result
+    import titlemaker
+
+    return titlemaker.make_titles(
+        texts, api_call=api_call, max_chars=max_chars, log=say
+    )
+
+
+def _titles_via_api(items: Sequence[str], limit: int, say: Any) -> List[str]:
+    """用 OpenAI 兼容接口概括标题。"""
+    config = api_config()
+    if not config:
+        raise RuntimeError("未配置语义 API")
+
+    numbered = "\n".join(
+        f"{index + 1}. {text[:400]}" for index, text in enumerate(items)
+    )
+    limit_hint = f"不超过 {limit} 字" if limit else "简洁（10 字以内）"
+    prompt = (
+        f"下面是 {len(items)} 个段落，请为每段起一个概括性小标题，{limit_hint}。\n"
+        "标题要概括该段讲的主题，不要照抄原文句子。\n"
+        f"{numbered}\n\n"
+        "只输出 JSON 数组，元素是标题字符串，顺序与段落一致。"
+    )
+    payload = {
+        "model": config["model"],
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": "你是中文编辑，擅长起简洁的小标题，只输出 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    request = urllib.request.Request(
+        f"{config['base']}/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            **({"Authorization": f"Bearer {config['key']}"} if config["key"] else {}),
+        },
+        method="POST",
+    )
+    timeout = _env_int("WORDCUT_SEMANTIC_API_TIMEOUT", 60)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = json.loads(response.read().decode("utf-8", "replace"))
+
+    content = body["choices"][0]["message"]["content"]
+    left, right = content.find("["), content.rfind("]")
+    if left < 0 or right <= left:
+        raise RuntimeError("标题 API 未返回 JSON 数组")
+    raw = json.loads(content[left : right + 1])
+    titles = [str(item or "").strip() for item in raw]
+    say(f"标题生成（API）：{sum(1 for x in titles if x)}/{len(items)}")
+    return titles
+
+

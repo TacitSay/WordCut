@@ -92,11 +92,16 @@ class RuleSegmenter:
 
     三条切分依据（满足任一即换段）：
 
-    1. **segment 变化**：faster-whisper 的句子级 segment 变了（最稳的信号）；
-    2. **硬标点**：句末标点（。？！；…），标点留在上一段；
-    3. **时间间隔**：相邻 Token 间隔超过 `gap_threshold` 秒（默认 0.6）；
-    4. **段落过长**：当前段累计时长超过 `max_segment_seconds`（默认 15 秒）
-       且遇到逗号类软标点，或累计超过 `hard_max_seconds`（默认 30 秒）强制切。
+    切分依据（满足任一即换段）：
+
+    1. **硬标点 + 长停顿**：句末标点之后若还有明显停顿，视为段落边界；
+    2. **时间间隔**：相邻 Token 间隔超过 ``gap_threshold``（默认 1.2 秒）——
+       这是"讲完一个话题、停下来"的信号，比句内换气（通常 < 0.5s）大得多；
+    3. **段落过长**：累计时长超过 ``hard_max_seconds``（默认 480 秒）强制切。
+
+    **注意**：早期版本用 ``max_segment_seconds=15``，结果 3 分钟素材就被切成
+    十几个碎段、标题跟着变密。段落应该按"章节"粒度（几分钟）划分，而不是
+    按"几句话"。
 
     实现说明：本类**不依赖 token 的 seg 字段**（Token 数据模型里没有 seg），
     因此依据 1 实际通过"句末标点 + 间隔"组合近似；若将来 Token 加上 seg 字段，
@@ -110,9 +115,12 @@ class RuleSegmenter:
 
     def __init__(
         self,
-        gap_threshold: float = 0.6,
-        max_segment_seconds: float = 15.0,
-        hard_max_seconds: float = 30.0,
+        # 段落之间的停顿阈值：句子内部换气远小于它，所以不会误切
+        gap_threshold: float = 1.2,
+        # 软上限：超过且遇到句末标点才切（不再是 15 秒）
+        max_segment_seconds: float = 240.0,
+        # 硬上限：无论如何都不让一段超过它
+        hard_max_seconds: float = 480.0,
     ) -> None:
         if gap_threshold < 0:
             raise ValueError("gap_threshold 必须 >= 0")

@@ -57,8 +57,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "api_timeout": 60,
         # 段落显示：一句一行 / 分段小标题
         "sentence_per_line": True,
-        "titles_enabled": False,
-        "title_max_chars": 16,
+        # 标题默认开启：没有标题的段落长文很难定位
+        "titles_enabled": True,
+        # 0 = 不限制标题字数（用户要求"不设置字数限制"）
+        "title_max_chars": 0,
         # 标点恢复：转写后用规则/模型补标点（中文 ASR 几乎不带标点）
         "punctuate": True,
         # 断句参数
