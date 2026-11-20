@@ -36,15 +36,14 @@ __all__ = [
 ]
 
 #: 本地摘要模型目录（可由设置覆盖）。
-SUMMARIZER_DIR: Path = Path(__file__).resolve().parent.parent / "models" / "summarizer-mt5-zh"
+SUMMARIZER_DIR: Path = Path(__file__).resolve().parent.parent / "models" / "summarizer-qwen15b"
 
 #: 空闲多久卸载本地摘要模型（秒）。
 _IDLE_SECONDS = 600.0
 
 #: 生成参数：标题不宜过长，否则又变成"正文摘要"。
+#: 生成上限（字符数），实际按 max_chars 动态调整
 _MAX_NEW_TOKENS = 40
-_MIN_NEW_TOKENS = 6
-_NUM_BEAMS = 4
 
 _local_lock = threading.Lock()
 _local_state: Dict[str, Any] = {
@@ -133,13 +132,14 @@ def _ensure_local() -> Any:
         raise RuntimeError(f"本地摘要模型目录不存在：{directory}")
 
     try:
-        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(f"缺少 transformers：{exc}") from exc
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(str(directory))
-        model = AutoModelForSeq2SeqLM.from_pretrained(str(directory))
+        # 注意：参数名必须是 torch_dtype（写成 dtype 会被当成多余 kwarg）
+        model = AutoModelForCausalLM.from_pretrained(str(directory), torch_dtype="float32")
         model.eval()
     except Exception as exc:  # noqa: BLE001 - sentencepiece 崩溃等都在这里
         raise RuntimeError(f"加载本地摘要模型失败：{exc}") from exc
@@ -157,26 +157,56 @@ def _ensure_local() -> Any:
 
 
 def _summarize_local(texts: Sequence[str], max_chars: int) -> List[str]:
-    """用本地 seq2seq 模型生成摘要。"""
+    """用本地指令模型（Qwen 等）生成概括式标题。
+
+    为什么用 causal LM 而不是 mT5/Pegasus：本机 sentencepiece 原生库在加载
+    ``spiece.model`` 时直接触发 Windows 访问违规（0xC0000005），mT5/Pegasus
+    全部不可用。Qwen 系列用 ``tokenizer.json``（BPE），不经过 sentencepiece，
+    实测可正常加载（1.5B 模型 CPU 加载 12.8s、每段生成 1–2.5s）。
+    """
     import torch
 
     tokenizer, model = _ensure_local()
     results: List[str] = []
-    with torch.no_grad():
-        for text in texts:
-            encoded = tokenizer(
-                text, max_length=768, truncation=True, return_tensors="pt"
+
+    limit_hint = f"{max_chars} 字以内" if max_chars else "10–18 个字"
+    max_new = 40 if max_chars <= 0 else min(48, max(16, max_chars * 3))
+
+    for text in texts:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是中文编辑。只输出一个概括性小标题，"
+                    f"{limit_hint}，不要解释、不要引号、不要句号结尾。"
+                ),
+            },
+            {"role": "user", "content": f"给这段访谈起个概括性小标题：\n{text[:1200]}"},
+        ]
+        try:
+            prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
             )
-            limit = _MAX_NEW_TOKENS if max_chars <= 0 else min(_MAX_NEW_TOKENS, max_chars * 2)
+            encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"提示词编码失败：{exc}") from exc
+
+        # generation_config.json 里的 temperature/top_p 在 do_sample=False 时无效，
+        # transformers 会打警告。显式传一份干净的配置避免刷屏。
+        with torch.no_grad():
             output = model.generate(
                 **encoded,
-                max_new_tokens=limit,
-                min_new_tokens=_MIN_NEW_TOKENS,
-                num_beams=_NUM_BEAMS,
+                max_new_tokens=max_new,
+                do_sample=False,
+                num_beams=1,
                 no_repeat_ngram_size=3,
-                early_stopping=True,
+                pad_token_id=tokenizer.eos_token_id,
+                temperature=None,
+                top_p=None,
+                top_k=None,
             )
-            results.append(tokenizer.decode(output[0], skip_special_tokens=True).strip())
+        generated = output[0][encoded["input_ids"].shape[1] :]
+        results.append(tokenizer.decode(generated, skip_special_tokens=True).strip())
 
     with _local_lock:
         _local_state["last_used"] = time.time()
@@ -243,6 +273,8 @@ def summarize_paragraphs(
     参数:
         texts: 段落全文列表。
         backend: ``auto``（API 优先，失败退本地）/ ``api`` / ``local``。
+            默认 ``auto``：API 通常 1–2 秒出结果；限流时会自动退到本地，
+            不会让用户干等。
         max_chars: 标题字数上限，``0`` 表示不限制。
         log: 调试回调。
 

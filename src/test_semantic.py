@@ -106,9 +106,30 @@ check("None 回退规则", type(semantic.build_segmenter(None)).__name__ == "Rul
 check("语义策略构造成功", isinstance(semantic.build_segmenter(semantic.STRATEGY_SEMANTIC_LOCAL), semantic.SemanticSegmenter))
 check("策略清单非空", len(semantic.describe_strategies()) == len(semantic.STRATEGIES))
 
+# 注意：本机可能在 data/settings.json 里配置了 API，
+# 所以不能用"环境变量为空"来断言不可用。改为在**临时清空设置**的前提下测。
 _old_base = os.environ.pop("WORDCUT_SEMANTIC_API_BASE", None)
 _old_model = os.environ.pop("WORDCUT_SEMANTIC_API_MODEL", None)
-check("未配置 API 时 semantic_api 不可用", not semantic.strategy_available(semantic.STRATEGY_SEMANTIC_API))
+_old_section = None
+try:
+    import app_settings
+
+    _old_section = app_settings.get_section("segment")
+    app_settings.update_section("segment", {"api_base": "", "api_model": "", "api_key": ""})
+    check(
+        "未配置 API 时 semantic_api 不可用",
+        not semantic.strategy_available(semantic.STRATEGY_SEMANTIC_API),
+    )
+finally:
+    if _old_section is not None:
+        app_settings.update_section(
+            "segment",
+            {
+                "api_base": _old_section.get("api_base", ""),
+                "api_model": _old_section.get("api_model", ""),
+                "api_key": _old_section.get("api_key", ""),
+            },
+        )
 os.environ["WORDCUT_SEMANTIC_API_BASE"] = "https://example.com/v1"
 os.environ["WORDCUT_SEMANTIC_API_MODEL"] = "demo"
 check("配置齐全后 semantic_api 可用", semantic.strategy_available(semantic.STRATEGY_SEMANTIC_API))

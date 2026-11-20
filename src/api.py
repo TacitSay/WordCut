@@ -4002,6 +4002,17 @@ def system_models() -> ModelsStatusResponse:
         )
     )
 
+    # 本地摘要模型（概括式标题用）：1.5B 量级，常驻约 3GB，值得观察
+    summary_state = summarizer.local_summarizer_status()
+    models.append(
+        ModelStatus(
+            name="summarizer",
+            loaded=bool(summary_state["loaded"]),
+            detail=("已就绪" if summary_state["available"] else "未下载"),
+            idle_seconds=float(summary_state["idle_seconds"]),
+        )
+    )
+
     rss_mb = 0.0
     try:
         import psutil  # 可选依赖，没有就跳过
@@ -4049,9 +4060,10 @@ def system_unload(payload: Optional[UnloadRequest] = None) -> UnloadResponse:
     只是要再等几秒。
     """
     target = ((payload.target if payload else "all") or "all").strip().lower()
-    if target not in ("whisper", "semantic", "all"):
+    if target not in ("whisper", "semantic", "summarizer", "all"):
         raise HTTPException(
-            status_code=400, detail=f"target 必须是 whisper / semantic / all，实际 {target!r}"
+            status_code=400,
+            detail=f"target 必须是 whisper / semantic / summarizer / all，实际 {target!r}",
         )
 
     unloaded: List[str] = []
@@ -4059,6 +4071,8 @@ def system_unload(payload: Optional[UnloadRequest] = None) -> UnloadResponse:
         unloaded.append("whisper")
     if target in ("semantic", "all") and semantic.unload_local_model():
         unloaded.append("semantic")
+    if target in ("semantic", "summarizer", "all") and summarizer.unload_local_summarizer():
+        unloaded.append("summarizer")
     return UnloadResponse(unloaded=unloaded)
 
 
