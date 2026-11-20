@@ -63,6 +63,7 @@ import app_settings  # noqa: E402
 import model_fetch  # noqa: E402
 import punctuator  # noqa: E402
 import sentencer  # noqa: E402
+import summarizer  # noqa: E402
 import semantic  # noqa: E402
 from model import DeleteSpan, TimeMap, Token  # noqa: E402
 
@@ -628,7 +629,11 @@ def _segments_for(
 
 
 def _attach_titles(segments: Sequence[Any]) -> List[Any]:
-    """按设置给段落挂小标题；未开启或生成失败时保持原样。"""
+    """按设置给段落挂**概括式**标题。
+
+    走 :mod:`summarizer`：API 优先（质量最好），不可用时退本地模型，
+    最后退关键词。永远返回可用结果 —— 标题失败不该让分段不可用。
+    """
     try:
         section = app_settings.get_section("segment")
     except Exception:  # noqa: BLE001
@@ -637,15 +642,19 @@ def _attach_titles(segments: Sequence[Any]) -> List[Any]:
     if not section.get("titles_enabled"):
         return list(segments)
 
-    # 0 或缺失 = 不限字数
     max_chars = int(section.get("title_max_chars") or 0)
-    mode = str(section.get("mode") or "rule")
+    backend = str(section.get("title_backend") or "auto")
+
     try:
-        titles = semantic.generate_titles(
-            [seg.text for seg in segments], mode=mode, max_chars=max_chars
+        result = summarizer.summarize_paragraphs(
+            [seg.text for seg in segments], backend=backend, max_chars=max_chars
         )
-        # Segment 是 frozen dataclass（不可变是分段结果的可信来源），
-        # 挂标题用 dataclasses.replace 重建对象，而不是原地赋值。
+        titles = result.get("titles") or []
+        _whisper_runtime["title_backend"] = str(result.get("backend") or "")
+        errors = result.get("errors") or []
+        if errors:
+            _whisper_runtime["title_errors"] = errors
+
         import dataclasses
 
         titled: List[Any] = []
@@ -658,6 +667,7 @@ def _attach_titles(segments: Sequence[Any]) -> List[Any]:
     except Exception as exc:  # noqa: BLE001 - 标题失败不影响分段
         _whisper_runtime["title_error"] = str(exc)
     return list(segments)
+
 
 
 def _duration_of(project: Dict[str, Any]) -> float:

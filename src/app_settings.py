@@ -59,8 +59,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "sentence_per_line": True,
         # 标题默认开启：没有标题的段落长文很难定位
         "titles_enabled": True,
-        # 0 = 不限制标题字数（用户要求"不设置字数限制"）
+        # 0 = 不限制标题字数
         "title_max_chars": 0,
+        # 标题生成后端：auto（API 优先）/ api / local / keyword
+        "title_backend": "auto",
+        # 本地摘要模型目录（可选）
+        "summarizer_dir": "",
         # 标点恢复：转写后用规则/模型补标点（中文 ASR 几乎不带标点）
         "punctuate": True,
         # 断句参数
