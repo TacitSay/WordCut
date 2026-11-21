@@ -75,8 +75,11 @@ STRATEGIES: Tuple[str, ...] = (
     STRATEGY_SEMANTIC_API,
 )
 
-#: 默认本地向量模型仓库（Xenova 提供的 ONNX 版 BGE-small-zh，量化后约 25MB）。
-DEFAULT_LOCAL_MODEL = "Xenova/bge-small-zh-v1.5"
+#: 默认本地向量模型仓库。
+#:
+#: 注意：语义分段现在优先用 `summarizer_dir` 指向的本地模型（Qwen 等），
+#: 这个常量只在"用户显式填了仓库名"时才用。留空表示不自动下载。
+DEFAULT_LOCAL_MODEL = ""
 
 #: 模型落在 ``models/semantic-<名字>/`` 下。
 SEMANTIC_DIR_PREFIX = "semantic-"
@@ -127,7 +130,10 @@ def local_model_name() -> str:
     env = os.environ.get("WORDCUT_SEMANTIC_MODEL", "").strip()
     if env:
         return env
-    return str(segment_settings().get("local_model") or "").strip() or DEFAULT_LOCAL_MODEL
+    configured = str(segment_settings().get("local_model") or "").strip()
+    if configured:
+        return configured
+    return DEFAULT_LOCAL_MODEL
 
 
 def local_model_dir_override() -> Optional[Path]:

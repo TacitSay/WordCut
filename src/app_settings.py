@@ -44,13 +44,15 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "segment": {
         # 分段模式：rule（规则）/ local（本地小模型）/ api（OpenAI 兼容接口）
         "mode": "rule",
-        # 本地模型（HuggingFace 仓库名或本地目录，见 local_model_dir）
-        "local_model": "Xenova/bge-small-zh-v1.5",
-        # 已有的本地模型目录（填了就直接用，不再走仓库名下载）
+        # 本地模型：改为"扫描 models/ 目录选择"，不再写死 HuggingFace 仓库名
+        # （旧字段保留只为兼容老配置文件，新界面用 summarizer_dir）
+        "local_model": "",
         "local_model_dir": "",
         # 模型下载根目录（空 = <项目>/models）
         "models_dir": "",
         # 语义分段 API（OpenAI 兼容）
+        # 服务商 id（deepseek / zhipu / ... 见 providers.py）
+        "provider": "",
         "api_base": "",
         "api_key": "",
         "api_model": "",

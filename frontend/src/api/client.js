@@ -498,6 +498,43 @@ export function testSegmentBackend(target = 'local') {
 }
 
 /**
+ * GET /api/settings/providers -> { providers: [...] }
+ *
+ * 内置的 AI 服务商预设（端点 + 常用模型 + 申请 Key 的链接）。
+ * 选服务商 + 填 Key 即可用，不必手填 Base URL。
+ */
+export function fetchProviders() {
+  return request('/api/settings/providers')
+}
+
+/**
+ * POST /api/settings/segment/test-connection -> { ok, detail, elapsed_ms, model_reply }
+ *
+ * 测试 AI 接口是否可用。支持传未保存的临时配置。
+ * @param {{provider?: string, api_base?: string, api_model?: string, api_key?: string}} payload
+ */
+export function testApiConnection(payload = {}) {
+  return request('/api/settings/segment/test-connection', { method: 'POST', body: payload })
+}
+
+/**
+ * GET /api/models/local -> { root, models: [...] }
+ *
+ * 扫描本地模型目录（用于下拉选择，而不是手填仓库名）。
+ */
+export function fetchLocalModels() {
+  return request('/api/models/local')
+}
+
+/**
+ * POST /api/models/local/remove -> { removed, name, freed_mb, error }
+ * @param {string} name 模型目录名
+ */
+export function removeLocalModel(name) {
+  return request('/api/models/local/remove', { method: 'POST', body: { name } })
+}
+
+/**
  * GET /api/settings/memory -> { whisper_idle_seconds, semantic_idle_seconds }
  */
 export function fetchMemorySettings() {
@@ -563,6 +600,10 @@ export default {
   testSegmentBackend,
   fetchMemorySettings,
   saveMemorySettings,
+  fetchProviders,
+  testApiConnection,
+  fetchLocalModels,
+  removeLocalModel,
   fetchModelStatus,
   unloadModels,
   fetchTokens,

@@ -35,7 +35,7 @@ def check(name, cond):
 # 1. 默认值
 settings = app_settings.load_settings()
 check("读到默认 mode=rule", settings["segment"]["mode"] == "rule")
-check("默认本地模型", settings["segment"]["local_model"].startswith("Xenova/"))
+check("默认不再写死 Xenova 仓库名", settings["segment"]["local_model"] == "")
 check("临时设置路径生效", app_settings.settings_path() == _TMP)
 
 # 2. 更新与持久化
@@ -45,7 +45,7 @@ check("文件已落盘", _TMP.is_file())
 
 raw = json.loads(_TMP.read_text(encoding="utf-8"))
 check("落盘内容正确", raw["segment"]["mode"] == "local" and raw["segment"]["api_timeout"] == 30)
-check("未改字段保留默认", raw["segment"]["local_model"].startswith("Xenova/"))
+check("未改字段保留默认", raw["segment"]["local_model"] == "")
 
 # 3. 部分更新不会清空其它字段
 app_settings.update_section("segment", {"api_base": "https://example.com/v1"})

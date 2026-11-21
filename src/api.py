@@ -30,6 +30,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +65,8 @@ import app_settings  # noqa: E402
 import model_fetch  # noqa: E402
 import punctuator  # noqa: E402
 import sentencer  # noqa: E402
+import model_registry  # noqa: E402
+import providers  # noqa: E402
 import summarizer  # noqa: E402
 import semantic  # noqa: E402
 from model import DeleteSpan, TimeMap, Token  # noqa: E402
@@ -3565,6 +3569,7 @@ class SegmentSettingsResponse(BaseModel):
     local_model: str = Field("", description="本地模型仓库名")
     local_model_dir: str = Field("", description="已有的本地模型目录（可空）")
     models_dir: str = Field("", description="模型根目录（可空 = <项目>/models）")
+    provider: str = Field("", description="服务商 id（deepseek/zhipu/...）")
     api_base: str = Field("", description="API base（OpenAI 兼容）")
     api_model: str = Field("", description="API 模型名")
     api_timeout: int = Field(60, description="API 超时（秒）")
@@ -3572,6 +3577,8 @@ class SegmentSettingsResponse(BaseModel):
     sentence_per_line: bool = Field(True, description="段落内一句一行")
     titles_enabled: bool = Field(False, description="是否生成分段小标题")
     title_max_chars: int = Field(0, description="小标题最大字数（0 = 不限）")
+    title_backend: str = Field("auto", description="标题后端：auto/api/local/keyword")
+    summarizer_dir: str = Field("", description="本地摘要模型目录（空 = 默认）")
     models: List[Dict[str, Any]] = Field(default_factory=list, description="可选本地模型")
     settings_path: str = Field("", description="设置文件路径（便于排查）")
     api_configured: bool = Field(False, description="API 是否配置完整")
@@ -3584,6 +3591,7 @@ class SegmentSettingsPatch(BaseModel):
     local_model: Optional[str] = None
     local_model_dir: Optional[str] = None
     models_dir: Optional[str] = None
+    provider: Optional[str] = None
     api_base: Optional[str] = None
     api_key: Optional[str] = None
     api_model: Optional[str] = None
@@ -3591,6 +3599,8 @@ class SegmentSettingsPatch(BaseModel):
     sentence_per_line: Optional[bool] = None
     titles_enabled: Optional[bool] = None
     title_max_chars: Optional[int] = None
+    title_backend: Optional[str] = None
+    summarizer_dir: Optional[str] = None
 
 
 class SegmentTestRequest(BaseModel):
@@ -3616,6 +3626,7 @@ def _segment_settings_payload() -> SegmentSettingsResponse:
         models = []
     return SegmentSettingsResponse(
         mode=str(section.get("mode") or "rule"),
+        provider=str(section.get("provider") or ""),
         local_model=str(section.get("local_model") or ""),
         local_model_dir=str(section.get("local_model_dir") or ""),
         models_dir=str(section.get("models_dir") or ""),
@@ -3626,6 +3637,8 @@ def _segment_settings_payload() -> SegmentSettingsResponse:
         sentence_per_line=bool(section.get("sentence_per_line")),
         titles_enabled=bool(section.get("titles_enabled")),
         title_max_chars=int(section.get("title_max_chars") or 0),
+        title_backend=str(section.get("title_backend") or "auto"),
+        summarizer_dir=str(section.get("summarizer_dir") or ""),
         models=models,
         settings_path=str(app_settings.settings_path()),
         api_configured=bool(semantic.api_config()),
@@ -3736,6 +3749,243 @@ def repunctuate(pid: str) -> RepunctuateResponse:
     )
 
 
+# ----------------------------------------------------------------------
+# 接口：AI 服务商 / 本地模型目录
+# ----------------------------------------------------------------------
+class ProviderInfo(BaseModel):
+    """一个 AI 服务商的预设。"""
+
+    id: str = Field(..., description="内部标识")
+    name: str = Field(..., description="显示名")
+    base: str = Field("", description="OpenAI 兼容端点")
+    models: List[str] = Field(default_factory=list, description="常用模型")
+    key_url: str = Field("", description="申请 Key 的地址")
+    note: str = Field("", description="补充说明")
+
+
+class ProvidersResponse(BaseModel):
+    """服务商清单。"""
+
+    providers: List[ProviderInfo] = Field(default_factory=list)
+
+
+@app.get(
+    "/api/settings/providers",
+    response_model=ProvidersResponse,
+    summary="列出内置的 AI 服务商预设",
+)
+def get_providers() -> ProvidersResponse:
+    """返回主流服务商的端点与模型，界面选服务商 + 填 Key 即可用。
+
+    本接口**不含任何密钥**，只有公开的端点与模型名。
+    """
+    return ProvidersResponse(
+        providers=[ProviderInfo(**item) for item in providers.provider_list()]
+    )
+
+
+class LocalModelInfo(BaseModel):
+    """扫描到的本地模型。"""
+
+    name: str = Field(..., description="目录名")
+    path: str = Field(..., description="绝对路径")
+    size_mb: float = Field(0.0, description="占用空间（MB）")
+    kind: str = Field("", description="用途推断")
+    detail: str = Field("", description="补充说明")
+    deprecated: bool = Field(False, description="是否为已废弃模型")
+    ready: bool = Field(False, description="是否含可用权重")
+    files: List[str] = Field(default_factory=list, description="关键文件名")
+
+
+class LocalModelsResponse(BaseModel):
+    """本地模型清单。"""
+
+    root: str = Field(..., description="模型根目录")
+    models: List[LocalModelInfo] = Field(default_factory=list)
+
+
+class RemoveModelRequest(BaseModel):
+    """删除本地模型的请求。"""
+
+    name: str = Field(..., description="模型目录名")
+
+
+class RemoveModelResponse(BaseModel):
+    """删除结果。"""
+
+    removed: bool = Field(False, description="是否删除成功")
+    name: str = Field("", description="目录名")
+    freed_mb: float = Field(0.0, description="释放空间（MB）")
+    error: str = Field("", description="失败原因")
+
+
+class TestConnectionRequest(BaseModel):
+    """测试 API 连接的请求（可用未保存的临时配置）。"""
+
+    provider: Optional[str] = Field(None, description="服务商 id（可选）")
+    api_base: Optional[str] = Field(None, description="覆盖 Base URL")
+    api_model: Optional[str] = Field(None, description="覆盖模型名")
+    api_key: Optional[str] = Field(None, description="覆盖 Key（留空则用已保存的）")
+
+
+class TestConnectionResponse(BaseModel):
+    """测试结果。"""
+
+    ok: bool = Field(False, description="是否连通")
+    detail: str = Field("", description="成功摘要或失败原因")
+    elapsed_ms: float = Field(0.0, description="耗时")
+    model_reply: str = Field("", description="模型回复片段")
+
+
+@app.get(
+    "/api/models/local",
+    response_model=LocalModelsResponse,
+    summary="扫描本地模型目录",
+)
+def list_local_models() -> LocalModelsResponse:
+    """扫描 `models/` 下真实存在的模型，供界面下拉选择。"""
+    return LocalModelsResponse(
+        root=str(model_registry.MODELS_ROOT),
+        models=[LocalModelInfo(**item) for item in model_registry.scan_models()],
+    )
+
+
+@app.post(
+    "/api/models/local/remove",
+    response_model=RemoveModelResponse,
+    summary="删除本地模型目录（释放空间）",
+)
+def remove_local_model(payload: RemoveModelRequest) -> RemoveModelResponse:
+    """删除一个模型目录。
+
+    只允许删除 `models/` 的直接子目录；删除前会先卸载对应模型，
+    避免文件被占用。
+
+    异常:
+        404: 目录不存在（返回体里通过 removed=false 表达，不抛）。
+    """
+    # 先卸载，避免 Windows 下文件被占用删不掉
+    if "semantic" in payload.name:
+        semantic.unload_local_model()
+    if "summarizer" in payload.name or "qwen" in payload.name:
+        summarizer.unload_local_summarizer()
+
+    result = model_registry.remove_model(payload.name)
+    if result.get("removed"):
+        _whisper_runtime["model_removed"] = payload.name
+    return RemoveModelResponse(**result)
+
+
+@app.post(
+    "/api/settings/segment/test-connection",
+    response_model=TestConnectionResponse,
+    summary="测试 AI 接口是否可用（可带未保存的临时配置）",
+)
+def test_api_connection(payload: Optional[TestConnectionRequest] = None) -> TestConnectionResponse:
+    """发一个最小请求验证 Key / Base / 模型是否可用。
+
+    支持用**未保存**的临时配置测试（用户在界面上改了还没点保存时，
+    也能先验证再保存）。Key 留空表示沿用已保存的。
+
+    异常:
+        400: 配置不完整。
+    """
+    request = payload or TestConnectionRequest()
+    section = app_settings.get_section("segment")
+
+    base = (request.api_base or section.get("api_base") or "").strip().rstrip("/")
+    model_name = (request.api_model or section.get("api_model") or "").strip()
+
+    # 已保存的 Key 只对"同一个端点"有效。换了服务商（base 不同）就必须
+    # 重新填 Key，否则会把上一家的 Key 发给新服务商，得到莫名其妙的 401。
+    saved_base = (section.get("api_base") or "").strip().rstrip("/")
+    same_endpoint = bool(base) and base == saved_base
+    if request.api_key:
+        key = request.api_key.strip()
+    elif same_endpoint:
+        key = (section.get("api_key") or "").strip()
+    else:
+        key = ""
+
+    # 选了服务商：**以预设为准**（覆盖掉设置里残留的旧值）。
+    # 只补齐空值是不够的——用户从智谱切到 DeepSeek 时，设置里还留着智谱的
+    # base，会把请求发到智谱去，然后拿 DeepSeek 的 Key 换来一个 401。
+    if request.provider:
+        preset = providers.find_provider(request.provider)
+        if preset and preset.get("base"):
+            base = str(preset["base"]).rstrip("/")
+            if not request.api_model:
+                model_name = next(
+                    iter(preset["models"] or []), ""  # type: ignore[arg-type]
+                )
+            # 换了端点，之前保存的 Key 不可复用
+            same_endpoint = base == (section.get("api_base") or "").strip().rstrip("/")
+
+    if not base or not model_name:
+        raise HTTPException(
+            status_code=400,
+            detail="配置不完整：需要 Base URL 与模型名（或选择一个服务商）",
+        )
+    if not key and "localhost" not in base and "127.0.0.1" not in base:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "这个端点需要 API Key。若刚切换了服务商，请重新填写 Key"
+                "（旧的 Key 不会跨服务商沿用）"
+            ),
+        )
+
+    started = time.perf_counter()
+    body = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "回复两个字：可用"}],
+        "max_tokens": 16,
+        "temperature": 0,
+    }
+    http_request = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            **({"Authorization": f"Bearer {key}"} if key else {}),
+        },
+        method="POST",
+    )
+
+    try:
+        timeout = int(section.get("api_timeout") or 30)
+        with urllib.request.urlopen(http_request, timeout=max(5, timeout)) as response:
+            data = json.loads(response.read().decode("utf-8", "replace"))
+        reply = str(data["choices"][0]["message"]["content"] or "").strip()
+        return TestConnectionResponse(
+            ok=True,
+            detail=f"连接成功（{model_name}）",
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+            model_reply=reply[:60],
+        )
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        # 把常见状态码翻译成人话
+        hint_map = {
+            401: "Key 无效或已过期",
+            403: "无权限访问该模型",
+            404: "端点或模型名不存在",
+            429: "触发限流（免费额度常见），稍后再试",
+        }
+        hint = hint_map.get(exc.code, "请求被拒绝")
+        return TestConnectionResponse(
+            ok=False,
+            detail=f"{hint}（HTTP {exc.code}）：{raw[:160]}",
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
+    except Exception as exc:  # noqa: BLE001 - 网络异常也要给出可读原因
+        return TestConnectionResponse(
+            ok=False,
+            detail=f"连接失败：{type(exc).__name__} {exc}",
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
+
+
 @app.get(
     "/api/settings/segment",
     response_model=SegmentSettingsResponse,
@@ -3777,6 +4027,12 @@ def put_segment_settings(patch: SegmentSettingsPatch) -> SegmentSettingsResponse
     timeout = data.get("api_timeout")
     if timeout is not None and not (1 <= int(timeout) <= 600):
         raise HTTPException(status_code=400, detail="api_timeout 必须在 1–600 秒之间")
+    backend_name = data.get("title_backend")
+    if backend_name is not None and backend_name not in ("auto", "api", "local", "keyword"):
+        raise HTTPException(
+            status_code=400,
+            detail="title_backend 必须是 auto / api / local / keyword",
+        )
     title_chars = data.get("title_max_chars")
     # 0 表示不限制；否则限制在 2–60 字之间
     if title_chars is not None and not (0 <= int(title_chars) <= 60):
